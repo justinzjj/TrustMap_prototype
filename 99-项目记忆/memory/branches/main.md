@@ -51,4 +51,3 @@ active
 
 - 初始化论文优先的原型主线。
 - 确认 Docker/Geth、一链一 MapNode、P2P 证据边界和 DirectVerifier 适配器。
-

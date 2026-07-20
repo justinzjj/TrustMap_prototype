@@ -40,4 +40,3 @@
 4. `项目地图.md`
 5. `logs/next.md`
 6. `docs/superpowers/specs/2026-07-20-trustmap-prototype-design.md`
-

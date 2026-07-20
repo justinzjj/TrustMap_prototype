@@ -45,4 +45,3 @@
 ## 给新对话的接续提示
 
 先请用户审核书面规格。用户确认后，使用 writing-plans 生成详细实施计划；再按用户授权采用 subagent-driven development，并先固定公共协议/schema，再并行实现不重叠模块。
-
