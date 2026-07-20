@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "packedLeaf": {
+    "sourceTrustRoot": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "sourceBlockHash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+    "expectedLeaf": "0x3e92e0db88d6afea9edc4eedf62fffa4d92bcdfc310dccbe943747fe8302e871"
+  },
+  "zeroHashes": {
+    "depth": 3,
+    "hashes": [
+      "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "0xad3228b676f7d3cd4284a5443f17f1962b36e491b30a40b2405849e597ba5fb5",
+      "0xb4c11951957c6f8f642c4af61cd6b24640fec6dc7fc607ee8206a99e92410d30",
+      "0x21ddb9a356815c3fac1026b6dec5df3124afbadb485c9ba5a3e3398a04b7ba85"
+    ]
+  },
+  "incrementalTree": {
+    "depth": 3,
+    "leaves": [
+      "0x3e92e0db88d6afea9edc4eedf62fffa4d92bcdfc310dccbe943747fe8302e871",
+      "0xc502f868a3f2d78c5adf18b41f606fc4c6cd8a4a9838125f03aadf235245b910"
+    ],
+    "rootsAfterAppend": [
+      "0xad62a975c5cf3b5dc16516b91f92432aeeb7c22cfcc347e32676062ed0a4e3cd",
+      "0xde56c791963d89622dc09a16a1f00afc2b31193d9c52006f89737ea7dd1201b7"
+    ],
+    "expectedNextIndex": 2,
+    "expectedCapacity": 8
+  },
+  "witness": {
+    "depth": 3,
+    "leaf": "0xc502f868a3f2d78c5adf18b41f606fc4c6cd8a4a9838125f03aadf235245b910",
+    "leafIndex": 1,
+    "siblings": [
+      "0x3e92e0db88d6afea9edc4eedf62fffa4d92bcdfc310dccbe943747fe8302e871",
+      "0xad3228b676f7d3cd4284a5443f17f1962b36e491b30a40b2405849e597ba5fb5",
+      "0xb4c11951957c6f8f642c4af61cd6b24640fec6dc7fc607ee8206a99e92410d30"
+    ],
+    "expectedRoot": "0xde56c791963d89622dc09a16a1f00afc2b31193d9c52006f89737ea7dd1201b7"
+  },
+  "recursivePath": {
+    "depth": 3,
+    "baseTrustRoot": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "blockHashes": [
+      "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    ],
+    "witnesses": [
+      {
+        "leafIndex": 1,
+        "siblings": [
+          "0x0101010101010101010101010101010101010101010101010101010101010101",
+          "0x0202020202020202020202020202020202020202020202020202020202020202",
+          "0x0303030303030303030303030303030303030303030303030303030303030303"
+        ]
+      },
+      {
+        "leafIndex": 6,
+        "siblings": [
+          "0x0404040404040404040404040404040404040404040404040404040404040404",
+          "0x0505050505050505050505050505050505050505050505050505050505050505",
+          "0x0606060606060606060606060606060606060606060606060606060606060606"
+        ]
+      }
+    ],
+    "intermediateRoots": [
+      "0x31b1bf37bff2a1754f1dacf82e989e7801672a402980133a454c601e66657bfa",
+      "0x211c83d83f7e830ff451fb5f434534e77b4bd19ae7ae9379f65a1aa8ee4f9203"
+    ],
+    "expectedHomeRoot": "0x211c83d83f7e830ff451fb5f434534e77b4bd19ae7ae9379f65a1aa8ee4f9203"
+  }
+}

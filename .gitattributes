@@ -1,0 +1,30 @@
+* text=auto eol=lf
+
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.sol text eol=lf
+*.sh text eol=lf
+*.mk text eol=lf
+Makefile text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+
+*.abi text eol=lf linguist-generated=true
+*.bin text eol=lf linguist-generated=true
+*.bin-runtime text eol=lf linguist-generated=true
+/contracts/out/** linguist-generated=true
+/contracts/cache/** linguist-generated=true
+
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.pdf binary
