@@ -63,7 +63,11 @@ func (repository *CanonicalCursorRepository) Advance(ctx context.Context, chainI
 	}
 	if current.Height == next.Height {
 		if current.Hash != next.Hash {
-			return current, false, ErrRecordConflict
+			degraded, persistErr := persistCursorDegraded(ctx, tx, current, "canonical block hash changed at persisted height")
+			if persistErr != nil {
+				return current, false, persistErr
+			}
+			return degraded, true, reorg.ErrCanonicalMismatch
 		}
 		if err := tx.Commit(); err != nil {
 			return current, false, err
@@ -72,12 +76,9 @@ func (repository *CanonicalCursorRepository) Advance(ctx context.Context, chainI
 	}
 	advanced, err := current.Advance(recheckedHash, next)
 	if errors.Is(err, reorg.ErrCanonicalMismatch) {
-		degraded := current.Degrade("persisted canonical block hash no longer matches RPC")
-		if _, updateErr := tx.ExecContext(ctx, `UPDATE canonical_cursors SET state='degraded',degraded_reason=?,updated_at=? WHERE chain_id=? AND state='healthy'`, degraded.DegradedReason, time.Now().UTC().UnixNano(), chainID[:]); updateErr != nil {
-			return current, false, updateErr
-		}
-		if commitErr := tx.Commit(); commitErr != nil {
-			return current, false, commitErr
+		degraded, persistErr := persistCursorDegraded(ctx, tx, current, "persisted canonical block hash no longer matches RPC")
+		if persistErr != nil {
+			return current, false, persistErr
 		}
 		return degraded, true, reorg.ErrCanonicalMismatch
 	}
@@ -91,6 +92,26 @@ func (repository *CanonicalCursorRepository) Advance(ctx context.Context, chainI
 		return current, false, err
 	}
 	return advanced, true, nil
+}
+
+func persistCursorDegraded(ctx context.Context, tx *sql.Tx, current reorg.CanonicalCursor, reason string) (reorg.CanonicalCursor, error) {
+	degraded := current.Degrade(reason)
+	result, err := tx.ExecContext(ctx, `UPDATE canonical_cursors SET state='degraded',degraded_reason=?,updated_at=?
+		WHERE chain_id=? AND block_height=? AND block_hash=? AND state='healthy'`, degraded.DegradedReason, time.Now().UTC().UnixNano(), current.ChainID[:], current.Height[:], current.Hash[:])
+	if err != nil {
+		return current, fmt.Errorf("persist degraded canonical cursor: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return current, fmt.Errorf("read degraded canonical cursor update result: %w", err)
+	}
+	if affected != 1 {
+		return current, fmt.Errorf("%w: degraded canonical cursor update affected %d rows", ErrConcurrentUpdate, affected)
+	}
+	if err := tx.Commit(); err != nil {
+		return current, fmt.Errorf("commit degraded canonical cursor: %w", err)
+	}
+	return degraded, nil
 }
 
 func scanCanonicalCursor(row rowScanner) (reorg.CanonicalCursor, error) {

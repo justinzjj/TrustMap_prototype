@@ -56,3 +56,20 @@ func TestTrustRootObservationRejectsInsufficientConfirmations(t *testing.T) {
 		t.Fatal("insufficient confirmations accepted")
 	}
 }
+
+func TestTrustRootObservationAllowsZeroInitialTrustRoot(t *testing.T) {
+	chainID, _ := domain.NewChainID(1)
+	height, _ := domain.NewBlockHeight(10)
+	head, _ := domain.NewBlockHeight(12)
+	observation, err := trustview.NewTrustRootObservation(trustview.TrustRootObservationContent{
+		ChainID: chainID, Height: height, BlockHash: common.HexToHash("0x1"), Gateway: common.HexToAddress("0x1000000000000000000000000000000000000001"),
+		TrustRoot: trustview.TrustRoot{}, GatewayCodeHash: common.HexToHash("0x3"), RequiredConfirmations: 2,
+		ConfirmedHeadHeight: head, ConfirmedHeadHash: common.HexToHash("0x4"),
+	})
+	if err != nil {
+		t.Fatalf("zero initial TrustRoot rejected: %v", err)
+	}
+	if observation.TrustRoot.Hash != (common.Hash{}) || observation.ID == (trustview.TrustRootObservationID{}) {
+		t.Fatalf("zero-root observation = %+v", observation)
+	}
+}

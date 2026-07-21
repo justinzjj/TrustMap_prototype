@@ -46,9 +46,9 @@ func (observation TrustRootObservation) Validate() error {
 		return err
 	}
 	if observation.BlockHash == (common.Hash{}) || observation.Gateway == (common.Address{}) ||
-		observation.TrustRoot.Hash == (common.Hash{}) || observation.GatewayCodeHash == (common.Hash{}) ||
-		observation.ConfirmedHeadHash == (common.Hash{}) || observation.RequiredConfirmations == 0 {
-		return errors.New("TrustRootObservation requires block, Gateway, TrustRoot, code hash, and confirmation evidence")
+		observation.GatewayCodeHash == (common.Hash{}) || observation.ConfirmedHeadHash == (common.Hash{}) ||
+		observation.RequiredConfirmations == 0 {
+		return errors.New("TrustRootObservation requires block, Gateway, code hash, and confirmation evidence")
 	}
 	required := new(big.Int).Add(observation.Height.BigInt(), new(big.Int).SetUint64(observation.RequiredConfirmations))
 	if observation.ConfirmedHeadHeight.BigInt().Cmp(required) < 0 {

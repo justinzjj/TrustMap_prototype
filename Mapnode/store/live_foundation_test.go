@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -105,6 +106,31 @@ func TestTrustRootObservationRepositoryActivatesSyntheticEvidenceAndOnlyOneNode(
 	}
 }
 
+func TestTrustRootObservationRepositoryPersistsZeroInitialTrustRoot(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	live := NewLiveChainRepository(db)
+	if err := live.Sync(ctx, liveRegistry(t)); err != nil {
+		t.Fatal(err)
+	}
+	observation := testObservation(t)
+	observation.TrustRoot = trustview.TrustRoot{}
+	observation.ID = observation.ComputeID()
+	block, _ := domain.NewBlockHeight(5)
+	if err := live.BindDeployment(ctx, chain.GatewayDeployment{ChainID: observation.ChainID, Address: observation.Gateway, CodeHash: observation.GatewayCodeHash}, block); err != nil {
+		t.Fatal(err)
+	}
+	repository := NewTrustRootObservationRepository(db)
+	persisted, node, created, err := repository.Save(ctx, observation)
+	if err != nil || !created || persisted.TrustRoot.Hash != (common.Hash{}) || node.Root.Hash != (common.Hash{}) {
+		t.Fatalf("Save zero root persisted=%+v node=%+v created=%v err=%v", persisted, node, created, err)
+	}
+	loaded, err := repository.Load(ctx, persisted.ID)
+	if err != nil || loaded.TrustRoot.Hash != (common.Hash{}) {
+		t.Fatalf("Load zero root=%+v err=%v", loaded, err)
+	}
+}
+
 func TestInactiveSyntheticObservationEvidenceCannotCreateTrustNode(t *testing.T) {
 	db := openTestDB(t)
 	observation := testObservation(t)
@@ -121,7 +147,11 @@ func TestInactiveSyntheticObservationEvidenceCannotCreateTrustNode(t *testing.T)
 }
 
 func TestCanonicalCursorMismatchPersistsDegradedAcrossRestartAndBlocksAdvance(t *testing.T) {
-	db := openTestDB(t)
+	path := filepath.Join(t.TempDir(), "cursor.sqlite")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	if err := NewLiveChainRepository(db).Sync(ctx, liveRegistry(t)); err != nil {
 		t.Fatal(err)
@@ -137,12 +167,44 @@ func TestCanonicalCursorMismatchPersistsDegradedAcrossRestartAndBlocksAdvance(t 
 	if !errors.Is(err, reorg.ErrCanonicalMismatch) || cursor.State != reorg.Degraded {
 		t.Fatalf("Advance cursor=%+v err=%v", cursor, err)
 	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository = NewCanonicalCursorRepository(db)
 	loaded, err := repository.Load(ctx, chainID)
 	if err != nil || loaded.State != reorg.Degraded {
 		t.Fatalf("Load cursor=%+v err=%v", loaded, err)
 	}
 	if _, _, err := repository.Advance(ctx, chainID, loaded.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8")}); !errors.Is(err, reorg.ErrCursorDegraded) {
 		t.Fatalf("degraded Advance err=%v", err)
+	}
+}
+
+func TestCanonicalCursorSameHeightReplacementPersistsDegraded(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := NewLiveChainRepository(db).Sync(ctx, liveRegistry(t)); err != nil {
+		t.Fatal(err)
+	}
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(7)
+	repository := NewCanonicalCursorRepository(db)
+	initial := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
+	if _, _, err := repository.Initialize(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	cursor, changed, err := repository.Advance(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: height, Hash: common.HexToHash("0x77")})
+	if !errors.Is(err, reorg.ErrCanonicalMismatch) || !changed || cursor.State != reorg.Degraded {
+		t.Fatalf("same-height replacement cursor=%+v changed=%v err=%v", cursor, changed, err)
+	}
+	loaded, err := repository.Load(ctx, chainID)
+	if err != nil || loaded.State != reorg.Degraded || loaded.Hash != initial.Hash {
+		t.Fatalf("persisted cursor=%+v err=%v", loaded, err)
 	}
 }
 

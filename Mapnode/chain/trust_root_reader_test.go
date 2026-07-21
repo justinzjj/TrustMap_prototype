@@ -87,6 +87,27 @@ func TestTrustRootReaderObservesExactConfirmedHistoricalBlock(t *testing.T) {
 	}
 }
 
+func TestTrustRootReaderObservesZeroInitialTrustRootAtExactBlockHash(t *testing.T) {
+	target := &types.Header{Number: big.NewInt(40), Extra: []byte("initial")}
+	head := &types.Header{Number: big.NewInt(42), Extra: []byte("confirmed")}
+	code := []byte{0x60, 0x00}
+	rpc := &readerRPC{chainID: big.NewInt(10001), target: target, head: head, code: code, root: common.Hash{}}
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(40)
+	gateway := common.HexToAddress("0x1000000000000000000000000000000000000001")
+	client, err := chain.NewGatewayClient(rpc, chain.GatewayDeployment{ChainID: chainID, Address: gateway, CodeHash: crypto.Keccak256Hash(code)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := chain.NewTrustRootReader(chain.NewCanonicalBlockReader(rpc), client).Observe(context.Background(), height, target.Hash(), 2)
+	if err != nil {
+		t.Fatalf("zero initial TrustRoot observation failed: %v", err)
+	}
+	if observation.TrustRoot.Hash != (common.Hash{}) || rpc.callBlock != target.Hash() {
+		t.Fatalf("observation=%+v callBlock=%s", observation, rpc.callBlock)
+	}
+}
+
 func TestTrustRootReaderFailsClosedOnCanonicalConfirmationChainAndCodeMismatch(t *testing.T) {
 	target := &types.Header{Number: big.NewInt(40), Extra: []byte("target")}
 	head := &types.Header{Number: big.NewInt(41), Extra: []byte("head")}
