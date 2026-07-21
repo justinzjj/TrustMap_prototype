@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/big"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -43,6 +44,7 @@ type confirmedEventRPC interface {
 type OperationalStore interface {
 	LoadIndexerCursor(context.Context, domain.ChainID) (reorg.CanonicalCursor, bool, error)
 	InitializeIndexerCursor(context.Context, reorg.CanonicalCursor) error
+	MarkIndexerValidated(context.Context, reorg.CanonicalCursor) error
 	LoadIndexerRequest(context.Context, domain.RequestID) (coordinator.Request, bool, error)
 	ObserveExpectedTrustRoot(context.Context, domain.ChainID, domain.BlockHeight, common.Hash, common.Hash) (trustview.TrustNode, error)
 	ApplyIndexerBlock(context.Context, ConfirmedBlock) (bool, error)
@@ -67,6 +69,8 @@ type ConfirmedEventIndexer struct {
 	rpc          confirmedEventRPC
 	operations   OperationalStore
 	observations OperationalStore
+	stepMu       sync.Mutex
+	validated    bool
 }
 
 type StepResult struct {
@@ -142,6 +146,9 @@ func NewConfirmedEventIndexer(config ConfirmedEventIndexerConfig, rpc confirmedE
 }
 
 func (indexer *ConfirmedEventIndexer) Step(ctx context.Context) (StepResult, error) {
+	indexer.stepMu.Lock()
+	defer indexer.stepMu.Unlock()
+
 	head, err := indexer.rpc.BlockNumber(ctx)
 	if err != nil {
 		return StepResult{}, fmt.Errorf("read home head: %w", err)
@@ -173,6 +180,9 @@ func (indexer *ConfirmedEventIndexer) Step(ctx context.Context) (StepResult, err
 		}
 		cursor = reorg.NewCanonicalCursor(indexer.config.ChainID, indexer.config.DeploymentBlock, header.Hash())
 		if err := indexer.operations.InitializeIndexerCursor(ctx, cursor); err != nil {
+			if errors.Is(err, ErrDeterministicStore) {
+				return result, indexer.failClosed(ctx, err)
+			}
 			return result, err
 		}
 	}
@@ -182,11 +192,32 @@ func (indexer *ConfirmedEventIndexer) Step(ctx context.Context) (StepResult, err
 	if !cursor.Height.BigInt().IsUint64() {
 		return result, indexer.failClosed(ctx, errors.New("cursor height exceeds HTTP indexer range"))
 	}
-	start := cursor.Height.BigInt().Uint64() + 1
-	if start == 0 || start > result.SafeHead {
+	if cursor.ChainID != indexer.config.ChainID || cursor.State != reorg.Healthy || cursor.Hash == (common.Hash{}) || cursor.Height.BigInt().Cmp(indexer.config.DeploymentBlock.BigInt()) < 0 {
+		return result, indexer.failClosed(ctx, errors.New("persisted cursor is malformed or outside the trusted deployment"))
+	}
+	if cursor.Height.BigInt().Uint64() > result.SafeHead {
 		return result, nil
 	}
-	for rangeStart := start; rangeStart <= result.SafeHead; {
+	if !indexer.validated {
+		rechecked, err := indexer.header(ctx, cursor.Height.BigInt().Uint64())
+		if err != nil {
+			return result, indexer.classifyRPCError(ctx, err)
+		}
+		if rechecked.Hash() != cursor.Hash {
+			return result, indexer.failClosed(ctx, errors.New("persisted cursor hash is no longer canonical"))
+		}
+		if exists {
+			if err := indexer.validateDeployment(ctx, cursor.Hash); err != nil {
+				var transient transientPreparationError
+				if errors.As(err, &transient) {
+					return result, transient.err
+				}
+				return result, indexer.failClosed(ctx, err)
+			}
+		}
+	}
+	start := cursor.Height.BigInt().Uint64() + 1
+	for rangeStart := start; start != 0 && rangeStart <= result.SafeHead; {
 		rangeEnd := rangeStart + indexer.config.MaxBlockRange - 1
 		if rangeEnd < rangeStart || rangeEnd > result.SafeHead {
 			rangeEnd = result.SafeHead
@@ -243,6 +274,15 @@ func (indexer *ConfirmedEventIndexer) Step(ctx context.Context) (StepResult, err
 			break
 		}
 		rangeStart = rangeEnd + 1
+	}
+	if !indexer.validated {
+		if err := indexer.operations.MarkIndexerValidated(ctx, cursor); err != nil {
+			if errors.Is(err, ErrDeterministicStore) {
+				return result, indexer.failClosed(ctx, err)
+			}
+			return result, err
+		}
+		indexer.validated = true
 	}
 	return result, nil
 }

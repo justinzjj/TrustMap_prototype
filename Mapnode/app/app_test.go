@@ -23,7 +23,7 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
-func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
+func TestOpenBuildsPhaseThreeAppButFailsClosedUntilIndexerValidation(t *testing.T) {
 	config, manifest, closeRPC := appFixture(t, "0x2711")
 	defer closeRPC()
 	application, err := Open(context.Background(), config, manifest)
@@ -31,11 +31,16 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer application.Close()
-	if !application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.canonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.PathProofBuilder == nil {
+	if application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.canonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.PathProofBuilder == nil {
 		t.Fatalf("incomplete Phase 3 composition: %+v", application)
 	}
-	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, coordinator.ErrInvalidObservation) {
-		t.Fatalf("healthy Process did not reach coordinator validation: %v", err)
+	processor := &countingProcessor{}
+	application.coordinator = processor
+	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, ErrOperationalUnavailable) {
+		t.Fatalf("unvalidated Process error=%v", err)
+	}
+	if calls := processor.calls.Load(); calls != 0 {
+		t.Fatalf("unvalidated Process entered coordinator %d times", calls)
 	}
 	home, err := application.Registry.HomeChain()
 	if err != nil || !home.Home || !home.SignerAuthority || !home.TransactionAuthority {
@@ -53,6 +58,80 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 	}
 	if _, err := os.Stat(config.Database.Path); err != nil {
 		t.Fatalf("SQLite database was not opened/migrated: %v", err)
+	}
+}
+
+func TestMarkIndexerValidatedEnablesReadinessAndProcess(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	ctx := context.Background()
+	application, err := Open(ctx, config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(manifest.DeploymentBlock)
+	cursor := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x1234"))
+	if err := application.InitializeIndexerCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+	processor := &countingProcessor{}
+	application.coordinator = processor
+	if err := application.MarkIndexerValidated(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+	if !application.Ready() {
+		t.Fatal("validated App did not become ready")
+	}
+	if _, err := application.Process(ctx, coordinator.Work{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls := processor.calls.Load(); calls != 1 {
+		t.Fatalf("validated Process calls=%d", calls)
+	}
+}
+
+func TestMarkIndexerValidatedRejectsCursorChangedBeforeTransition(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	ctx := context.Background()
+	application, err := Open(ctx, config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(manifest.DeploymentBlock)
+	persisted := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x1234"))
+	if err := application.InitializeIndexerCursor(ctx, persisted); err != nil {
+		t.Fatal(err)
+	}
+	expected := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x5678"))
+	if err := application.MarkIndexerValidated(ctx, expected); !errors.Is(err, indexer.ErrDeterministicStore) {
+		t.Fatalf("changed cursor mark error=%v", err)
+	}
+	if application.Ready() {
+		t.Fatal("cursor mismatch opened operational gate")
+	}
+}
+
+func TestIndexerApplyRemainsAvailableBeforeProcessValidation(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "worker-gate.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	blocks := &countingIndexerStore{}
+	application := &App{database: database, canonicalCursors: store.NewCanonicalCursorRepository(database), indexerRepository: blocks, coordinator: &countingProcessor{}}
+	application.ready.Store(true)
+	if _, err := application.ApplyIndexerBlock(context.Background(), indexer.ConfirmedBlock{}); err != nil {
+		t.Fatal(err)
+	}
+	if blocks.calls.Load() != 1 || application.Ready() {
+		t.Fatalf("worker calls=%d ready=%t", blocks.calls.Load(), application.Ready())
 	}
 }
 
@@ -116,6 +195,7 @@ func TestProcessAndCanonicalDegradationAreLinearized(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer application.Close()
+	application.indexerValidated = true
 
 	chainID, _ := domain.NewChainID(10001)
 	height, _ := domain.NewBlockHeight(7)
@@ -182,6 +262,7 @@ func TestIndexerApplyHoldsOperationalWriteLockAgainstPlanning(t *testing.T) {
 	processor := &countingProcessor{}
 	application := &App{database: database, canonicalCursors: store.NewCanonicalCursorRepository(database), indexerRepository: blocks, coordinator: processor}
 	application.ready.Store(true)
+	application.indexerValidated = true
 	applyDone := make(chan error, 1)
 	go func() {
 		_, err := application.ApplyIndexerBlock(context.Background(), indexer.ConfirmedBlock{})
@@ -217,6 +298,16 @@ func (store *blockingIndexerStore) ApplyConfirmedBlock(context.Context, indexer.
 }
 func (*blockingIndexerStore) Degrade(context.Context, domain.ChainID, string) error { return nil }
 func (*blockingIndexerStore) HasDegraded(context.Context) (bool, error)             { return false, nil }
+
+type countingIndexerStore struct{ calls atomic.Int32 }
+
+func (*countingIndexerStore) Configure(context.Context, store.IndexerConfig) error { return nil }
+func (store *countingIndexerStore) ApplyConfirmedBlock(context.Context, indexer.ConfirmedBlock) (bool, error) {
+	store.calls.Add(1)
+	return true, nil
+}
+func (*countingIndexerStore) Degrade(context.Context, domain.ChainID, string) error { return nil }
+func (*countingIndexerStore) HasDegraded(context.Context) (bool, error)             { return false, nil }
 
 type countingProcessor struct{ calls atomic.Int32 }
 

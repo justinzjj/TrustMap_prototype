@@ -38,6 +38,12 @@ func TestConfirmedEventIndexerAdvancesEverySafeEmptyBlockInBoundedRanges(t *test
 	if result.SafeHead != 8 || result.BlocksApplied != 3 || len(operations.applied) != 3 {
 		t.Fatalf("result=%+v applied=%d", result, len(operations.applied))
 	}
+	if operations.markCalls != 1 {
+		t.Fatalf("validation marks=%d, want 1", operations.markCalls)
+	}
+	if operations.marked != operations.cursor || operations.marked.Height.BigInt().Uint64() != result.SafeHead {
+		t.Fatalf("validation marked cursor=%+v final=%+v safeHead=%d", operations.marked, operations.cursor, result.SafeHead)
+	}
 	for index, want := range []uint64{6, 7, 8} {
 		if operations.applied[index].Number != want {
 			t.Fatalf("applied[%d]=%d want=%d", index, operations.applied[index].Number, want)
@@ -57,8 +63,111 @@ func TestConfirmedEventIndexerDoesNotAdvanceWhenHeadIsBelowConfirmations(t *test
 	if _, err := indexer.Step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(operations.applied) != 0 || operations.initialized {
+	if len(operations.applied) != 0 || operations.initialized || operations.markCalls != 0 {
 		t.Fatalf("unsafe deployment initialized/applied: %+v", operations)
+	}
+}
+
+func TestConfirmedEventIndexerWaitsWithoutDegradingWhenDeploymentIsNotSafe(t *testing.T) {
+	chainID, _ := domain.NewChainID(10002)
+	height, _ := domain.NewBlockHeight(5)
+	rpc := &fakeIndexerRPC{chainID: big.NewInt(10002), head: 6, headers: makeHeaderChain(0, 6), code: []byte{1}}
+	operations := &fakeOperations{}
+	indexer, _ := NewConfirmedEventIndexer(ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash(rpc.code), DeploymentBlock: height, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}, rpc, operations, nil)
+	if _, err := indexer.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if operations.initialized || operations.markCalls != 0 || operations.degraded != "" {
+		t.Fatalf("unsafe deployment changed validation state: %+v", operations)
+	}
+}
+
+func TestConfirmedEventIndexerRestartRevalidatesPersistedCursor(t *testing.T) {
+	chainID, _ := domain.NewChainID(10002)
+	height, _ := domain.NewBlockHeight(5)
+	headers := makeHeaderChain(0, 7)
+	rpc := &fakeIndexerRPC{chainID: big.NewInt(10002), head: 7, headers: headers, code: []byte{1}}
+	operations := &fakeOperations{cursor: reorg.NewCanonicalCursor(chainID, height, headers[5].Hash()), initialized: true}
+	config := ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash(rpc.code), DeploymentBlock: height, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}
+
+	first, _ := NewConfirmedEventIndexer(config, rpc, operations, nil)
+	if _, err := first.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := NewConfirmedEventIndexer(config, rpc, operations, nil)
+	rpc.chainErr = errors.New("temporary restart RPC outage")
+	if _, err := second.Step(context.Background()); err == nil || errors.Is(err, ErrDeterministicIndexing) {
+		t.Fatalf("restart transient error=%v", err)
+	}
+	if operations.markCalls != 1 || operations.degraded != "" {
+		t.Fatalf("restart transient state=%+v", operations)
+	}
+	rpc.chainErr = nil
+	if _, err := second.Step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if operations.markCalls != 2 || rpc.chainCalls != 3 || rpc.codeCalls != 2 {
+		t.Fatalf("restart validation marks=%d chain calls=%d code calls=%d", operations.markCalls, rpc.chainCalls, rpc.codeCalls)
+	}
+}
+
+func TestConfirmedEventIndexerInitialWrongCodeFailsClosedBeforeValidation(t *testing.T) {
+	chainID, _ := domain.NewChainID(10002)
+	height, _ := domain.NewBlockHeight(5)
+	headers := makeHeaderChain(0, 7)
+	rpc := &fakeIndexerRPC{chainID: big.NewInt(10002), head: 7, headers: headers, code: []byte{1}}
+	operations := &fakeOperations{}
+	indexer, _ := NewConfirmedEventIndexer(ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash([]byte{2}), DeploymentBlock: height, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}, rpc, operations, nil)
+	if _, err := indexer.Step(context.Background()); !errors.Is(err, ErrDeterministicIndexing) {
+		t.Fatalf("Step error=%v", err)
+	}
+	if operations.degraded == "" || operations.markCalls != 0 {
+		t.Fatalf("wrong code state=%+v", operations)
+	}
+}
+
+func TestConfirmedEventIndexerInitializationConflictFailsClosed(t *testing.T) {
+	chainID, _ := domain.NewChainID(10002)
+	height, _ := domain.NewBlockHeight(5)
+	headers := makeHeaderChain(0, 7)
+	rpc := &fakeIndexerRPC{chainID: big.NewInt(10002), head: 7, headers: headers, code: []byte{1}}
+	operations := &fakeOperations{initializeErr: DeterministicStoreError(errors.New("cursor changed"))}
+	indexer, _ := NewConfirmedEventIndexer(ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash(rpc.code), DeploymentBlock: height, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}, rpc, operations, nil)
+	if _, err := indexer.Step(context.Background()); !errors.Is(err, ErrDeterministicIndexing) {
+		t.Fatalf("initialization conflict error=%v", err)
+	}
+	if operations.degraded == "" || operations.markCalls != 0 {
+		t.Fatalf("initialization conflict state=%+v", operations)
+	}
+}
+
+func TestConfirmedEventIndexerWaitsWithoutDegradingWhenPersistedCursorIsNotSafe(t *testing.T) {
+	chainID, _ := domain.NewChainID(10002)
+	height, _ := domain.NewBlockHeight(6)
+	headers := makeHeaderChain(0, 7)
+	rpc := &fakeIndexerRPC{chainID: big.NewInt(10002), head: 7, headers: headers, code: []byte{1}}
+	operations := &fakeOperations{cursor: reorg.NewCanonicalCursor(chainID, height, headers[6].Hash()), initialized: true}
+	indexer, _ := NewConfirmedEventIndexer(ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash(rpc.code), DeploymentBlock: height, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}, rpc, operations, nil)
+	if _, err := indexer.Step(context.Background()); err != nil {
+		t.Fatalf("unsafe persisted cursor error=%v", err)
+	}
+	if operations.degraded != "" || operations.markCalls != 0 {
+		t.Fatalf("unsafe persisted cursor state=%+v", operations)
+	}
+}
+
+func TestConfirmedEventIndexerPersistedCursorHashMismatchFailsClosed(t *testing.T) {
+	chainID, _ := domain.NewChainID(10002)
+	height, _ := domain.NewBlockHeight(5)
+	headers := makeHeaderChain(0, 7)
+	rpc := &fakeIndexerRPC{chainID: big.NewInt(10002), head: 7, headers: headers, code: []byte{1}}
+	operations := &fakeOperations{cursor: reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0xdead")), initialized: true}
+	indexer, _ := NewConfirmedEventIndexer(ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash(rpc.code), DeploymentBlock: height, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}, rpc, operations, nil)
+	if _, err := indexer.Step(context.Background()); !errors.Is(err, ErrDeterministicIndexing) {
+		t.Fatalf("non-canonical persisted cursor error=%v", err)
+	}
+	if operations.degraded == "" || operations.markCalls != 0 {
+		t.Fatalf("non-canonical persisted cursor state=%+v", operations)
 	}
 }
 
@@ -74,6 +183,9 @@ func TestConfirmedEventIndexerFailsClosedOnDeterministicApplyError(t *testing.T)
 	}
 	if operations.degraded == "" {
 		t.Fatal("deterministic apply error did not persist degradation")
+	}
+	if operations.markCalls != 0 {
+		t.Fatalf("failed backlog marked validation %d times", operations.markCalls)
 	}
 }
 
@@ -148,18 +260,21 @@ func TestPrepareBlockClassifiesHashBoundObservationMismatchAsDeterministic(t *te
 }
 
 type fakeIndexerRPC struct {
-	chainID  *big.Int
-	chainErr error
-	head     uint64
-	headers  map[uint64]*types.Header
-	code     []byte
-	logs     []types.Log
-	filters  [][2]uint64
-	receipts map[common.Hash]*types.Receipt
+	chainID    *big.Int
+	chainErr   error
+	head       uint64
+	headers    map[uint64]*types.Header
+	code       []byte
+	logs       []types.Log
+	filters    [][2]uint64
+	receipts   map[common.Hash]*types.Receipt
+	chainCalls int
+	codeCalls  int
 }
 
 func (rpc *fakeIndexerRPC) BlockNumber(context.Context) (uint64, error) { return rpc.head, nil }
 func (rpc *fakeIndexerRPC) ChainID(context.Context) (*big.Int, error) {
+	rpc.chainCalls++
 	if rpc.chainErr != nil {
 		return nil, rpc.chainErr
 	}
@@ -172,6 +287,7 @@ func (rpc *fakeIndexerRPC) HeaderByNumber(_ context.Context, number *big.Int) (*
 	return rpc.headers[number.Uint64()], nil
 }
 func (rpc *fakeIndexerRPC) CodeAtHash(context.Context, common.Address, common.Hash) ([]byte, error) {
+	rpc.codeCalls++
 	return append([]byte(nil), rpc.code...), nil
 }
 func (rpc *fakeIndexerRPC) FilterLogs(_ context.Context, query ethereum.FilterQuery) ([]types.Log, error) {
@@ -190,20 +306,31 @@ func (rpc *fakeIndexerRPC) TransactionReceipt(_ context.Context, hash common.Has
 }
 
 type fakeOperations struct {
-	cursor      reorg.CanonicalCursor
-	initialized bool
-	applied     []ConfirmedBlock
-	degraded    string
-	applyErr    error
-	loadRequest *coordinator.Request
-	observeErr  error
+	cursor        reorg.CanonicalCursor
+	initialized   bool
+	applied       []ConfirmedBlock
+	degraded      string
+	applyErr      error
+	loadRequest   *coordinator.Request
+	observeErr    error
+	markCalls     int
+	marked        reorg.CanonicalCursor
+	initializeErr error
 }
 
 func (operations *fakeOperations) LoadIndexerCursor(context.Context, domain.ChainID) (reorg.CanonicalCursor, bool, error) {
 	return operations.cursor, operations.initialized, nil
 }
 func (operations *fakeOperations) InitializeIndexerCursor(_ context.Context, cursor reorg.CanonicalCursor) error {
+	if operations.initializeErr != nil {
+		return operations.initializeErr
+	}
 	operations.cursor, operations.initialized = cursor, true
+	return nil
+}
+func (operations *fakeOperations) MarkIndexerValidated(_ context.Context, cursor reorg.CanonicalCursor) error {
+	operations.markCalls++
+	operations.marked = cursor
 	return nil
 }
 func (operations *fakeOperations) LoadIndexerRequest(context.Context, domain.RequestID) (coordinator.Request, bool, error) {

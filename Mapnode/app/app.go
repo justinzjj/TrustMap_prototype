@@ -48,6 +48,7 @@ type App struct {
 	pathTreeDepth     uint8
 	ready             atomic.Bool
 	operationalMu     sync.RWMutex
+	indexerValidated  bool
 	canonicalCursors  *store.CanonicalCursorRepository
 	planner           *planner.Planner
 	coordinator       requestProcessor
@@ -206,6 +207,16 @@ func (application *App) Process(ctx context.Context, work coordinator.Work) (coo
 }
 
 func (application *App) operationalGate(ctx context.Context) error {
+	if err := application.indexerWorkerGate(ctx); err != nil {
+		return err
+	}
+	if !application.indexerValidated {
+		return ErrOperationalUnavailable
+	}
+	return nil
+}
+
+func (application *App) indexerWorkerGate(ctx context.Context) error {
 	if !application.ready.Load() || application.canonicalCursors == nil || application.coordinator == nil {
 		return ErrOperationalUnavailable
 	}
@@ -305,7 +316,33 @@ func (application *App) InitializeIndexerCursor(ctx context.Context, cursor reor
 		return ErrOperationalUnavailable
 	}
 	_, _, err := application.canonicalCursors.Initialize(ctx, cursor)
+	if errors.Is(err, store.ErrRecordConflict) {
+		return indexer.DeterministicStoreError(err)
+	}
 	return err
+}
+
+func (application *App) MarkIndexerValidated(ctx context.Context, expected reorg.CanonicalCursor) error {
+	if application == nil {
+		return ErrOperationalUnavailable
+	}
+	application.operationalMu.Lock()
+	defer application.operationalMu.Unlock()
+	if err := application.indexerWorkerGate(ctx); err != nil {
+		return err
+	}
+	persisted, err := application.canonicalCursors.Load(ctx, expected.ChainID)
+	if errors.Is(err, store.ErrRecordNotFound) {
+		return indexer.DeterministicStoreError(errors.New("validated indexer cursor disappeared before readiness transition"))
+	}
+	if err != nil {
+		return err
+	}
+	if persisted != expected || persisted.State != reorg.Healthy {
+		return indexer.DeterministicStoreError(errors.New("validated indexer cursor changed before readiness transition"))
+	}
+	application.indexerValidated = true
+	return nil
 }
 
 func (application *App) LoadIndexerRequest(ctx context.Context, id domain.RequestID) (coordinator.Request, bool, error) {
@@ -324,7 +361,7 @@ func (application *App) LoadIndexerRequest(ctx context.Context, id domain.Reques
 func (application *App) ApplyIndexerBlock(ctx context.Context, block indexer.ConfirmedBlock) (bool, error) {
 	application.operationalMu.Lock()
 	defer application.operationalMu.Unlock()
-	if err := application.operationalGate(ctx); err != nil {
+	if err := application.indexerWorkerGate(ctx); err != nil {
 		return false, err
 	}
 	if application.indexerRepository == nil {
@@ -386,7 +423,7 @@ func (application *App) ObserveExpectedTrustRoot(ctx context.Context, chainID do
 	}
 	application.operationalMu.Lock()
 	defer application.operationalMu.Unlock()
-	if err := application.operationalGate(ctx); err != nil {
+	if err := application.indexerWorkerGate(ctx); err != nil {
 		return trustview.TrustNode{}, err
 	}
 	if err := application.LiveChains.BindDeployment(ctx, binding.deployment, binding.block); err != nil {
