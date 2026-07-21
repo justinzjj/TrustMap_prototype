@@ -176,14 +176,19 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 	edgeA, edgeB := blob32(0xe1), blob32(0xe2)
 	missingWitnessEdge := blob32(0xe0)
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
-		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
-	) VALUES(?,?,?,?,?,NULL,1)`, snapshotA, missingWitnessEdge, homeA, targetA, evidenceRecord.ID[:]); err != nil {
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,NULL,0,1)`, snapshotA, missingWitnessEdge, homeA, targetA, evidenceRecord.ID[:]); err != nil {
 		t.Fatalf("insert active edge with missing proof material: %v", err)
 	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
-		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
-	) VALUES(?,?,?,?,?,?,1)`, snapshotA, edgeA, homeA, targetA, evidenceRecord.ID[:], witnessID); err != nil {
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,?,0,1)`, snapshotA, edgeA, homeA, targetA, evidenceRecord.ID[:], witnessID); err != nil {
 		t.Fatalf("insert snapshot A edge: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,?,1,1)`, snapshotA, blob32(0xed), homeA, targetA, evidenceRecord.ID[:], witnessID); err == nil {
+		t.Fatal("snapshot edge accepted witness with wrong dependency leaf index")
 	}
 	if _, err := db.sql.Exec(`INSERT INTO membership_witness_siblings(
 		witness_id,sibling_index,sibling_hash
@@ -196,23 +201,23 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 		t.Fatal("snapshot-referenced witness sibling was overwritten")
 	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
-		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
-	) VALUES(?,?,?,?,?,?,1)`, snapshotB, edgeB, homeB, targetB, evidenceRecord.ID[:], witnessID); err != nil {
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,?,0,1)`, snapshotB, edgeB, homeB, targetB, evidenceRecord.ID[:], witnessID); err != nil {
 		t.Fatalf("insert snapshot B edge: %v", err)
 	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
-		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
-	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xee), homeA, targetA, evidenceRecord.ID[:], witnessB); err == nil {
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,?,0,1)`, snapshotA, blob32(0xee), homeA, targetA, evidenceRecord.ID[:], witnessB); err == nil {
 		t.Fatal("snapshot edge accepted witness belonging to different evidence")
 	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
-		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
-	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xe3), homeA, targetB, evidenceRecord.ID[:], witnessID); err == nil {
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,?,0,1)`, snapshotA, blob32(0xe3), homeA, targetB, evidenceRecord.ID[:], witnessID); err == nil {
 		t.Fatal("snapshot edge accepted node from another snapshot")
 	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
-		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
-	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xe4), homeA, targetA, evidenceRecord.ID[:], blob32(0xff)); err == nil {
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost
+	) VALUES(?,?,?,?,?,?,0,1)`, snapshotA, blob32(0xe4), homeA, targetA, evidenceRecord.ID[:], blob32(0xff)); err == nil {
 		t.Fatal("snapshot edge accepted missing witness")
 	}
 	if _, err := db.sql.Exec(`INSERT INTO plans(

@@ -59,8 +59,8 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 	if _, _, err := NewRequestRepository(db).Observe(ctx, request); err != nil {
 		t.Fatal(err)
 	}
-	edgeCB, _ := trustview.NewTrustEdge(c.ID, b.ID, records[0].ID, nil, 100)
-	edgeBA, _ := trustview.NewTrustEdge(b.ID, a.ID, records[1].ID, nil, 100)
+	edgeCB, _ := trustview.NewTrustEdge(c.ID, b.ID, records[0].ID, dependencyCB.LeafIndex, nil, 100)
+	edgeBA, _ := trustview.NewTrustEdge(b.ID, a.ID, records[1].ID, dependencyBA.LeafIndex, nil, 100)
 	graph := NewTrustViewRepository(db)
 	if _, err := graph.MergeActiveTrustEdge(ctx, c, b, edgeCB, dependencyCB); !errors.Is(err, ErrInactiveEvidence) {
 		t.Fatalf("candidate evidence merge error = %v", err)
@@ -93,7 +93,7 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 	if _, err := graph.MergeActiveTrustEdge(ctx, c, unrelatedTo, edgeCB, dependencyCB); !errors.Is(err, ErrEvidenceBinding) {
 		t.Fatalf("unrelated to evidence error = %v", err)
 	}
-	unrelatedEdge, _ := trustview.NewTrustEdge(c.ID, b.ID, records[2].ID, nil, 100)
+	unrelatedEdge, _ := trustview.NewTrustEdge(c.ID, b.ID, records[2].ID, dependencyCB.LeafIndex, nil, 100)
 	unrelatedDependency := dependencyCB
 	unrelatedDependency.EvidenceID = records[2].ID
 	if _, err := graph.MergeActiveTrustEdge(ctx, c, b, unrelatedEdge, unrelatedDependency); !errors.Is(err, ErrEvidenceBinding) {
@@ -104,7 +104,7 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 		t.Fatal(err)
 	}
 	activateEvidence(t, evidenceRepo, opaqueEdgeEvidence.ID)
-	opaqueEdge, _ := trustview.NewTrustEdge(c.ID, b.ID, opaqueEdgeEvidence.ID, nil, 100)
+	opaqueEdge, _ := trustview.NewTrustEdge(c.ID, b.ID, opaqueEdgeEvidence.ID, dependencyCB.LeafIndex, nil, 100)
 	opaqueDependency := dependencyCB
 	opaqueDependency.EvidenceID = opaqueEdgeEvidence.ID
 	if _, err := graph.MergeActiveTrustEdge(ctx, c, b, opaqueEdge, opaqueDependency); !errors.Is(err, ErrEvidenceBinding) {
@@ -112,6 +112,10 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 	}
 	if changed, err := graph.MergeActiveTrustEdge(ctx, c, b, edgeCB, dependencyCB); err != nil || !changed {
 		t.Fatalf("merge C->B = %t, %v", changed, err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO trust_edges(edge_id,from_node_id,to_node_id,evidence_id,active,dependency_leaf_index,path_step_cost,created_at)
+		VALUES(?,?,?,?,1,0,100,1)`, common.HexToHash("0xeeee").Bytes(), c.ID[:], b.ID[:], records[0].ID[:]); err == nil {
+		t.Fatal("one DependencyRecorded evidence authorized multiple TrustEdges")
 	}
 	if changed, err := graph.MergeActiveTrustEdge(ctx, b, a, edgeBA, dependencyBA); err != nil || !changed {
 		t.Fatalf("merge B->A = %t, %v", changed, err)
@@ -131,7 +135,7 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 		t.Fatal(err)
 	}
 	activateEvidence(t, evidenceRepo, secondEdgeEvidence.ID)
-	secondEdge, _ := trustview.NewTrustEdge(c.ID, b.ID, secondEdgeEvidence.ID, nil, 100)
+	secondEdge, _ := trustview.NewTrustEdge(c.ID, b.ID, secondEdgeEvidence.ID, secondDependency.LeafIndex, nil, 100)
 	if changed, err := graph.MergeActiveTrustEdge(ctx, c, b, secondEdge, secondDependency); err != nil || !changed {
 		t.Fatalf("second DependencyRecorded in same block = %t, %v", changed, err)
 	}
@@ -170,19 +174,34 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 	if !oldSnapshot.Sealed || len(oldSnapshot.Edges) != 3 {
 		t.Fatalf("old snapshot = %+v", oldSnapshot)
 	}
+	expectedLeaves := map[evidence.ID]uint32{records[0].ID: 0, records[1].ID: 1, secondEdgeEvidence.ID: 2}
 	for _, edge := range oldSnapshot.Edges {
 		if edge.WitnessID != nil {
 			t.Fatal("snapshot unexpectedly had witness")
+		}
+		if edge.LeafIndex != expectedLeaves[edge.EvidenceID] {
+			t.Fatalf("snapshot edge leaf = %d, want %d", edge.LeafIndex, expectedLeaves[edge.EvidenceID])
 		}
 	}
 
 	witnessCB := trustview.NewMembershipWitness(records[0].ID, 0, []common.Hash{common.HexToHash("0x101")})
 	witnessBA := trustview.NewMembershipWitness(records[1].ID, 1, []common.Hash{common.HexToHash("0x102")})
 	witnessSecond := trustview.NewMembershipWitness(secondEdgeEvidence.ID, 2, []common.Hash{common.HexToHash("0x103")})
+	wrongLeafWitness := trustview.NewMembershipWitness(records[0].ID, 99, []common.Hash{common.HexToHash("0x999")})
+	if _, err := graph.SaveMembershipWitness(ctx, wrongLeafWitness); !errors.Is(err, ErrEvidenceBinding) {
+		t.Fatalf("wrong witness leaf error = %v", err)
+	}
+	noEdgeWitness := trustview.NewMembershipWitness(records[2].ID, 0, []common.Hash{common.HexToHash("0x998")})
+	if _, err := graph.SaveMembershipWitness(ctx, noEdgeWitness); !errors.Is(err, ErrEvidenceBinding) {
+		t.Fatalf("witness without TrustEdge error = %v", err)
+	}
 	for _, witness := range []trustview.MembershipWitness{witnessCB, witnessBA, witnessSecond} {
 		if inserted, err := graph.SaveMembershipWitness(ctx, witness); err != nil || !inserted {
 			t.Fatalf("SaveMembershipWitness = %t, %v", inserted, err)
 		}
+	}
+	if inserted, err := graph.SaveMembershipWitness(ctx, witnessCB); err != nil || inserted {
+		t.Fatalf("idempotent full witness replay = %t, %v", inserted, err)
 	}
 	loadedOld, err := graph.LoadTrustViewSnapshot(ctx, oldSnapshot.ID)
 	if err != nil {
@@ -205,6 +224,9 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 		if edge.WitnessID == nil {
 			t.Fatal("new snapshot omitted membership witness")
 		}
+		if edge.LeafIndex != expectedLeaves[edge.EvidenceID] {
+			t.Fatalf("witness snapshot edge leaf = %d, want %d", edge.LeafIndex, expectedLeaves[edge.EvidenceID])
+		}
 	}
 
 	reg := calibratedRegistry(t, chainC, chainA)
@@ -216,8 +238,27 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 	if selected.Type != planner.PathPlan || len(selected.Hops) != 2 || selected.PathCost == nil || *selected.PathCost != 200 {
 		t.Fatalf("selected plan = %+v", selected)
 	}
+	invalidIdentity := selected.Clone()
+	invalidIdentity.ID[0] ^= 1
+	if err := planRepo.SavePlan(ctx, invalidIdentity); !errors.Is(err, planner.ErrPlanIDMismatch) {
+		t.Fatalf("arbitrary PlanID error = %v", err)
+	}
+	planTampering := []func(*planner.Plan){
+		func(plan *planner.Plan) { plan.RequestID[0] ^= 1 }, func(plan *planner.Plan) { plan.Attempt++ }, func(plan *planner.Plan) { plan.SnapshotID[0] ^= 1 },
+		func(plan *planner.Plan) { plan.ProfileID += "x" }, func(plan *planner.Plan) { plan.ProfileFingerprint[0] ^= 1 }, func(plan *planner.Plan) { plan.Type = planner.DirectPlan },
+		func(plan *planner.Plan) { plan.HomeNodeID[0] ^= 1 }, func(plan *planner.Plan) { plan.TargetNodeID[0] ^= 1 }, func(plan *planner.Plan) { plan.Hops[0][0] ^= 1 },
+		func(plan *planner.Plan) { plan.PathStepCost++ }, func(plan *planner.Plan) { *plan.PathCost += 1 }, func(plan *planner.Plan) { *plan.DirectCost += 1 }, func(plan *planner.Plan) { plan.FallbackReason = planner.NoPath },
+	}
+	for index, tamper := range planTampering {
+		changed := selected.Clone()
+		tamper(&changed)
+		if err := planRepo.SavePlan(ctx, changed); !errors.Is(err, planner.ErrPlanIDMismatch) {
+			t.Fatalf("tampered plan field %d error = %v", index, err)
+		}
+	}
 	conflictingAttempt := selected.Clone()
-	conflictingAttempt.ID[0] ^= 1
+	conflictingAttempt.ProfileID = "other-profile"
+	conflictingAttempt.ID = planner.ComputePlanID(conflictingAttempt)
 	if err := planRepo.SavePlan(ctx, conflictingAttempt); !errors.Is(err, ErrRecordConflict) {
 		t.Fatalf("same attempt different PlanID error = %v", err)
 	}
@@ -228,9 +269,9 @@ func TestTrustViewRepositoryActiveEvidenceSnapshotsAndPlanSurviveRestart(t *test
 			t.Fatal(createErr)
 		}
 		plan := selected.Clone()
-		plan.ID = planner.PlanID(common.BigToHash(new(big.Int).SetUint64(0x9000 + attempt)))
 		plan.Attempt = attempt
 		plan.SnapshotID = snapshot.ID
+		plan.ID = planner.ComputePlanID(plan)
 		return plan, snapshot
 	}
 	plan2, _ := makeLaterPlan(2)

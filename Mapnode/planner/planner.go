@@ -26,6 +26,7 @@ var (
 	ErrPathCostOverflow         = errors.New("TrustView path cost overflows uint64")
 	ErrStaleSnapshot            = errors.New("TrustViewSnapshot is stale")
 	ErrInconsistentPathStepCost = errors.New("TrustViewSnapshot path step cost is not a single trusted non-zero value")
+	ErrPlanIDMismatch           = errors.New("PlanID does not match persisted plan content")
 )
 
 type PlanID [32]byte
@@ -190,39 +191,53 @@ func (planner *Planner) Plan(ctx context.Context, request Request) (Plan, error)
 }
 
 func (planner *Planner) persist(ctx context.Context, plan Plan) (Plan, error) {
-	plan.ID = computePlanID(plan)
+	plan.ID = ComputePlanID(plan)
 	if err := planner.plans.SavePlan(ctx, plan); err != nil {
 		return Plan{}, err
 	}
 	return planner.plans.LoadPlan(ctx, plan.ID)
 }
 
-func computePlanID(plan Plan) PlanID {
-	encoded := make([]byte, 0, 32*4+len(plan.Type)+len(plan.ProfileID))
+// ComputePlanID is a domain-separated, unambiguous content address for every
+// persisted planning decision. CreatedAt is deliberately excluded.
+func ComputePlanID(plan Plan) PlanID {
+	encoded := make([]byte, 0, 320+len(plan.ProfileID)+len(plan.FallbackReason)+32*len(plan.Hops))
+	encoded = appendLengthPrefixed(encoded, []byte("TrustMap/Planner/PlanID/v1"))
 	encoded = append(encoded, plan.RequestID[:]...)
-	word := [32]byte{}
-	binary.BigEndian.PutUint64(word[24:], plan.Attempt)
-	encoded = append(encoded, word[:]...)
+	encoded = appendUint64Word(encoded, plan.Attempt)
 	encoded = append(encoded, plan.SnapshotID[:]...)
-	encoded = append(encoded, []byte(plan.Type)...)
-	encoded = append(encoded, []byte(plan.ProfileID)...)
+	encoded = appendLengthPrefixed(encoded, []byte(plan.ProfileID))
 	encoded = append(encoded, plan.ProfileFingerprint[:]...)
-	encoded = append(encoded, []byte(plan.FallbackReason)...)
-	word = [32]byte{}
-	binary.BigEndian.PutUint64(word[24:], plan.PathStepCost)
-	encoded = append(encoded, word[:]...)
+	encoded = appendLengthPrefixed(encoded, []byte(plan.Type))
+	encoded = append(encoded, plan.HomeNodeID[:]...)
+	encoded = append(encoded, plan.TargetNodeID[:]...)
+	encoded = appendUint64Word(encoded, uint64(len(plan.Hops)))
+	for _, edgeID := range plan.Hops {
+		encoded = append(encoded, edgeID[:]...)
+	}
+	encoded = appendUint64Word(encoded, plan.PathStepCost)
 	for _, value := range []*uint64{plan.PathCost, plan.DirectCost} {
-		word = [32]byte{}
+		word := [32]byte{}
 		if value != nil {
 			word[0] = 1
 			binary.BigEndian.PutUint64(word[24:], *value)
 		}
 		encoded = append(encoded, word[:]...)
 	}
-	for _, edgeID := range plan.Hops {
-		encoded = append(encoded, edgeID[:]...)
-	}
+	encoded = appendLengthPrefixed(encoded, []byte(plan.FallbackReason))
 	return PlanID(crypto.Keccak256Hash(encoded))
+}
+
+func appendLengthPrefixed(destination, value []byte) []byte {
+	length := [4]byte{}
+	binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+	destination = append(destination, length[:]...)
+	return append(destination, value...)
+}
+func appendUint64Word(destination []byte, value uint64) []byte {
+	word := [32]byte{}
+	binary.BigEndian.PutUint64(word[24:], value)
+	return append(destination, word[:]...)
 }
 
 func snapshotHasNode(snapshot trustview.TrustViewSnapshot, id trustview.NodeID) bool {

@@ -21,6 +21,9 @@ func (repository *PlanRepository) SavePlan(ctx context.Context, plan planner.Pla
 	if repository == nil || repository.db == nil {
 		return errors.New("nil plan repository database")
 	}
+	if plan.ID != planner.ComputePlanID(plan) {
+		return planner.ErrPlanIDMismatch
+	}
 	if err := validatePlanForStorage(plan); err != nil {
 		return err
 	}
@@ -221,11 +224,18 @@ func loadPlan(ctx context.Context, query queryer, id planner.PlanID) (planner.Pl
 		}
 		plan.Hops = append(plan.Hops, edgeID)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return planner.Plan{}, fmt.Errorf("iterate plan hops: %w", err)
+	}
 	if err := rows.Close(); err != nil {
-		return planner.Plan{}, err
+		return planner.Plan{}, fmt.Errorf("close plan hops: %w", err)
 	}
 	if len(plan.Hops) != int(hopCount) {
 		return planner.Plan{}, errors.New("corrupt plan hop count")
+	}
+	if plan.ID != planner.ComputePlanID(plan) {
+		return planner.Plan{}, planner.ErrPlanIDMismatch
 	}
 	return plan, nil
 }

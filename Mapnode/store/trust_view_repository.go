@@ -8,6 +8,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
@@ -64,7 +65,7 @@ func (repository *TrustViewRepository) MergeActiveTrustEdge(
 		return false, err
 	}
 	if !evidenceLocatorMatchesNode(fromEvidence.Locator, from) || !evidenceLocatorMatchesNode(toEvidence.Locator, to) ||
-		!evidenceLocatorMatchesNode(edgeEvidence.Locator, from) || dependency.EvidenceID != edge.EvidenceID {
+		!evidenceLocatorMatchesNode(edgeEvidence.Locator, from) || dependency.EvidenceID != edge.EvidenceID || edge.LeafIndex != dependency.LeafIndex {
 		return false, ErrEvidenceBinding
 	}
 	if err := dependency.Validate(to, edgeEvidence.Locator.PayloadDigest); err != nil {
@@ -150,12 +151,12 @@ func mergeTrustNode(ctx context.Context, tx *sql.Tx, node trustview.TrustNode) (
 func mergeTrustEdge(ctx context.Context, tx *sql.Tx, edge trustview.TrustEdge) (bool, error) {
 	var from, to, evidenceID []byte
 	var active int
-	var cost int64
-	err := tx.QueryRowContext(ctx, `SELECT from_node_id,to_node_id,evidence_id,active,path_step_cost
-		FROM trust_edges WHERE edge_id=?`, edge.ID[:]).Scan(&from, &to, &evidenceID, &active, &cost)
+	var cost, leafIndex int64
+	err := tx.QueryRowContext(ctx, `SELECT from_node_id,to_node_id,evidence_id,active,dependency_leaf_index,path_step_cost
+		FROM trust_edges WHERE edge_id=?`, edge.ID[:]).Scan(&from, &to, &evidenceID, &active, &leafIndex, &cost)
 	if err == nil {
 		if !equalBytes(from, edge.From[:]) || !equalBytes(to, edge.To[:]) || !equalBytes(evidenceID, edge.EvidenceID[:]) ||
-			cost != int64(edge.PathStepCost) {
+			leafIndex != int64(edge.LeafIndex) || cost != int64(edge.PathStepCost) {
 			return false, ErrGraphConflict
 		}
 		if active == 1 {
@@ -169,9 +170,15 @@ func mergeTrustEdge(ctx context.Context, tx *sql.Tx, edge trustview.TrustEdge) (
 	if !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("load TrustEdge: %w", err)
 	}
+	var existingEdgeID []byte
+	if err := tx.QueryRowContext(ctx, "SELECT edge_id FROM trust_edges WHERE evidence_id=?", edge.EvidenceID[:]).Scan(&existingEdgeID); err == nil {
+		return false, ErrGraphConflict
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("check TrustEdge evidence uniqueness: %w", err)
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO trust_edges(
-		edge_id,from_node_id,to_node_id,evidence_id,active,path_step_cost,created_at
-	) VALUES(?,?,?,?,1,?,?)`, edge.ID[:], edge.From[:], edge.To[:], edge.EvidenceID[:], int64(edge.PathStepCost), time.Now().UTC().UnixNano())
+		edge_id,from_node_id,to_node_id,evidence_id,active,dependency_leaf_index,path_step_cost,created_at
+	) VALUES(?,?,?,?,1,?,?,?)`, edge.ID[:], edge.From[:], edge.To[:], edge.EvidenceID[:], int64(edge.LeafIndex), int64(edge.PathStepCost), time.Now().UTC().UnixNano())
 	if err != nil {
 		return false, fmt.Errorf("insert TrustEdge: %w", err)
 	}
@@ -206,11 +213,33 @@ func (repository *TrustViewRepository) SaveMembershipWitness(ctx context.Context
 	if err := requireActiveEvidence(ctx, tx, witness.EvidenceID); err != nil {
 		return false, err
 	}
+	var expectedLeaf int64
+	if err := tx.QueryRowContext(ctx, "SELECT dependency_leaf_index FROM trust_edges WHERE evidence_id=? AND active=1", witness.EvidenceID[:]).Scan(&expectedLeaf); errors.Is(err, sql.ErrNoRows) {
+		return false, ErrEvidenceBinding
+	} else if err != nil {
+		return false, fmt.Errorf("load TrustEdge witness leaf: %w", err)
+	}
+	if uint32(expectedLeaf) != witness.LeafIndex {
+		return false, ErrEvidenceBinding
+	}
 	var existingID []byte
-	err = tx.QueryRowContext(ctx, "SELECT witness_id FROM membership_witnesses WHERE evidence_id=?", witness.EvidenceID[:]).Scan(&existingID)
+	var existingLeaf int64
+	err = tx.QueryRowContext(ctx, "SELECT witness_id,leaf_index FROM membership_witnesses WHERE evidence_id=?", witness.EvidenceID[:]).Scan(&existingID, &existingLeaf)
 	if err == nil {
-		if !equalBytes(existingID, witness.ID[:]) {
+		if !equalBytes(existingID, witness.ID[:]) || uint32(existingLeaf) != witness.LeafIndex {
 			return false, ErrGraphConflict
+		}
+		persistedSiblings, loadErr := loadWitnessSiblings(ctx, tx, witness.ID)
+		if loadErr != nil {
+			return false, loadErr
+		}
+		if len(persistedSiblings) != len(witness.Siblings) {
+			return false, ErrGraphConflict
+		}
+		for index := range persistedSiblings {
+			if persistedSiblings[index] != witness.Siblings[index] {
+				return false, ErrGraphConflict
+			}
 		}
 		return false, tx.Commit()
 	}
@@ -234,6 +263,35 @@ func (repository *TrustViewRepository) SaveMembershipWitness(ctx context.Context
 		return false, fmt.Errorf("commit witness insert: %w", err)
 	}
 	return true, nil
+}
+
+func loadWitnessSiblings(ctx context.Context, query queryer, id trustview.WitnessID) ([]common.Hash, error) {
+	rows, err := query.QueryContext(ctx, "SELECT sibling_hash FROM membership_witness_siblings WHERE witness_id=? ORDER BY sibling_index", id[:])
+	if err != nil {
+		return nil, fmt.Errorf("load witness siblings: %w", err)
+	}
+	var siblings []common.Hash
+	for rows.Next() {
+		var raw []byte
+		var sibling common.Hash
+		if err := rows.Scan(&raw); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan witness sibling: %w", err)
+		}
+		if err := copyExact(sibling[:], raw, "witness sibling"); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		siblings = append(siblings, sibling)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate witness siblings: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close witness siblings: %w", err)
+	}
+	return siblings, nil
 }
 
 type TrustViewSnapshotRequest struct {
@@ -305,8 +363,8 @@ func (repository *TrustViewRepository) CreateTrustViewSnapshot(ctx context.Conte
 		JOIN evidence e ON e.id=n.evidence_id WHERE n.evidence_state='active' AND e.state='active'`, id[:]); err != nil {
 		return trustview.TrustViewSnapshot{}, fmt.Errorf("materialize TrustView nodes: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO snapshot_edges(snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost)
-		SELECT ?,g.edge_id,g.from_node_id,g.to_node_id,g.evidence_id,w.witness_id,g.path_step_cost
+	if _, err := tx.ExecContext(ctx, `INSERT INTO snapshot_edges(snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost)
+		SELECT ?,g.edge_id,g.from_node_id,g.to_node_id,g.evidence_id,w.witness_id,g.dependency_leaf_index,g.path_step_cost
 		FROM trust_edges g JOIN evidence e ON e.id=g.evidence_id
 		LEFT JOIN membership_witnesses w ON w.evidence_id=g.evidence_id
 		WHERE g.active=1 AND e.state='active'`, id[:]); err != nil {
@@ -410,10 +468,14 @@ func loadSnapshot(ctx context.Context, query queryer, id trustview.SnapshotID) (
 		}
 		snapshot.Nodes = append(snapshot.Nodes, node)
 	}
-	if err := rows.Close(); err != nil {
-		return snapshot, err
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return snapshot, fmt.Errorf("iterate snapshot nodes: %w", err)
 	}
-	rows, err = query.QueryContext(ctx, `SELECT edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost FROM snapshot_edges WHERE snapshot_id=? ORDER BY edge_id`, id[:])
+	if err := rows.Close(); err != nil {
+		return snapshot, fmt.Errorf("close snapshot nodes: %w", err)
+	}
+	rows, err = query.QueryContext(ctx, `SELECT edge_id,from_node_id,to_node_id,evidence_id,witness_id,dependency_leaf_index,path_step_cost FROM snapshot_edges WHERE snapshot_id=? ORDER BY edge_id`, id[:])
 	if err != nil {
 		return snapshot, err
 	}
@@ -421,8 +483,8 @@ func loadSnapshot(ctx context.Context, query queryer, id trustview.SnapshotID) (
 		var edge trustview.TrustEdge
 		var edgeID, from, to, evidenceID []byte
 		var witness []byte
-		var cost int64
-		if err := rows.Scan(&edgeID, &from, &to, &evidenceID, &witness, &cost); err != nil {
+		var cost, leafIndex int64
+		if err := rows.Scan(&edgeID, &from, &to, &evidenceID, &witness, &leafIndex, &cost); err != nil {
 			_ = rows.Close()
 			return snapshot, err
 		}
@@ -443,11 +505,15 @@ func loadSnapshot(ctx context.Context, query queryer, id trustview.SnapshotID) (
 			}
 			edge.WitnessID = &witnessID
 		}
-		edge.PathStepCost = uint64(cost)
+		edge.LeafIndex, edge.PathStepCost = uint32(leafIndex), uint64(cost)
 		snapshot.Edges = append(snapshot.Edges, edge)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return snapshot, fmt.Errorf("iterate snapshot edges: %w", err)
+	}
 	if err := rows.Close(); err != nil {
-		return snapshot, err
+		return snapshot, fmt.Errorf("close snapshot edges: %w", err)
 	}
 	return snapshot, nil
 }

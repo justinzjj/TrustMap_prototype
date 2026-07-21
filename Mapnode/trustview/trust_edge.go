@@ -20,27 +20,34 @@ type TrustEdge struct {
 	From         NodeID
 	To           NodeID
 	EvidenceID   evidence.ID
+	LeafIndex    uint32
 	WitnessID    *WitnessID
 	PathStepCost uint64
 }
 
-func NewTrustEdge(from, to NodeID, evidenceID evidence.ID, witnessID *WitnessID, pathStepCost uint64) (TrustEdge, error) {
+func NewTrustEdge(from, to NodeID, evidenceID evidence.ID, leafIndex uint32, witnessID *WitnessID, pathStepCost uint64) (TrustEdge, error) {
 	if from == (NodeID{}) || to == (NodeID{}) || from == to || evidenceID == (evidence.ID{}) || pathStepCost == 0 {
 		return TrustEdge{}, ErrInvalidTrustEdge
 	}
-	encoded := make([]byte, 0, 96)
+	encoded := make([]byte, 0, 128)
 	encoded = append(encoded, from[:]...)
 	encoded = append(encoded, to[:]...)
 	encoded = append(encoded, evidenceID[:]...)
+	leafWord := [32]byte{}
+	leafWord[28] = byte(leafIndex >> 24)
+	leafWord[29] = byte(leafIndex >> 16)
+	leafWord[30] = byte(leafIndex >> 8)
+	leafWord[31] = byte(leafIndex)
+	encoded = append(encoded, leafWord[:]...)
 	edge := TrustEdge{
 		ID: EdgeID(crypto.Keccak256Hash(encoded)), From: from, To: to, EvidenceID: evidenceID,
-		WitnessID: cloneWitnessID(witnessID), PathStepCost: pathStepCost,
+		LeafIndex: leafIndex, WitnessID: cloneWitnessID(witnessID), PathStepCost: pathStepCost,
 	}
 	return edge, nil
 }
 
 func (edge TrustEdge) Validate() error {
-	want, err := NewTrustEdge(edge.From, edge.To, edge.EvidenceID, edge.WitnessID, edge.PathStepCost)
+	want, err := NewTrustEdge(edge.From, edge.To, edge.EvidenceID, edge.LeafIndex, edge.WitnessID, edge.PathStepCost)
 	if err != nil || want.ID != edge.ID {
 		return ErrInvalidTrustEdge
 	}

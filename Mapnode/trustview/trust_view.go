@@ -99,7 +99,7 @@ func NewTrustView(revision uint64, nodes []TrustNode, edges []TrustEdge) (TrustV
 			return TrustView{}, ErrInvalidTrustEdge
 		}
 		if previous, exists := uniqueEdges[edge.ID]; exists {
-			if previous.From != edge.From || previous.To != edge.To || previous.EvidenceID != edge.EvidenceID ||
+			if previous.From != edge.From || previous.To != edge.To || previous.EvidenceID != edge.EvidenceID || previous.LeafIndex != edge.LeafIndex ||
 				previous.PathStepCost != edge.PathStepCost || !sameWitness(previous.WitnessID, edge.WitnessID) {
 				return TrustView{}, ErrInvalidTrustEdge
 			}

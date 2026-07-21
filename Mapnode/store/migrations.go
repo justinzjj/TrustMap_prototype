@@ -52,6 +52,10 @@ func (db *DB) migrate() error {
 		}
 		applied = append(applied, item)
 	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate migration history: %w", err)
+	}
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close migration history: %w", err)
 	}
@@ -184,8 +188,9 @@ CREATE TABLE trust_edges (
     edge_id BLOB PRIMARY KEY CHECK(typeof(edge_id)='blob' AND length(edge_id)=32),
     from_node_id BLOB NOT NULL CHECK(typeof(from_node_id)='blob' AND length(from_node_id)=32),
     to_node_id BLOB NOT NULL CHECK(typeof(to_node_id)='blob' AND length(to_node_id)=32),
-    evidence_id BLOB NOT NULL CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
+    evidence_id BLOB NOT NULL UNIQUE CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
     active INTEGER NOT NULL CHECK(active IN (0,1)),
+    dependency_leaf_index INTEGER NOT NULL CHECK(dependency_leaf_index BETWEEN 0 AND 4294967295),
     path_step_cost INTEGER NOT NULL CHECK(path_step_cost >= 0),
     created_at INTEGER NOT NULL CHECK(created_at > 0),
     FOREIGN KEY(from_node_id) REFERENCES trust_nodes(node_id),
@@ -265,13 +270,14 @@ CREATE TABLE snapshot_edges (
     to_node_id BLOB NOT NULL CHECK(typeof(to_node_id)='blob' AND length(to_node_id)=32),
     evidence_id BLOB NOT NULL CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
     witness_id BLOB CHECK(witness_id IS NULL OR (typeof(witness_id)='blob' AND length(witness_id)=32)),
+    dependency_leaf_index INTEGER NOT NULL CHECK(dependency_leaf_index BETWEEN 0 AND 4294967295),
     path_step_cost INTEGER NOT NULL CHECK(path_step_cost >= 0),
     PRIMARY KEY(snapshot_id,edge_id),
     FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id) ON DELETE CASCADE,
     FOREIGN KEY(snapshot_id,from_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(snapshot_id,to_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(evidence_id) REFERENCES evidence(id),
-    FOREIGN KEY(witness_id,evidence_id) REFERENCES membership_witnesses(witness_id,evidence_id),
+    FOREIGN KEY(witness_id,evidence_id,dependency_leaf_index) REFERENCES membership_witnesses(witness_id,evidence_id,leaf_index),
     UNIQUE(snapshot_id,edge_id,witness_id,to_node_id)
 ) STRICT;
 
@@ -332,7 +338,8 @@ CREATE TABLE membership_witnesses (
     leaf_index INTEGER NOT NULL CHECK(leaf_index BETWEEN 0 AND 4294967295),
     created_at INTEGER NOT NULL CHECK(created_at > 0),
     FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE,
-    UNIQUE(witness_id,evidence_id)
+    UNIQUE(witness_id,evidence_id),
+    UNIQUE(witness_id,evidence_id,leaf_index)
 ) STRICT;
 
 CREATE TABLE membership_witness_siblings (

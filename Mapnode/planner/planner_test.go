@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
@@ -14,6 +15,38 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
+
+func TestComputePlanIDCommitsEveryPersistedDecisionField(t *testing.T) {
+	pathCost, directCost := uint64(20), uint64(3_000_096)
+	base := Plan{RequestID: domain.RequestID(common.HexToHash("0x1")), Attempt: 2, SnapshotID: trustview.SnapshotID(common.HexToHash("0x2")), ProfileID: "pow-spv-3m", ProfileFingerprint: common.HexToHash("0x3"), Type: PathPlan, HomeNodeID: trustview.NodeID(common.HexToHash("0x4")), TargetNodeID: trustview.NodeID(common.HexToHash("0x5")), Hops: []trustview.EdgeID{trustview.EdgeID(common.HexToHash("0x6")), trustview.EdgeID(common.HexToHash("0x7"))}, PathStepCost: 10, PathCost: &pathCost, DirectCost: &directCost, CreatedAt: time.Unix(1, 0)}
+	want := ComputePlanID(base)
+	base.ID = want
+	mutations := []struct {
+		name  string
+		apply func(*Plan)
+	}{
+		{"request", func(plan *Plan) { plan.RequestID[0] ^= 1 }}, {"attempt", func(plan *Plan) { plan.Attempt++ }}, {"snapshot", func(plan *Plan) { plan.SnapshotID[0] ^= 1 }},
+		{"profile ID", func(plan *Plan) { plan.ProfileID += "x" }}, {"fingerprint", func(plan *Plan) { plan.ProfileFingerprint[0] ^= 1 }}, {"type", func(plan *Plan) { plan.Type = DirectPlan }},
+		{"home", func(plan *Plan) { plan.HomeNodeID[0] ^= 1 }}, {"target", func(plan *Plan) { plan.TargetNodeID[0] ^= 1 }}, {"hop", func(plan *Plan) { plan.Hops[0][0] ^= 1 }},
+		{"hop count", func(plan *Plan) { plan.Hops = plan.Hops[:1] }}, {"step cost", func(plan *Plan) { plan.PathStepCost++ }}, {"path cost", func(plan *Plan) { *plan.PathCost += 1 }},
+		{"path cost presence", func(plan *Plan) { plan.PathCost = nil }}, {"direct cost", func(plan *Plan) { *plan.DirectCost += 1 }}, {"direct cost presence", func(plan *Plan) { plan.DirectCost = nil }},
+		{"fallback", func(plan *Plan) { plan.FallbackReason = NoPath }},
+	}
+	for _, tt := range mutations {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := base.Clone()
+			tt.apply(&changed)
+			if ComputePlanID(changed) == want {
+				t.Fatal("PlanID ignored persisted decision field")
+			}
+		})
+	}
+	createdChanged := base.Clone()
+	createdChanged.CreatedAt = time.Unix(99, 0)
+	if ComputePlanID(createdChanged) != want {
+		t.Fatal("PlanID included non-decision CreatedAt")
+	}
+}
 
 func TestPlannerSelectsDirectedPathAndReportsExplicitFallbacks(t *testing.T) {
 	snapshot := plannerSnapshot(t, 10, 10, true)
@@ -75,12 +108,12 @@ func TestPlannerFallbackReachabilityDirectionProfileAndCostValidation(t *testing
 		}, UncalibratedProfile, nil},
 		{"inconsistent step", func(snapshot *trustview.TrustViewSnapshot, _ *registry.ValidatedDirectProfile) {
 			snapshot.Edges[1].PathStepCost = 11
-			changed, _ := trustview.NewTrustEdge(snapshot.Edges[1].From, snapshot.Edges[1].To, snapshot.Edges[1].EvidenceID, snapshot.Edges[1].WitnessID, 11)
+			changed, _ := trustview.NewTrustEdge(snapshot.Edges[1].From, snapshot.Edges[1].To, snapshot.Edges[1].EvidenceID, snapshot.Edges[1].LeafIndex, snapshot.Edges[1].WitnessID, 11)
 			snapshot.Edges[1] = changed
 		}, "", ErrInconsistentPathStepCost},
 		{"overflow", func(snapshot *trustview.TrustViewSnapshot, profile *registry.ValidatedDirectProfile) {
 			for index, edge := range snapshot.Edges {
-				changed, _ := trustview.NewTrustEdge(edge.From, edge.To, edge.EvidenceID, edge.WitnessID, math.MaxUint64)
+				changed, _ := trustview.NewTrustEdge(edge.From, edge.To, edge.EvidenceID, edge.LeafIndex, edge.WitnessID, math.MaxUint64)
 				snapshot.Edges[index] = changed
 			}
 			profile.DirectCost = math.MaxUint64
@@ -160,7 +193,7 @@ func TestPlannerDeterministicTieBreakIgnoresInsertionOrderAndCycles(t *testing.T
 	c, b, d, a := node(chainC, 1), node(chainB, 2), node(chainD, 3), node(chainA, 4)
 	w := trustview.WitnessID(common.HexToHash("0x1"))
 	edge := func(from, to trustview.TrustNode, tag byte) trustview.TrustEdge {
-		result, err := trustview.NewTrustEdge(from.ID, to.ID, evidence.ID{tag}, &w, 10)
+		result, err := trustview.NewTrustEdge(from.ID, to.ID, evidence.ID{tag}, uint32(tag), &w, 10)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,8 +289,8 @@ func plannerSnapshot(t *testing.T, firstCost, secondCost uint64, witnesses bool)
 	if witnesses {
 		p1, p2 = &w1, &w2
 	}
-	e1, _ := trustview.NewTrustEdge(c.ID, b.ID, evidence.ID{4}, p1, firstCost)
-	e2, _ := trustview.NewTrustEdge(b.ID, a.ID, evidence.ID{5}, p2, secondCost)
+	e1, _ := trustview.NewTrustEdge(c.ID, b.ID, evidence.ID{4}, 4, p1, firstCost)
+	e2, _ := trustview.NewTrustEdge(b.ID, a.ID, evidence.ID{5}, 5, p2, secondCost)
 	return trustview.TrustViewSnapshot{ID: trustview.SnapshotID(common.HexToHash("0x55")), Revision: 1, HomeChainID: chainC, HomeTrustRoot: c.Root, StartNodeID: c.ID, TargetNodeID: a.ID, Sealed: true, Nodes: []trustview.TrustNode{c, b, a}, Edges: []trustview.TrustEdge{e1, e2}}
 }
 

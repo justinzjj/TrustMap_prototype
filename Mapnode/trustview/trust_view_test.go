@@ -15,7 +15,7 @@ func TestPaperFacingTrustViewTypesAndDirectedEdges(t *testing.T) {
 	height, _ := domain.NewBlockHeight(10)
 	c := NewTrustNode(NodeKey{ChainID: chainC, Height: height, BlockHash: common.HexToHash("0xc")}, TrustRoot{Hash: common.HexToHash("0xcc")}, evidence.ID{1})
 	b := NewTrustNode(NodeKey{ChainID: chainB, Height: height, BlockHash: common.HexToHash("0xb")}, TrustRoot{Hash: common.HexToHash("0xbb")}, evidence.ID{2})
-	edge, err := NewTrustEdge(c.ID, b.ID, evidence.ID{3}, nil, 25)
+	edge, err := NewTrustEdge(c.ID, b.ID, evidence.ID{3}, 7, nil, 25)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,8 +35,23 @@ func TestPaperFacingTrustViewTypesAndDirectedEdges(t *testing.T) {
 	sameChainKey := b.Key
 	sameChainKey.BlockHash = common.HexToHash("0xb2")
 	sameChainNode := NewTrustNode(sameChainKey, TrustRoot{Hash: common.HexToHash("0xb22")}, evidence.ID{9})
-	sameChainEdge, _ := NewTrustEdge(b.ID, sameChainNode.ID, evidence.ID{10}, nil, 25)
+	sameChainEdge, _ := NewTrustEdge(b.ID, sameChainNode.ID, evidence.ID{10}, 8, nil, 25)
 	if _, err := NewTrustView(9, []TrustNode{b, sameChainNode}, []TrustEdge{sameChainEdge}); !errors.Is(err, ErrInvalidTrustEdge) {
 		t.Fatalf("same-chain header relation entered TrustView: %v", err)
+	}
+}
+
+func TestTrustEdgeIdentityIncludesDependencyLeafIndex(t *testing.T) {
+	from, to := NodeID{1}, NodeID{2}
+	first, err := NewTrustEdge(from, to, evidence.ID{3}, 4, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewTrustEdge(from, to, evidence.ID{3}, 5, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ID == second.ID {
+		t.Fatal("TrustEdge ID ignored DependencyRecorded leafIndex")
 	}
 }
