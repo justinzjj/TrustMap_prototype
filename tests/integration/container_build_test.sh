@@ -4,6 +4,7 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 GETH_IMAGE=${GETH_IMAGE:-ethereum/client-go:v1.17.3}
 GO_IMAGE=${GO_IMAGE:-golang:1.24.10-bookworm}
+GOPROXY=${GOPROXY:-https://proxy.golang.org,direct}
 DISTROLESS_IMAGE=${DISTROLESS_IMAGE:-gcr.io/distroless/static-debian12:nonroot}
 FOUNDRY_IMAGE=${FOUNDRY_IMAGE:-ghcr.io/foundry-rs/foundry:v1.4.4}
 JQ_IMAGE=${JQ_IMAGE:-ghcr.io/jqlang/jq:1.8.1}
@@ -61,8 +62,11 @@ if grep -E -- '--unlock|--allow-insecure-unlock' "$repo_root/docker/geth-entrypo
     fail "geth entrypoint must rely on dev-mode account handling"
 fi
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ARG GO_IMAGE=golang:1.24.10-bookworm'
+assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ARG GOPROXY=https://proxy.golang.org,direct'
+assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ENV GOPROXY=${GOPROXY}'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'CGO_ENABLED=0'
+assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY internal/directprofile ./internal/directprofile'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'USER nonroot:nonroot'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY --from=build --chown=nonroot:nonroot /out/runtime /runtime'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'CMD ["/mapnode", "--healthcheck", "http://127.0.0.1:8080/health/ready"]'
@@ -300,6 +304,12 @@ PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
     sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-reserved-success.out" 2>&1
 jq -e '.profileId == "pow-spv-3m" and (.authorizedSigners | length) == 3 and .signatureChecks == 3 and .hashRounds == 4497 and .measuredDirectCostGas == 3000096' "$manifest" >/dev/null || fail "reserved deployment manifest calibration is invalid"
 
+mapnode_build_block=$(sed -n '/^build_failed=0$/,$p' "$repo_root/tests/integration/container_build_test.sh")
+case $mapnode_build_block in
+    *'--build-arg "GOPROXY=$GOPROXY"'*) ;;
+    *) fail "MapNode Docker build does not pass the configured GOPROXY" ;;
+esac
+
 if [ "${TRUSTMAP_SKIP_DOCKER_BUILD:-0}" = 1 ]; then
     printf '%s\n' 'container_build_test: static and behavior checks passed; Docker builds skipped by request'
     exit 0
@@ -312,6 +322,7 @@ if ! docker build --build-arg "GETH_IMAGE=$GETH_IMAGE" -f "$repo_root/docker/get
 fi
 if ! docker build \
     --build-arg "GO_IMAGE=$GO_IMAGE" \
+    --build-arg "GOPROXY=$GOPROXY" \
     --build-arg "DISTROLESS_IMAGE=$DISTROLESS_IMAGE" \
     -f "$repo_root/docker/mapnode.Dockerfile" -t trustmap-test-mapnode "$repo_root"; then
     build_failed=1
