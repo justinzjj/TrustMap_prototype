@@ -139,6 +139,11 @@ func renderCompose(topology *config.Topology, identities map[string]identity, ou
 			secretRoot + "/mapnode-password:/run/secrets/mapnode-password:ro",
 			secretRoot + "/p2p-private-key:/run/secrets/p2p-private-key:ro",
 		}
+		mapNodeDependencies := make(map[string]composeDependency, len(topology.Chains))
+		for _, catalogChain := range topology.Chains {
+			mapNodeMounts = append(mapNodeMounts, fmt.Sprintf("./chains/%s/deployment:/runtime/chains/%s/deployment:ro", catalogChain.Name, catalogChain.Name))
+			mapNodeDependencies["deploy-"+catalogChain.Name] = composeDependency{Condition: "service_completed_successfully"}
+		}
 		mapNodeMounts = append(mapNodeMounts, directSignerMounts...)
 		mapNodeMounts = append(mapNodeMounts, mapNodeVolume+":/runtime/data")
 		document.Services[mapNodeName] = composeService{
@@ -146,7 +151,7 @@ func renderCompose(topology *config.Topology, identities map[string]identity, ou
 			Environment: map[string]string{
 				"MAPNODE_CONFIG": "/runtime/mapnode.json",
 			},
-			DependsOn: map[string]composeDependency{deployName: {Condition: "service_completed_successfully"}},
+			DependsOn: mapNodeDependencies,
 			Ports: []string{
 				fmt.Sprintf("127.0.0.1:%d:8080", chain.HostPorts.MapNodeAPI),
 				fmt.Sprintf("127.0.0.1:%d:9000", chain.HostPorts.MapNodeP2P),

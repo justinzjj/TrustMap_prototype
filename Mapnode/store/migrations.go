@@ -17,6 +17,7 @@ type migration struct {
 var migrations = []migration{
 	{version: 1, name: "phase3_core", sql: phase3Schema},
 	{version: 2, name: "pathproof_integrity", sql: pathProofIntegrityV2},
+	{version: 3, name: "live_observation_foundation", sql: liveObservationFoundationV3},
 }
 
 const migrationTable = `
@@ -524,5 +525,118 @@ CREATE TRIGGER prevent_proof_hop_delete
 BEFORE DELETE ON proof_hops
 BEGIN
     SELECT RAISE(ABORT,'PathProof hop is append-only');
+END;
+`
+
+const liveObservationFoundationV3 = `
+CREATE TABLE live_chains (
+    chain_id BLOB PRIMARY KEY CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    name TEXT NOT NULL UNIQUE CHECK(length(name)>0 AND trim(name)=name),
+    http_rpc TEXT NOT NULL CHECK(length(http_rpc)>0),
+    confirmations INTEGER NOT NULL CHECK(confirmations>0),
+    deployment_manifest TEXT NOT NULL CHECK(length(deployment_manifest)>0),
+    home INTEGER NOT NULL CHECK(home IN (0,1)),
+    gateway BLOB CHECK(gateway IS NULL OR (typeof(gateway)='blob' AND length(gateway)=20)),
+    gateway_code_hash BLOB CHECK(gateway_code_hash IS NULL OR (typeof(gateway_code_hash)='blob' AND length(gateway_code_hash)=32)),
+    deployment_block BLOB CHECK(deployment_block IS NULL OR (typeof(deployment_block)='blob' AND length(deployment_block)=32)),
+    validated_at INTEGER CHECK(validated_at IS NULL OR validated_at>0),
+    CHECK((gateway IS NULL AND gateway_code_hash IS NULL AND deployment_block IS NULL AND validated_at IS NULL)
+       OR (gateway IS NOT NULL AND gateway_code_hash IS NOT NULL AND deployment_block IS NOT NULL AND validated_at IS NOT NULL))
+) STRICT;
+
+CREATE TRIGGER protect_live_chain_identity
+BEFORE UPDATE ON live_chains
+WHEN NEW.chain_id<>OLD.chain_id OR NEW.name<>OLD.name OR NEW.http_rpc<>OLD.http_rpc
+  OR NEW.confirmations<>OLD.confirmations OR NEW.deployment_manifest<>OLD.deployment_manifest OR NEW.home<>OLD.home
+  OR (OLD.gateway IS NOT NULL AND (NEW.gateway IS NOT OLD.gateway OR NEW.gateway_code_hash IS NOT OLD.gateway_code_hash OR NEW.deployment_block IS NOT OLD.deployment_block OR NEW.validated_at IS NOT OLD.validated_at))
+BEGIN
+    SELECT RAISE(ABORT,'live chain catalog is immutable');
+END;
+
+CREATE TABLE canonical_cursors (
+    chain_id BLOB PRIMARY KEY CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    block_height BLOB NOT NULL CHECK(typeof(block_height)='blob' AND length(block_height)=32),
+    block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
+    state TEXT NOT NULL CHECK(state IN ('healthy','degraded')),
+    degraded_reason TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL CHECK(updated_at>0),
+    FOREIGN KEY(chain_id) REFERENCES live_chains(chain_id),
+    CHECK((state='healthy' AND degraded_reason='') OR (state='degraded' AND length(degraded_reason)>0))
+) STRICT;
+
+CREATE TABLE trust_root_observations (
+    observation_id BLOB PRIMARY KEY CHECK(typeof(observation_id)='blob' AND length(observation_id)=32),
+    evidence_id BLOB NOT NULL UNIQUE CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
+    chain_id BLOB NOT NULL CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    block_height BLOB NOT NULL CHECK(typeof(block_height)='blob' AND length(block_height)=32),
+    block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
+    gateway BLOB NOT NULL CHECK(typeof(gateway)='blob' AND length(gateway)=20),
+    trust_root BLOB NOT NULL CHECK(typeof(trust_root)='blob' AND length(trust_root)=32),
+    gateway_code_hash BLOB NOT NULL CHECK(typeof(gateway_code_hash)='blob' AND length(gateway_code_hash)=32),
+    required_confirmations INTEGER NOT NULL CHECK(required_confirmations>0),
+    confirmed_head_height BLOB NOT NULL CHECK(typeof(confirmed_head_height)='blob' AND length(confirmed_head_height)=32),
+    confirmed_head_hash BLOB NOT NULL CHECK(typeof(confirmed_head_hash)='blob' AND length(confirmed_head_hash)=32),
+    observed_at INTEGER NOT NULL CHECK(observed_at>0),
+    FOREIGN KEY(evidence_id) REFERENCES evidence(id),
+    FOREIGN KEY(chain_id) REFERENCES live_chains(chain_id),
+    UNIQUE(chain_id,block_height,block_hash,gateway)
+) STRICT;
+
+CREATE TRIGGER require_active_synthetic_evidence_for_observation
+BEFORE INSERT ON trust_root_observations
+WHEN NOT EXISTS(
+    SELECT 1 FROM evidence e WHERE e.id=NEW.evidence_id AND e.state='active'
+      AND e.chain_id=NEW.chain_id AND e.contract_address=NEW.gateway
+      AND e.block_number=NEW.block_height AND e.block_hash=NEW.block_hash
+      AND e.tx_hash=zeroblob(32) AND e.tx_index=0 AND e.log_index=0
+)
+BEGIN
+    SELECT RAISE(ABORT,'TrustRootObservation requires active synthetic evidence');
+END;
+
+CREATE TRIGGER prevent_trust_root_observation_update
+BEFORE UPDATE ON trust_root_observations
+BEGIN
+    SELECT RAISE(ABORT,'TrustRootObservation is immutable');
+END;
+
+CREATE TRIGGER prevent_trust_root_observation_delete
+BEFORE DELETE ON trust_root_observations
+BEGIN
+    SELECT RAISE(ABORT,'TrustRootObservation is immutable');
+END;
+
+CREATE TRIGGER prevent_observation_evidence_update
+BEFORE UPDATE ON evidence
+WHEN EXISTS(SELECT 1 FROM trust_root_observations WHERE evidence_id=OLD.id)
+BEGIN
+    SELECT RAISE(ABORT,'TrustRootObservation evidence is immutable');
+END;
+
+DROP TRIGGER require_active_evidence_for_trust_edge_insert;
+DROP TRIGGER require_active_evidence_for_trust_edge_update;
+
+CREATE TRIGGER require_active_evidence_for_trust_edge_insert
+BEFORE INSERT ON trust_edges
+WHEN NEW.active=1 AND (
+  COALESCE((SELECT state FROM evidence WHERE id=NEW.evidence_id),'')<>'active'
+  OR EXISTS(SELECT 1 FROM trust_root_observations WHERE evidence_id=NEW.evidence_id)
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.from_node_id),'')<>'active'
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.to_node_id),'')<>'active'
+)
+BEGIN
+    SELECT RAISE(ABORT,'active TrustEdge requires active non-observation evidence');
+END;
+
+CREATE TRIGGER require_active_evidence_for_trust_edge_update
+BEFORE UPDATE ON trust_edges
+WHEN NEW.active=1 AND (
+  COALESCE((SELECT state FROM evidence WHERE id=NEW.evidence_id),'')<>'active'
+  OR EXISTS(SELECT 1 FROM trust_root_observations WHERE evidence_id=NEW.evidence_id)
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.from_node_id),'')<>'active'
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.to_node_id),'')<>'active'
+)
+BEGIN
+    SELECT RAISE(ABORT,'active TrustEdge requires active non-observation evidence');
 END;
 `

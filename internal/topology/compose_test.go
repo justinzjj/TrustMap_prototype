@@ -105,8 +105,14 @@ func TestComposeHasExactlyThreeServicesPerChainAndRequiredWiring(t *testing.T) {
 			t.Fatalf("missing %s", mapNodeName)
 		}
 		assertBuild(t, mapNode, "docker/mapnode.Dockerfile")
-		if mapNode.DependsOn[deployName]["condition"] != "service_completed_successfully" || mapNode.Environment["MAPNODE_CONFIG"] != "/runtime/mapnode.json" {
+		if mapNode.Environment["MAPNODE_CONFIG"] != "/runtime/mapnode.json" {
 			t.Fatalf("invalid mapnode wiring: %+v", mapNode)
+		}
+		for _, dependency := range cfg.Chains {
+			if mapNode.DependsOn["deploy-"+dependency.Name]["condition"] != "service_completed_successfully" {
+				t.Fatalf("mapnode %s does not wait for deploy-%s: %+v", chain.Name, dependency.Name, mapNode.DependsOn)
+			}
+			assertContains(t, mapNode.Volumes, fmt.Sprintf("./chains/%s/deployment:/runtime/chains/%s/deployment:ro", dependency.Name, dependency.Name))
 		}
 		assertContains(t, mapNode.Ports, fmt.Sprintf("127.0.0.1:%d:8080", chain.HostPorts.MapNodeAPI))
 		assertContains(t, mapNode.Ports, fmt.Sprintf("127.0.0.1:%d:9000", chain.HostPorts.MapNodeP2P))
@@ -120,8 +126,8 @@ func TestComposeHasExactlyThreeServicesPerChainAndRequiredWiring(t *testing.T) {
 
 		mapNodeJSON := string(readFile(t, filepath.Join(output, "chains", chain.Name, "mapnode.json")))
 		for _, other := range cfg.Chains {
-			if other.Name != chain.Name && strings.Contains(mapNodeJSON, "geth-"+other.Name) {
-				t.Fatalf("mapnode %s contains cross-chain Geth peer %s", chain.Name, other.Name)
+			if !strings.Contains(mapNodeJSON, "geth-"+other.Name) {
+				t.Fatalf("mapnode %s lacks read-only chain catalog entry %s", chain.Name, other.Name)
 			}
 		}
 	}
@@ -191,6 +197,9 @@ func TestComposeMountsOnlyRoleSpecificRuntimeFilesAndSecrets(t *testing.T) {
 			secretRoot + "/mapnode-password:/run/secrets/mapnode-password:ro",
 			secretRoot + "/p2p-private-key:/run/secrets/p2p-private-key:ro",
 			fmt.Sprintf("mapnode-%s-data:/runtime/data", chain.Name),
+		}
+		for _, catalogChain := range cfg.Chains {
+			mapNodeWant = append(mapNodeWant, fmt.Sprintf("./chains/%s/deployment:/runtime/chains/%s/deployment:ro", catalogChain.Name, catalogChain.Name))
 		}
 		mapNodeWant = append(mapNodeWant, directSignerSecrets...)
 		mapNodeVolumes := compose.Services["mapnode-"+chain.Name].Volumes

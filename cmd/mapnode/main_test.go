@@ -139,10 +139,18 @@ func writeRuntimeMismatchFixture(t *testing.T, rpcURL, listen string) string {
     "confirmations": 1,
     "gateway_manifest": %q
   },
+  "chains": [{
+    "name": "chain-runtime-test",
+    "chain_id": "10001",
+    "http_rpc": %q,
+    "confirmations": 1,
+    "deployment_manifest": %q,
+    "home": true
+  }],
   "api": {"listen": %q},
   "p2p": {"enabled": false, "listen": "", "private_key_file": "", "bootstrap_file": ""},
   "database": {"driver": "sqlite", "path": %q},
   "signer": {"keystore_file": %q, "password_file": %q},
   "direct_verifier": {"profile_file": %q}
-}`, rpcURL, manifest, listen, filepath.Join(dir, "mapnode.db"), transactionKeystore, transactionPassword, profile))
+}`, rpcURL, manifest, rpcURL, manifest, listen, filepath.Join(dir, "mapnode.db"), transactionKeystore, transactionPassword, profile))
 }

@@ -22,7 +22,7 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer application.Close()
-	if !application.Ready() || application.Registry == nil || application.TrustView == nil || application.Planner == nil || application.PathProofBuilder == nil || application.Coordinator == nil {
+	if !application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.CanonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.Planner == nil || application.PathProofBuilder == nil || application.Coordinator == nil {
 		t.Fatalf("incomplete Phase 3 composition: %+v", application)
 	}
 	home, err := application.Registry.HomeChain()
@@ -35,6 +35,9 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 	}
 	if application.PathTreeDepth() != manifest.MerkleDepth {
 		t.Fatalf("trusted PathTreeDepth = %d, want %d", application.PathTreeDepth(), manifest.MerkleDepth)
+	}
+	if all := application.ChainCatalog.All(); len(all) != 2 || all[0].Name != "chain-c" || all[1].Name != "chain-d" {
+		t.Fatalf("live catalog=%+v", all)
 	}
 	if _, err := os.Stat(config.Database.Path); err != nil {
 		t.Fatalf("SQLite database was not opened/migrated: %v", err)
@@ -83,7 +86,11 @@ func appFixture(t *testing.T, runtimeChainID string) (bootstrap.Config, bootstra
 	}
 	cost := uint64(3_000_096)
 	profile := &bootstrap.DirectVerifierProfile{Version: 1, ProfileID: "pow-spv-3m", ContractName: "ExperimentalCostedDirectVerifier", AuthorizedSigners: signers, SignatureChecks: 3, HashRounds: 4497, MeasuredDirectCostGas: &cost}
-	config := bootstrap.Config{Version: 1, Name: "mapnode-c", HomeChain: bootstrap.HomeChain{Name: "chain-c", ChainID: "10001", HTTPRPC: server.URL}, Database: bootstrap.Database{Driver: "sqlite", Path: filepath.Join(t.TempDir(), "runtime", "mapnode.sqlite")}, DirectVerifier: bootstrap.DirectVerifier{Profile: profile}}
+	config := bootstrap.Config{Version: 1, Name: "mapnode-c", HomeChain: bootstrap.HomeChain{Name: "chain-c", ChainID: "10001", HTTPRPC: server.URL, Confirmations: 2, GatewayManifest: "/runtime/deployment/gateway-manifest.json"}, Database: bootstrap.Database{Driver: "sqlite", Path: filepath.Join(t.TempDir(), "runtime", "mapnode.sqlite")}, DirectVerifier: bootstrap.DirectVerifier{Profile: profile}}
+	config.Chains = []bootstrap.ChainCatalog{
+		{Name: "chain-c", ChainID: "10001", HTTPRPC: server.URL, Confirmations: 2, DeploymentManifest: "/runtime/chains/chain-c/deployment/gateway-manifest.json", Home: true},
+		{Name: "chain-d", ChainID: "10002", HTTPRPC: "http://remote-not-dialed.invalid:8545", Confirmations: 3, DeploymentManifest: "/runtime/chains/chain-d/deployment/gateway-manifest.json"},
+	}
 	if err := os.MkdirAll(filepath.Dir(config.Database.Path), 0o755); err != nil {
 		t.Fatal(err)
 	}

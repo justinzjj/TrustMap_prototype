@@ -159,8 +159,16 @@ func TestRenderCreatesValidIdentitiesGenesisAndProfiles(t *testing.T) {
 			t.Fatalf("profile does not match topology/identity: %+v", profile)
 		}
 		mapNode := readJSON[struct {
-			Version   int    `json:"version"`
-			Name      string `json:"name"`
+			Version int    `json:"version"`
+			Name    string `json:"name"`
+			Chains  []struct {
+				Name               string `json:"name"`
+				ChainID            string `json:"chain_id"`
+				HTTPRPC            string `json:"http_rpc"`
+				Confirmations      int    `json:"confirmations"`
+				DeploymentManifest string `json:"deployment_manifest"`
+				Home               bool   `json:"home"`
+			} `json:"chains"`
 			HomeChain struct {
 				Name            string `json:"name"`
 				ChainID         string `json:"chain_id"`
@@ -181,6 +189,25 @@ func TestRenderCreatesValidIdentitiesGenesisAndProfiles(t *testing.T) {
 		}
 		if mapNode.HomeChain.GatewayManifest != "/runtime/deployment/gateway-manifest.json" || mapNode.P2P.BootstrapFile != "/runtime/p2p/bootstrap.json" || mapNode.DirectVerifier.ProfileFile != "/runtime/direct-verifier-profile.json" {
 			t.Fatalf("unexpected mapnode runtime paths: %+v", mapNode)
+		}
+		if len(mapNode.Chains) != len(cfg.Chains) {
+			t.Fatalf("catalog length=%d want=%d", len(mapNode.Chains), len(cfg.Chains))
+		}
+		homes := 0
+		for index, catalog := range mapNode.Chains {
+			want := cfg.Chains[index]
+			if catalog.Name != want.Name || catalog.ChainID != fmt.Sprint(want.ChainID) || catalog.HTTPRPC != fmt.Sprintf("http://geth-%s:8545", want.Name) || catalog.Confirmations != want.Confirmations || catalog.DeploymentManifest != fmt.Sprintf("/runtime/chains/%s/deployment/gateway-manifest.json", want.Name) {
+				t.Fatalf("catalog[%d]=%+v", index, catalog)
+			}
+			if catalog.Home {
+				homes++
+				if catalog.Name != chain.Name {
+					t.Fatalf("catalog home=%s want=%s", catalog.Name, chain.Name)
+				}
+			}
+		}
+		if homes != 1 {
+			t.Fatalf("catalog homes=%d", homes)
 		}
 	}
 }

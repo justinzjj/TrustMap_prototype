@@ -97,6 +97,14 @@ func validFixture(t *testing.T) (string, string) {
     "confirmations": 2,
     "gateway_manifest": %q
   },
+  "chains": [{
+    "name": "chain-a",
+    "chain_id": "10001",
+    "http_rpc": "http://geth-a:8545",
+    "confirmations": 2,
+    "deployment_manifest": %q,
+    "home": true
+  }],
   "api": {"listen": "127.0.0.1:18080"},
   "p2p": {
     "enabled": true,
@@ -107,7 +115,7 @@ func validFixture(t *testing.T) (string, string) {
   "database": {"driver": "sqlite", "path": %q},
 	"signer": {"keystore_file": %q, "password_file": %q},
   "direct_verifier": {"profile_file": %q}
-}`, manifest, identity, bootstrap, filepath.Join(dir, "mapnode.db"), keystore, password, profile))
+}`, manifest, manifest, identity, bootstrap, filepath.Join(dir, "mapnode.db"), keystore, password, profile))
 	return config, manifest
 }
 
@@ -123,6 +131,37 @@ func TestLoadValidatedRequiresManifestCodeHashes(t *testing.T) {
 	}
 	if _, _, err := LoadValidated(configPath); err == nil || !strings.Contains(err.Error(), "codeHashes.gateway") {
 		t.Fatalf("expected required gateway code hash error, got %v", err)
+	}
+}
+
+func TestLoadValidatedRequiresStrictAllChainCatalogWithExactlyOneHome(t *testing.T) {
+	configPath, manifestPath := validFixture(t)
+	body, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(body, &document); err != nil {
+		t.Fatal(err)
+	}
+	document["chains"] = []map[string]any{
+		{"name": "chain-a", "chain_id": "10001", "http_rpc": "http://geth-a:8545", "confirmations": 2, "deployment_manifest": manifestPath, "home": true},
+		{"name": "chain-b", "chain_id": "10002", "http_rpc": "http://geth-b:8545", "confirmations": 3, "deployment_manifest": manifestPath, "home": false},
+	}
+	encoded, _ := json.Marshal(document)
+	if err := os.WriteFile(configPath, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, _, err := LoadValidated(configPath)
+	if err != nil || len(config.Chains) != 2 || !config.Chains[0].Home || config.Chains[1].Home {
+		t.Fatalf("LoadValidated chains=%+v err=%v", config.Chains, err)
+	}
+
+	document["chains"].([]map[string]any)[1]["home"] = true
+	encoded, _ = json.Marshal(document)
+	_ = os.WriteFile(configPath, encoded, 0o600)
+	if _, _, err := LoadValidated(configPath); err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("multiple homes error=%v", err)
 	}
 }
 

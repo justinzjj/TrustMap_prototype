@@ -70,6 +70,30 @@ func ComputeID(locator Locator) (ID, error) {
 	return ID(keccak256(encoded[:])), nil
 }
 
+// ComputeSyntheticID is reserved for RPC observations that have no
+// transaction/log coordinate. Normal log Evidence must continue through
+// ComputeID, which rejects a zero transaction hash.
+func ComputeSyntheticID(locator Locator) (ID, error) {
+	if err := locator.ChainID.Validate(); err != nil {
+		return ID{}, err
+	}
+	if locator.ContractAddress == (common.Address{}) || locator.BlockHash == (common.Hash{}) || locator.PayloadDigest == (common.Hash{}) {
+		return ID{}, errors.New("synthetic evidence requires chain, contract, block hash, and payload digest")
+	}
+	if locator.TxHash != (common.Hash{}) || locator.TxIndex != 0 || locator.LogIndex != 0 {
+		return ID{}, errors.New("synthetic evidence must have zero transaction/log coordinates")
+	}
+	encoded := [8 * 32]byte{}
+	chainID := locator.ChainID.Bytes32()
+	blockNumber := locator.BlockNumber.Bytes32()
+	copy(encoded[0:32], chainID[:])
+	copy(encoded[32+12:64], locator.ContractAddress[:])
+	copy(encoded[64:96], blockNumber[:])
+	copy(encoded[96:128], locator.BlockHash[:])
+	copy(encoded[224:256], locator.PayloadDigest[:])
+	return ID(keccak256(encoded[:])), nil
+}
+
 // ComputeGatewayRequestID matches TrustMapGateway.computeRequestId exactly.
 func ComputeGatewayRequestID(
 	homeChainID domain.ChainID,

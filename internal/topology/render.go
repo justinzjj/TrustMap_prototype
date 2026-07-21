@@ -72,7 +72,7 @@ func Render(topology *config.Topology, output string) error {
 		if err := ensureDir(filepath.Join(chainDir, "deployment"), 0755); err != nil {
 			return err
 		}
-		if err := renderChain(chainDir, chain, chainIdentity, topology.MapNodes); err != nil {
+		if err := renderChain(chainDir, chain, chainIdentity, topology.MapNodes, topology.Chains); err != nil {
 			return fmt.Errorf("render chain %q: %w", chain.Name, err)
 		}
 	}
@@ -96,7 +96,7 @@ func Render(topology *config.Topology, output string) error {
 	return renderCompose(topology, identities, output)
 }
 
-func renderChain(chainDir string, chain config.Chain, chainIdentity identity, mapNodes config.MapNodes) error {
+func renderChain(chainDir string, chain config.Chain, chainIdentity identity, mapNodes config.MapNodes, allChains []config.Chain) error {
 	genesis := core.DeveloperGenesisBlock(30_000_000, nil)
 	chainConfig := *genesis.Config
 	chainConfig.ChainID = new(big.Int).SetUint64(chain.ChainID)
@@ -143,7 +143,7 @@ func renderChain(chainDir string, chain config.Chain, chainIdentity identity, ma
 		return err
 	}
 
-	mapNode := mapNodeConfig(chain, chainIdentity, mapNodes)
+	mapNode := mapNodeConfig(chain, chainIdentity, mapNodes, allChains)
 	content, err = marshalJSON(mapNode)
 	if err != nil {
 		return fmt.Errorf("encode mapnode config: %w", err)
@@ -151,10 +151,20 @@ func renderChain(chainDir string, chain config.Chain, chainIdentity identity, ma
 	return atomicWrite(filepath.Join(chainDir, "mapnode.json"), content, 0644)
 }
 
-func mapNodeConfig(chain config.Chain, chainIdentity identity, mapNodes config.MapNodes) map[string]any {
+func mapNodeConfig(chain config.Chain, chainIdentity identity, mapNodes config.MapNodes, allChains []config.Chain) map[string]any {
+	catalog := make([]map[string]any, 0, len(allChains))
+	for _, item := range allChains {
+		catalog = append(catalog, map[string]any{
+			"name": item.Name, "chain_id": new(big.Int).SetUint64(item.ChainID).String(),
+			"http_rpc": fmt.Sprintf("http://geth-%s:8545", item.Name), "confirmations": item.Confirmations,
+			"deployment_manifest": fmt.Sprintf("/runtime/chains/%s/deployment/gateway-manifest.json", item.Name),
+			"home":                item.Name == chain.Name,
+		})
+	}
 	return map[string]any{
 		"version": 1,
 		"name":    chain.Name,
+		"chains":  catalog,
 		"home_chain": map[string]any{
 			"name": chain.Name, "chain_id": new(big.Int).SetUint64(chain.ChainID).String(),
 			"http_rpc":         fmt.Sprintf("http://geth-%s:8545", chain.Name),

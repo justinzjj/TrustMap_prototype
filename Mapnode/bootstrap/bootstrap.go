@@ -30,11 +30,21 @@ type Config struct {
 	Version        int            `json:"version"`
 	Name           string         `json:"name"`
 	HomeChain      HomeChain      `json:"home_chain"`
+	Chains         []ChainCatalog `json:"chains,omitempty"`
 	API            API            `json:"api"`
 	P2P            P2P            `json:"p2p"`
 	Database       Database       `json:"database"`
 	Signer         Signer         `json:"signer"`
 	DirectVerifier DirectVerifier `json:"direct_verifier"`
+}
+
+type ChainCatalog struct {
+	Name               string `json:"name"`
+	ChainID            string `json:"chain_id"`
+	HTTPRPC            string `json:"http_rpc"`
+	Confirmations      uint64 `json:"confirmations"`
+	DeploymentManifest string `json:"deployment_manifest"`
+	Home               bool   `json:"home"`
 }
 
 type HomeChain struct {
@@ -183,6 +193,9 @@ func validateConfig(config Config) error {
 	if config.HomeChain.Confirmations == 0 {
 		return errors.New("home_chain.confirmations must be positive")
 	}
+	if err := validateChainCatalog(config); err != nil {
+		return err
+	}
 	if err := validateListen(config.API.Listen); err != nil {
 		return fmt.Errorf("api.listen: %w", err)
 	}
@@ -217,6 +230,54 @@ func validateConfig(config Config) error {
 		if err := requireReadableFile(field, path); err != nil {
 			return err
 		}
+	}
+	for index, item := range config.Chains {
+		if err := requireReadableFile(fmt.Sprintf("chains[%d].deployment_manifest", index), item.DeploymentManifest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateChainCatalog(config Config) error {
+	if len(config.Chains) == 0 {
+		return errors.New("chains must contain the read-only all-chain catalog")
+	}
+	names := make(map[string]struct{}, len(config.Chains))
+	ids := make(map[string]struct{}, len(config.Chains))
+	homes := 0
+	var home ChainCatalog
+	for index, item := range config.Chains {
+		if strings.TrimSpace(item.Name) == "" || strings.TrimSpace(item.Name) != item.Name {
+			return fmt.Errorf("chains[%d].name is required and canonical", index)
+		}
+		if _, exists := names[item.Name]; exists {
+			return fmt.Errorf("duplicate chain name %q", item.Name)
+		}
+		names[item.Name] = struct{}{}
+		if err := validateDecimalID(item.ChainID); err != nil {
+			return fmt.Errorf("chains[%d].chain_id: %w", index, err)
+		}
+		if _, exists := ids[item.ChainID]; exists {
+			return fmt.Errorf("duplicate chain ID %s", item.ChainID)
+		}
+		ids[item.ChainID] = struct{}{}
+		if err := validateURL(item.HTTPRPC, "http", "https"); err != nil {
+			return fmt.Errorf("chains[%d].http_rpc: %w", index, err)
+		}
+		if item.Confirmations == 0 || strings.TrimSpace(item.DeploymentManifest) == "" {
+			return fmt.Errorf("chains[%d] requires confirmations and deployment_manifest", index)
+		}
+		if item.Home {
+			homes++
+			home = item
+		}
+	}
+	if homes != 1 {
+		return fmt.Errorf("chains requires exactly one home, got %d", homes)
+	}
+	if home.Name != config.HomeChain.Name || home.ChainID != config.HomeChain.ChainID || home.HTTPRPC != config.HomeChain.HTTPRPC || home.Confirmations != config.HomeChain.Confirmations {
+		return errors.New("home catalog entry does not match home_chain")
 	}
 	return nil
 }
