@@ -62,15 +62,18 @@
 **Files:**
 - Create: `Mapnode/registry/registry.go`
 - Create: `Mapnode/registry/registry_test.go`
-- Create: `Mapnode/trustview/types.go`
-- Create: `Mapnode/trustview/service.go`
-- Create: `Mapnode/trustview/trustview_test.go`
+- Create: `Mapnode/trustview/trust_root.go`
+- Create: `Mapnode/trustview/trust_edge.go`
+- Create: `Mapnode/trustview/trust_view.go`
+- Create: `Mapnode/trustview/trust_view_snapshot.go`
+- Create: `Mapnode/trustview/trust_view_test.go`
 - Create: `Mapnode/planner/planner.go`
 - Create: `Mapnode/planner/planner_test.go`
 - Modify: `Mapnode/store/repository.go`
 - Modify: `Mapnode/store/store_test.go`
 
 - [ ] Write failing registry tests requiring exactly one home chain, transactions allowed only on that entry, and `directCost=3_000_096` accepted only from a deployment-validated `pow-spv-3m / 3 / 3 / 4497` profile. Custom or mismatched profiles expose no calibrated direct cost.
+- [ ] Define paper-facing exported types named `TrustRoot`, `TrustView` and `TrustViewSnapshot`; avoid hiding these mechanisms in generic `types.go` or `service.go` files.
 - [ ] Write failing repository/service tests showing only active evidence produces active TrustView edges, duplicate merges are idempotent, and a created snapshot never changes after later graph updates.
 - [ ] Require an active evidence record before an edge can be activated; enforce this in the transaction-backed repository rather than trusting callers.
 - [ ] Define the graph node key as `(chainId, height, blockHash)` and persist TrustRoot, evidence state and first-observed time. Define directed inter-chain edges from the recording-chain node to the verified source-chain node and retain the evidence/witness locator.

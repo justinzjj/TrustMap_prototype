@@ -46,6 +46,15 @@ Mapnode/
 └── api/             # Phase 4 health, status, TrustView and request APIs
 ```
 
+Paper-facing mechanisms must remain visible in the source tree. Go package
+directories stay lowercase, while filenames and exported types use the paper's
+terms explicitly. In particular, `Mapnode/trustview/` owns
+`trust_root.go`, `trust_view.go`, `trust_view_snapshot.go` and
+`trust_edge.go`, with exported `TrustRoot`, `TrustView` and
+`TrustViewSnapshot` types. Tests should use the same vocabulary so that a
+reader can map the implementation back to the paper without reverse-engineering
+generic `types.go` or `service.go` files.
+
 The Phase 2 `internal/mapnodebootstrap` package is migrated to
 `Mapnode/bootstrap`; it is not retained as a second implementation. Generic
 cross-layer primitives such as exact uint256 domain types and Merkle hashing may
