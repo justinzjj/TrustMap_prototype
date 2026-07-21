@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/justinzjj/TrustMap_prototype/internal/directprofile"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -16,10 +17,10 @@ const (
 	DefaultBlockPeriodSeconds = 3
 	DefaultConfirmations      = 2
 	DefaultMerkleDepth        = 8
-	DefaultDirectProfileID    = "committee-3"
-	DefaultAuthorizedSigners  = 3
-	DefaultSignatureChecks    = 3
-	DefaultHashRounds         = 4
+	DefaultDirectProfileID    = directprofile.ID
+	DefaultAuthorizedSigners  = directprofile.AuthorizedSignerCount
+	DefaultSignatureChecks    = directprofile.SignatureChecks
+	DefaultHashRounds         = directprofile.HashRounds
 	DefaultHostPortBase       = 18545
 	DefaultHostPortStride     = 100
 )
@@ -238,6 +239,9 @@ func (topology *Topology) Validate() error {
 	if topology.MapNodes.Database != "sqlite" {
 		return fmt.Errorf("mapnodes.database must be sqlite, got %q", topology.MapNodes.Database)
 	}
+	if err := validateReservedDirectVerifier("defaults.direct_verifier", topology.Defaults.DirectVerifier); err != nil {
+		return err
+	}
 
 	names := make(map[string]struct{}, len(topology.Chains))
 	chainIDs := make(map[uint64]struct{}, len(topology.Chains))
@@ -279,6 +283,9 @@ func (topology *Topology) Validate() error {
 		if chain.DirectVerifier.HashRounds < 0 || chain.DirectVerifier.HashRounds > 16384 {
 			return fmt.Errorf("%s.direct_verifier.hash_rounds must be between 0 and 16384", prefix)
 		}
+		if err := validateReservedDirectVerifier(prefix+".direct_verifier", chain.DirectVerifier); err != nil {
+			return err
+		}
 		for service, port := range map[string]int{
 			"http": chain.HostPorts.HTTP, "ws": chain.HostPorts.WS,
 			"mapnode_api": chain.HostPorts.MapNodeAPI, "mapnode_p2p": chain.HostPorts.MapNodeP2P,
@@ -292,6 +299,21 @@ func (topology *Topology) Validate() error {
 			}
 			ports[port] = label
 		}
+	}
+	return nil
+}
+
+func validateReservedDirectVerifier(field string, verifier DirectVerifier) error {
+	if verifier.ProfileID != directprofile.ID {
+		return nil
+	}
+	if verifier.AuthorizedSignerCount != directprofile.AuthorizedSignerCount ||
+		verifier.SignatureChecks != directprofile.SignatureChecks ||
+		verifier.HashRounds != directprofile.HashRounds {
+		return fmt.Errorf(
+			"%s profile %q requires authorized_signer_count=%d, signature_checks=%d, and hash_rounds=%d",
+			field, directprofile.ID, directprofile.AuthorizedSignerCount, directprofile.SignatureChecks, directprofile.HashRounds,
+		)
 	}
 	return nil
 }

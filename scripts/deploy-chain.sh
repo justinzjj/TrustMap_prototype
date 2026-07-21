@@ -59,12 +59,20 @@ jq -e '
     (.password_file | type == "string" and length > 0))) and
   (.signature_checks | type == "number" and floor == . and . > 0 and . <= 4096 and . <= ($profile.authorized_signers | length)) and
   (.hash_rounds | type == "number" and floor == . and . >= 0 and . <= 16384) and
-  (.measured_direct_cost_gas == null or (.measured_direct_cost_gas | type == "number" and floor == . and . > 0))
+  (if .profile_id == "pow-spv-3m" then
+    (.authorized_signers | length) == 3 and
+    .signature_checks == 3 and
+    .hash_rounds == 4497 and
+    .measured_direct_cost_gas == 3000096
+  else
+    .measured_direct_cost_gas == null
+  end)
 ' "$AUTHORIZED_SIGNERS_FILE" >/dev/null || die "invalid direct verifier profile"
 
 profile_id=$(jq -r '.profile_id' "$AUTHORIZED_SIGNERS_FILE")
 signature_checks=$(jq -r '.signature_checks' "$AUTHORIZED_SIGNERS_FILE")
 hash_rounds=$(jq -r '.hash_rounds' "$AUTHORIZED_SIGNERS_FILE")
+measured_direct_cost_gas=$(jq -c '.measured_direct_cost_gas' "$AUTHORIZED_SIGNERS_FILE")
 authorized_signers=$(jq -c '[.authorized_signers[].address]' "$AUTHORIZED_SIGNERS_FILE")
 authorized_signers_arg=$(jq -r '[.authorized_signers[].address] | "[" + join(",") + "]"' "$AUTHORIZED_SIGNERS_FILE")
 signer_count=$(jq -r '.authorized_signers | length' "$AUTHORIZED_SIGNERS_FILE")
@@ -153,6 +161,7 @@ jq -n \
     --argjson authorized_signers "$authorized_signers" \
     --argjson signature_checks "$signature_checks" \
     --argjson hash_rounds "$hash_rounds" \
+    --argjson measured_direct_cost_gas "$measured_direct_cost_gas" \
     --argjson deployment_block "$deployment_block" \
     '{
       version: 1,
@@ -165,6 +174,7 @@ jq -n \
       authorizedSigners: $authorized_signers,
       signatureChecks: $signature_checks,
       hashRounds: $hash_rounds,
+      measuredDirectCostGas: $measured_direct_cost_gas,
       codeHashes: {gateway: $gateway_code_hash, directVerifier: $verifier_code_hash},
       transactions: {gateway: $gateway_tx, directVerifier: $verifier_tx, bindGateway: $bind_tx}
     }' >"$manifest_tmp"

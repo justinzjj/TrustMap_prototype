@@ -9,6 +9,7 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/justinzjj/TrustMap_prototype/internal/config"
+	"github.com/justinzjj/TrustMap_prototype/internal/directprofile"
 )
 
 type verifierProfile struct {
@@ -119,6 +120,13 @@ func renderChain(chainDir string, chain config.Chain, chainIdentity identity, ma
 		ContractName:    "ExperimentalCostedDirectVerifier",
 		SignatureChecks: chain.DirectVerifier.SignatureChecks,
 		HashRounds:      chain.DirectVerifier.HashRounds,
+	}
+	if chain.DirectVerifier.ProfileID == directprofile.ID &&
+		chain.DirectVerifier.AuthorizedSignerCount == directprofile.AuthorizedSignerCount &&
+		chain.DirectVerifier.SignatureChecks == directprofile.SignatureChecks &&
+		chain.DirectVerifier.HashRounds == directprofile.HashRounds {
+		measuredCost := uint64(directprofile.MeasuredCostGas)
+		profile.MeasuredDirectCostGas = &measuredCost
 	}
 	for index, address := range chainIdentity.AuthorizedSigners {
 		profile.AuthorizedSigners = append(profile.AuthorizedSigners, authorizedSigner{

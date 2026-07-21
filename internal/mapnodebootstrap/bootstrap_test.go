@@ -78,6 +78,7 @@ func validFixture(t *testing.T) (string, string) {
   ],
   "signatureChecks": 2,
   "hashRounds": 3,
+  "measuredDirectCostGas": null,
   "codeHashes": {
     "gateway": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "directVerifier": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -195,6 +196,74 @@ func TestValidateDirectVerifierProfileRejectsMoreThan4096Signers(t *testing.T) {
 	}
 	if err := validateDirectVerifierProfile(profile); err == nil || !strings.Contains(err.Error(), "at most 4096") {
 		t.Fatalf("expected signer count limit error, got %v", err)
+	}
+}
+
+func TestValidateDirectVerifierProfileLocksReservedCalibration(t *testing.T) {
+	measured := uint64(3000096)
+	base := DirectVerifierProfile{
+		Version: 1, ProfileID: "pow-spv-3m", ContractName: "ExperimentalCostedDirectVerifier",
+		AuthorizedSigners: make([]AuthorizedSigner, 3), SignatureChecks: 3, HashRounds: 4497,
+		MeasuredDirectCostGas: &measured,
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*DirectVerifierProfile)
+	}{
+		{"missing cost", func(profile *DirectVerifierProfile) { profile.MeasuredDirectCostGas = nil }},
+		{"wrong cost", func(profile *DirectVerifierProfile) { value := uint64(3000095); profile.MeasuredDirectCostGas = &value }},
+		{"wrong signer count", func(profile *DirectVerifierProfile) { profile.AuthorizedSigners = make([]AuthorizedSigner, 4) }},
+		{"wrong checks", func(profile *DirectVerifierProfile) { profile.SignatureChecks = 2 }},
+		{"wrong rounds", func(profile *DirectVerifierProfile) { profile.HashRounds = 4496 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			profile := base
+			tc.mutate(&profile)
+			if err := validateDirectVerifierProfile(profile); err == nil || !strings.Contains(err.Error(), "pow-spv-3m") {
+				t.Fatalf("expected reserved calibration error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateDirectVerifierProfileRejectsMeasuredCustomProfile(t *testing.T) {
+	measured := uint64(3000096)
+	profile := DirectVerifierProfile{
+		Version: 1, ProfileID: "custom-profile", ContractName: "ExperimentalCostedDirectVerifier",
+		AuthorizedSigners: []AuthorizedSigner{{}}, SignatureChecks: 1, MeasuredDirectCostGas: &measured,
+	}
+	if err := validateDirectVerifierProfile(profile); err == nil || !strings.Contains(err.Error(), "custom") {
+		t.Fatalf("expected custom measured cost rejection, got %v", err)
+	}
+}
+
+func TestValidateManifestProfileCrossChecksMeasuredCost(t *testing.T) {
+	measured := uint64(3000096)
+	wrong := uint64(3000095)
+	profile := DirectVerifierProfile{
+		ProfileID: "pow-spv-3m", AuthorizedSigners: []AuthorizedSigner{{Address: "0x1111111111111111111111111111111111111111"}},
+		SignatureChecks: 3, HashRounds: 4497, MeasuredDirectCostGas: &measured,
+	}
+	manifest := DeploymentManifest{
+		ProfileID: "pow-spv-3m", AuthorizedSigners: []string{"0x1111111111111111111111111111111111111111"},
+		SignatureChecks: 3, HashRounds: 4497, MeasuredDirectCostGas: &wrong,
+	}
+	if err := validateManifestProfile(manifest, profile); err == nil || !strings.Contains(err.Error(), "measuredDirectCostGas") {
+		t.Fatalf("expected measured cost mismatch, got %v", err)
+	}
+	manifest.MeasuredDirectCostGas = &measured
+	if err := validateManifestProfile(manifest, profile); err != nil {
+		t.Fatalf("exact measured cost should match: %v", err)
+	}
+
+	custom := DirectVerifierProfile{ProfileID: "custom", AuthorizedSigners: profile.AuthorizedSigners, SignatureChecks: 1}
+	customManifest := DeploymentManifest{ProfileID: "custom", AuthorizedSigners: manifest.AuthorizedSigners, SignatureChecks: 1}
+	if err := validateManifestProfile(customManifest, custom); err != nil {
+		t.Fatalf("nil custom costs should remain compatible: %v", err)
+	}
+	customManifest.MeasuredDirectCostGas = &measured
+	if err := validateManifestProfile(customManifest, custom); err == nil || !strings.Contains(err.Error(), "measuredDirectCostGas") {
+		t.Fatalf("expected non-nil custom manifest cost rejection, got %v", err)
 	}
 }
 

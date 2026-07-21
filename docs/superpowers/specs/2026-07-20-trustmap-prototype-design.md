@@ -165,7 +165,7 @@ defaults:
     profile_id: pow-spv-3m
     authorized_signer_count: 3
     signature_checks: 3
-    hash_rounds: 4
+    hash_rounds: 4497
 chains:
   - name: chain-a
     chain_id: 10001
@@ -331,6 +331,8 @@ DirectProof 编码 `sourceTrustRoot + signatures[]`。合约先对完整验证�
 
 - 目标成本：`3,000,000 gas`；
 - 自动化验收区间：`2,700,000–3,300,000 gas`（目标值 ±10%）；
+- 固定校准参数：`authorized_signer_count = 3`、`signatureChecks = 3`、`hashRounds = 4497`；
+- 固定实测记录：cold-state 完整 `verifyDirectAndRecord` 为 `3,000,096 gas`，以 `measured_direct_cost_gas`/`measuredDirectCostGas` 随同同一 profile 发布；
 - 校准入口：一次成功的 `TrustMapGateway.verifyDirectAndRecord`，包含实验 DirectVerifier 验证和同一 DirectPlan 的链上依赖记录，不包含前置 `requestVerification` 交易；
 - 校准状态：使用固定 depth、固定请求上下文和确定性的新 dependency 状态，避免重复 dependency 或 tree 状态改变测量边界；
 - 调参优先级：保持默认 `authorized_signer_count = signatureChecks = 3`，主要调整部署时固定的 `hashRounds`，避免靠扩大 calldata 或伪造大量 signer 把成本堆高；

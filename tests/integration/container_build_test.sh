@@ -174,6 +174,7 @@ case $command in
         case " $* " in
             *signer-1.json*) printf '%s\n' '0x3333333333333333333333333333333333333333' ;;
             *signer-2.json*) printf '%s\n' '0x4444444444444444444444444444444444444444' ;;
+            *signer-3.json*) printf '%s\n' '0x5555555555555555555555555555555555555555' ;;
             *) exit 1 ;;
         esac
         ;;
@@ -196,7 +197,7 @@ ln -s "$(command -v jq)" "$fake_bin/jq"
 
 deploy_case=$test_tmp/deploy-case
 mkdir -p "$deploy_case"
-for file in deployer.json deployer-password signer-1.json signer-password-1 signer-2.json signer-password-2; do
+for file in deployer.json deployer-password signer-1.json signer-password-1 signer-2.json signer-password-2 signer-3.json signer-password-3; do
     printf '%s\n' 'test-only-deploy-secret' >"$deploy_case/$file"
 done
 cat >"$deploy_case/profile.json" <<EOF
@@ -235,16 +236,69 @@ if PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8
     fail "deploy script accepted a signer keystore/address mismatch"
 fi
 [ ! -e "$manifest" ] || fail "signer-mismatch deployment wrote a manifest"
+
+custom_cost_profile=$deploy_case/profile-custom-cost.json
+jq '.measured_direct_cost_gas = 3000096' "$deploy_case/profile.json" >"$custom_cost_profile"
+if PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
+    AUTHORIZED_SIGNERS_FILE="$custom_cost_profile" DEPLOYER_KEYSTORE="$deploy_case/deployer.json" \
+    DEPLOYER_PASSWORD_FILE="$deploy_case/deployer-password" MANIFEST_PATH="$manifest" \
+    sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-custom-cost.out" 2>&1; then
+    fail "deploy script accepted measured cost on a custom profile"
+fi
+[ ! -e "$manifest" ] || fail "invalid custom-cost deployment wrote a manifest"
+
+cat >"$deploy_case/profile-reserved.json" <<EOF
+{
+  "version": 1,
+  "profile_id": "pow-spv-3m",
+  "contract_name": "ExperimentalCostedDirectVerifier",
+  "authorized_signers": [
+    {"address":"0x3333333333333333333333333333333333333333","keystore_file":"$deploy_case/signer-1.json","password_file":"$deploy_case/signer-password-1"},
+    {"address":"0x4444444444444444444444444444444444444444","keystore_file":"$deploy_case/signer-2.json","password_file":"$deploy_case/signer-password-2"},
+    {"address":"0x5555555555555555555555555555555555555555","keystore_file":"$deploy_case/signer-3.json","password_file":"$deploy_case/signer-password-3"}
+  ],
+  "signature_checks": 3,
+  "hash_rounds": 4497,
+  "measured_direct_cost_gas": 3000096
+}
+EOF
+reserved_bad_rounds=$deploy_case/profile-reserved-bad-rounds.json
+jq '.hash_rounds = 4496' "$deploy_case/profile-reserved.json" >"$reserved_bad_rounds"
+if PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
+    AUTHORIZED_SIGNERS_FILE="$reserved_bad_rounds" DEPLOYER_KEYSTORE="$deploy_case/deployer.json" \
+    DEPLOYER_PASSWORD_FILE="$deploy_case/deployer-password" MANIFEST_PATH="$manifest" \
+    sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-reserved-rounds.out" 2>&1; then
+    fail "deploy script accepted altered reserved hash rounds"
+fi
+[ ! -e "$manifest" ] || fail "invalid reserved-rounds deployment wrote a manifest"
+
+reserved_bad_cost=$deploy_case/profile-reserved-bad-cost.json
+jq '.measured_direct_cost_gas = 3000095' "$deploy_case/profile-reserved.json" >"$reserved_bad_cost"
+if PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
+    AUTHORIZED_SIGNERS_FILE="$reserved_bad_cost" DEPLOYER_KEYSTORE="$deploy_case/deployer.json" \
+    DEPLOYER_PASSWORD_FILE="$deploy_case/deployer-password" MANIFEST_PATH="$manifest" \
+    sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-reserved-cost.out" 2>&1; then
+    fail "deploy script accepted altered reserved measured cost"
+fi
+[ ! -e "$manifest" ] || fail "invalid reserved-cost deployment wrote a manifest"
+
 : >"$FAKE_DEPLOY_LOG"
 PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
     AUTHORIZED_SIGNERS_FILE="$deploy_case/profile.json" DEPLOYER_KEYSTORE="$deploy_case/deployer.json" \
     DEPLOYER_PASSWORD_FILE="$deploy_case/deployer-password" MANIFEST_PATH="$manifest" \
     sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-success.out" 2>&1
-jq -e '.status == "deployed" and .chainId == "10001" and .profileId == "local-cost-2x3" and .signatureChecks == 2 and .hashRounds == 3 and (.authorizedSigners | length) == 2' "$manifest" >/dev/null || fail "deployment manifest content is invalid"
+jq -e '.status == "deployed" and .chainId == "10001" and .profileId == "local-cost-2x3" and .signatureChecks == 2 and .hashRounds == 3 and .measuredDirectCostGas == null and (.authorizedSigners | length) == 2' "$manifest" >/dev/null || fail "deployment manifest content is invalid"
 [ "$(stat -c '%a' "$manifest")" = 644 ] || fail "deployment manifest mode is not 0644"
 if grep -R -F 'test-only-deploy-secret' "$test_tmp" --exclude='deployer-password' --exclude='signer-password-*' --exclude='*.json' >/dev/null; then
     fail "deploy script exposed a secret"
 fi
+
+rm -f "$manifest"
+PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
+    AUTHORIZED_SIGNERS_FILE="$deploy_case/profile-reserved.json" DEPLOYER_KEYSTORE="$deploy_case/deployer.json" \
+    DEPLOYER_PASSWORD_FILE="$deploy_case/deployer-password" MANIFEST_PATH="$manifest" \
+    sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-reserved-success.out" 2>&1
+jq -e '.profileId == "pow-spv-3m" and (.authorizedSigners | length) == 3 and .signatureChecks == 3 and .hashRounds == 4497 and .measuredDirectCostGas == 3000096' "$manifest" >/dev/null || fail "reserved deployment manifest calibration is invalid"
 
 if [ "${TRUSTMAP_SKIP_DOCKER_BUILD:-0}" = 1 ]; then
     printf '%s\n' 'container_build_test: static and behavior checks passed; Docker builds skipped by request'

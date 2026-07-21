@@ -30,6 +30,9 @@ func TestExampleTopologiesRenderOneToOne(t *testing.T) {
 			periods := map[int]bool{}
 			names, ids, ports := map[string]bool{}, map[uint64]bool{}, map[int]bool{}
 			for _, chain := range cfg.Chains {
+				if got := chain.DirectVerifier; got.ProfileID != "pow-spv-3m" || got.AuthorizedSignerCount != 3 || got.SignatureChecks != 3 || got.HashRounds != 4497 {
+					t.Fatalf("example chain %s uses non-calibrated profile: %+v", chain.Name, got)
+				}
 				periods[chain.BlockPeriodSeconds] = true
 				if names[chain.Name] || ids[chain.ChainID] {
 					t.Fatalf("duplicate chain identity: %+v", chain)
@@ -49,6 +52,10 @@ func TestExampleTopologiesRenderOneToOne(t *testing.T) {
 			output := t.TempDir()
 			if err := topology.Render(cfg, output); err != nil {
 				t.Fatalf("Render() error = %v", err)
+			}
+			profile := readJSON[verifierProfile](t, filepath.Join(output, "chains", cfg.Chains[0].Name, "direct-verifier-profile.json"))
+			if profile.MeasuredDirectCostGas == nil || *profile.MeasuredDirectCostGas != 3000096 {
+				t.Fatalf("example measured direct cost = %v", profile.MeasuredDirectCostGas)
 			}
 			var compose composeDocument
 			if err := yaml.Unmarshal(readFile(t, filepath.Join(output, "compose.yaml")), &compose); err != nil {

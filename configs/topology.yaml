@@ -7,10 +7,10 @@ defaults:
   confirmations: 2
   merkle_depth: 8
   direct_verifier:
-    profile_id: committee-3
+    profile_id: pow-spv-3m
     authorized_signer_count: 3
     signature_checks: 3
-    hash_rounds: 4
+    hash_rounds: 4497
   host_ports:
     base: 18545
     stride: 100

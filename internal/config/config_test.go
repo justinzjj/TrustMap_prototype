@@ -89,6 +89,82 @@ mapnodes: {p2p_enabled: false, database: sqlite}
 	if topology.Defaults.FoundryImage == "" || strings.HasSuffix(topology.Defaults.FoundryImage, ":latest") {
 		t.Fatalf("foundry default must be pinned: %q", topology.Defaults.FoundryImage)
 	}
+	if got := topology.Defaults.DirectVerifier; got.ProfileID != "pow-spv-3m" || got.AuthorizedSignerCount != 3 || got.SignatureChecks != 3 || got.HashRounds != 4497 {
+		t.Fatalf("calibrated direct verifier defaults = %+v", got)
+	}
+}
+
+func TestDecodeRequiresExactReservedDirectVerifierProfile(t *testing.T) {
+	base := `version: 1
+network_name: trustmap-dev
+defaults:
+  direct_verifier:
+    profile_id: pow-spv-3m
+    authorized_signer_count: 3
+    signature_checks: 3
+    hash_rounds: 4497
+chains:
+  - {name: alpha, chain_id: 1}
+  - {name: beta, chain_id: 2}
+mapnodes: {database: sqlite}
+`
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"signer count", "authorized_signer_count: 3", "authorized_signer_count: 4"},
+		{"signature checks", "signature_checks: 3", "signature_checks: 2"},
+		{"hash rounds", "hash_rounds: 4497", "hash_rounds: 4496"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Decode(strings.NewReader(strings.Replace(base, tc.old, tc.new, 1)))
+			if err == nil || !strings.Contains(err.Error(), "pow-spv-3m") {
+				t.Fatalf("expected reserved profile error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestDecodeRejectsChainOverrideMasqueradingAsReservedProfile(t *testing.T) {
+	input := `version: 1
+network_name: trustmap-dev
+defaults:
+  direct_verifier:
+    profile_id: custom-profile
+    authorized_signer_count: 2
+    signature_checks: 2
+    hash_rounds: 7
+chains:
+  - name: alpha
+    chain_id: 1
+    direct_verifier: {profile_id: pow-spv-3m}
+  - {name: beta, chain_id: 2}
+mapnodes: {database: sqlite}
+`
+	_, err := config.Decode(strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "pow-spv-3m") {
+		t.Fatalf("expected reserved chain override error, got %v", err)
+	}
+}
+
+func TestDecodeAllowsCustomDirectVerifierProfile(t *testing.T) {
+	input := strings.Replace(validYAML, "  host_ports:\n    base: 18545", "  direct_verifier:\n    profile_id: custom-2x7\n    authorized_signer_count: 2\n    signature_checks: 2\n    hash_rounds: 7\n  host_ports:\n    base: 18545", 1)
+	topology, err := config.Decode(strings.NewReader(input))
+	if err != nil {
+		t.Fatalf("Decode() custom profile error = %v", err)
+	}
+	if got := topology.Chains[0].DirectVerifier; got.ProfileID != "custom-2x7" || got.AuthorizedSignerCount != 2 || got.SignatureChecks != 2 || got.HashRounds != 7 {
+		t.Fatalf("custom profile = %+v", got)
+	}
+}
+
+func TestDecodeRejectsMeasuredCostInput(t *testing.T) {
+	input := strings.Replace(validYAML, "  host_ports:\n    base: 18545", "  direct_verifier:\n    measured_direct_cost_gas: 3000096\n  host_ports:\n    base: 18545", 1)
+	_, err := config.Decode(strings.NewReader(input))
+	if err == nil || !strings.Contains(err.Error(), "measured_direct_cost_gas") {
+		t.Fatalf("expected measured cost input rejection, got %v", err)
+	}
 }
 
 func TestDecodeResolvesDirectVerifierDefaultsAndOverrides(t *testing.T) {

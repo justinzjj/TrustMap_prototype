@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"github.com/justinzjj/TrustMap_prototype/internal/directprofile"
 )
 
 const SupportedConfigVersion = 1
@@ -88,18 +89,19 @@ type AuthorizedSigner struct {
 }
 
 type DeploymentManifest struct {
-	Version           int        `json:"version"`
-	Status            string     `json:"status"`
-	ChainID           string     `json:"chainId"`
-	DeploymentBlock   uint64     `json:"deploymentBlock"`
-	Gateway           string     `json:"gateway"`
-	DirectVerifier    string     `json:"directVerifier"`
-	ProfileID         string     `json:"profileId"`
-	AuthorizedSigners []string   `json:"authorizedSigners"`
-	SignatureChecks   uint32     `json:"signatureChecks"`
-	HashRounds        uint32     `json:"hashRounds"`
-	CodeHashes        CodeHashes `json:"codeHashes"`
-	Transactions      any        `json:"transactions,omitempty"`
+	Version               int        `json:"version"`
+	Status                string     `json:"status"`
+	ChainID               string     `json:"chainId"`
+	DeploymentBlock       uint64     `json:"deploymentBlock"`
+	Gateway               string     `json:"gateway"`
+	DirectVerifier        string     `json:"directVerifier"`
+	ProfileID             string     `json:"profileId"`
+	AuthorizedSigners     []string   `json:"authorizedSigners"`
+	SignatureChecks       uint32     `json:"signatureChecks"`
+	HashRounds            uint32     `json:"hashRounds"`
+	MeasuredDirectCostGas *uint64    `json:"measuredDirectCostGas"`
+	CodeHashes            CodeHashes `json:"codeHashes"`
+	Transactions          any        `json:"transactions,omitempty"`
 }
 
 type CodeHashes struct {
@@ -228,6 +230,19 @@ func validateDirectVerifierProfile(profile DirectVerifierProfile) error {
 	if profile.ContractName != "ExperimentalCostedDirectVerifier" {
 		return fmt.Errorf("unsupported contract_name %q", profile.ContractName)
 	}
+	if profile.ProfileID == directprofile.ID {
+		if len(profile.AuthorizedSigners) != directprofile.AuthorizedSignerCount ||
+			profile.SignatureChecks != directprofile.SignatureChecks ||
+			profile.HashRounds != directprofile.HashRounds ||
+			profile.MeasuredDirectCostGas == nil || *profile.MeasuredDirectCostGas != directprofile.MeasuredCostGas {
+			return fmt.Errorf(
+				"profile %q requires %d authorized signers, signature_checks=%d, hash_rounds=%d, and measured_direct_cost_gas=%d",
+				directprofile.ID, directprofile.AuthorizedSignerCount, directprofile.SignatureChecks, directprofile.HashRounds, directprofile.MeasuredCostGas,
+			)
+		}
+	} else if profile.MeasuredDirectCostGas != nil {
+		return fmt.Errorf("custom profile %q must not provide measured_direct_cost_gas", profile.ProfileID)
+	}
 	if len(profile.AuthorizedSigners) == 0 {
 		return errors.New("authorized_signers must not be empty")
 	}
@@ -309,6 +324,10 @@ func validateManifestProfile(manifest DeploymentManifest, profile DirectVerifier
 	}
 	if manifest.HashRounds != profile.HashRounds {
 		return fmt.Errorf("hashRounds %d does not match profile %d", manifest.HashRounds, profile.HashRounds)
+	}
+	if (manifest.MeasuredDirectCostGas == nil) != (profile.MeasuredDirectCostGas == nil) ||
+		(manifest.MeasuredDirectCostGas != nil && *manifest.MeasuredDirectCostGas != *profile.MeasuredDirectCostGas) {
+		return errors.New("measuredDirectCostGas does not match profile")
 	}
 	if len(manifest.AuthorizedSigners) != len(profile.AuthorizedSigners) {
 		return errors.New("authorizedSigners length does not match profile")

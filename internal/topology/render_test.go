@@ -185,6 +185,42 @@ func TestRenderCreatesValidIdentitiesGenesisAndProfiles(t *testing.T) {
 	}
 }
 
+func TestRenderPublishesMeasuredCostOnlyForExactReservedProfile(t *testing.T) {
+	reserved := `version: 1
+network_name: trustmap-reserved
+defaults:
+  direct_verifier:
+    profile_id: pow-spv-3m
+    authorized_signer_count: 3
+    signature_checks: 3
+    hash_rounds: 4497
+chains:
+  - {name: alpha, chain_id: 31337}
+  - {name: beta, chain_id: 31338}
+mapnodes: {database: sqlite}
+`
+	cfg := decodeTopology(t, reserved)
+	output := t.TempDir()
+	if err := topology.Render(cfg, output); err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+	profile := readJSON[verifierProfile](t, filepath.Join(output, "chains", "alpha", "direct-verifier-profile.json"))
+	if profile.MeasuredDirectCostGas == nil || *profile.MeasuredDirectCostGas != 3000096 {
+		t.Fatalf("reserved measured cost = %v", profile.MeasuredDirectCostGas)
+	}
+
+	custom := strings.Replace(reserved, "profile_id: pow-spv-3m", "profile_id: custom-same-work", 1)
+	cfg = decodeTopology(t, custom)
+	output = t.TempDir()
+	if err := topology.Render(cfg, output); err != nil {
+		t.Fatalf("Render(custom) error = %v", err)
+	}
+	profile = readJSON[verifierProfile](t, filepath.Join(output, "chains", "alpha", "direct-verifier-profile.json"))
+	if profile.MeasuredDirectCostGas != nil {
+		t.Fatalf("custom profile received reserved measured cost: %d", *profile.MeasuredDirectCostGas)
+	}
+}
+
 func TestRenderReusesIdentityAndIsByteDeterministic(t *testing.T) {
 	cfg := decodeTopology(t, renderYAML)
 	output := t.TempDir()
