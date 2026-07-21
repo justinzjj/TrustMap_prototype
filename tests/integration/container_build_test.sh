@@ -18,6 +18,12 @@ assert_contains() {
     grep -F -- "$2" "$1" >/dev/null || fail "$1 does not contain: $2"
 }
 
+assert_not_contains() {
+    if grep -F -- "$2" "$1" >/dev/null; then
+        fail "$1 must not contain: $2"
+    fi
+}
+
 reject_latest() {
     case $2 in
         latest|*:latest) fail "$1 must not use latest" ;;
@@ -28,7 +34,7 @@ for path in \
     .dockerignore \
     docker/geth.Dockerfile docker/geth-entrypoint.sh docker/geth-healthcheck.sh \
     docker/deployer.Dockerfile scripts/deploy-chain.sh \
-    docker/mapnode.Dockerfile cmd/mapnode/main.go internal/mapnodebootstrap/bootstrap.go
+    docker/mapnode.Dockerfile cmd/mapnode/main.go Mapnode/bootstrap/bootstrap.go
 do
     [ -f "$repo_root/$path" ] || fail "missing $path"
 done
@@ -66,7 +72,9 @@ assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ARG GOPROXY=https://prox
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ENV GOPROXY=${GOPROXY}'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ARG DISTROLESS_IMAGE=gcr.io/distroless/static-debian12:nonroot'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'CGO_ENABLED=0'
+assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY Mapnode ./Mapnode'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY internal/directprofile ./internal/directprofile'
+assert_not_contains "$repo_root/docker/mapnode.Dockerfile" 'internal/mapnodebootstrap'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'USER nonroot:nonroot'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY --from=build --chown=nonroot:nonroot /out/runtime /runtime'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'CMD ["/mapnode", "--healthcheck", "http://127.0.0.1:8080/health/ready"]'

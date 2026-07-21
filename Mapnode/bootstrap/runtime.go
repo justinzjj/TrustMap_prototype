@@ -1,4 +1,4 @@
-package mapnodebootstrap
+package bootstrap
 
 import (
 	"bytes"

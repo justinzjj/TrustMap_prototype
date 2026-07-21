@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/justinzjj/TrustMap_prototype/internal/mapnodebootstrap"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 )
 
 func main() {
@@ -42,7 +42,7 @@ func run(arguments []string, stderr io.Writer) int {
 			fmt.Fprintln(stderr, "--config and --healthcheck are mutually exclusive")
 			return 2
 		}
-		if err := mapnodebootstrap.CheckHealth(*healthURL); err != nil {
+		if err := bootstrap.CheckHealth(*healthURL); err != nil {
 			fmt.Fprintf(stderr, "mapnode healthcheck failed: %v\n", err)
 			return 1
 		}
@@ -52,13 +52,13 @@ func run(arguments []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--config is required")
 		return 2
 	}
-	config, manifest, err := mapnodebootstrap.LoadValidated(*configPath)
+	config, manifest, err := bootstrap.LoadValidated(*configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "mapnode bootstrap failed: %v\n", err)
 		return 1
 	}
 	runtimeContext, cancelRuntimeValidation := context.WithTimeout(context.Background(), 10*time.Second)
-	err = mapnodebootstrap.ValidateRuntime(runtimeContext, config, manifest)
+	err = bootstrap.ValidateRuntime(runtimeContext, config, manifest)
 	cancelRuntimeValidation()
 	if err != nil {
 		fmt.Fprintf(stderr, "mapnode runtime validation failed: %v\n", err)
@@ -72,7 +72,7 @@ func run(arguments []string, stderr io.Writer) int {
 	}
 	server := &http.Server{
 		Addr:              config.API.Listen,
-		Handler:           mapnodebootstrap.NewHealthHandler(true),
+		Handler:           bootstrap.NewHealthHandler(true),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	stop := make(chan os.Signal, 1)

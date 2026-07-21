@@ -8,8 +8,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/mapnode ./cmd/mapnode
+COPY Mapnode ./Mapnode
 COPY internal/directprofile ./internal/directprofile
-COPY internal/mapnodebootstrap ./internal/mapnodebootstrap
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/mapnode ./cmd/mapnode \
     && mkdir -p /out/runtime/data
 
