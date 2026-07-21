@@ -43,7 +43,20 @@ func TestTopologyRenderWritesOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := os.MkdirTemp(filepath.Join(repositoryRoot, "runtime"), ".cli-test-")
+	runtimeRoot := filepath.Join(repositoryRoot, "runtime")
+	if _, err := os.Stat(runtimeRoot); os.IsNotExist(err) {
+		if err := os.MkdirAll(runtimeRoot, 0755); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := os.Remove(runtimeRoot); err != nil && !os.IsNotExist(err) {
+				t.Errorf("remove test-created empty runtime directory: %v", err)
+			}
+		})
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.MkdirTemp(runtimeRoot, ".cli-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
