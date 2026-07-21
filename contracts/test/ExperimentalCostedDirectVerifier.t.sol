@@ -18,7 +18,7 @@ contract ExperimentalCostedDirectVerifierTest is TestBase {
     uint256 private constant SOURCE_HEIGHT = 700;
     uint32 private constant SIGNATURE_CHECKS = 3;
     uint32 private constant HASH_ROUNDS = 4;
-    uint32 private constant POW_SPV_CALIBRATION_HASH_ROUNDS = 4553;
+    uint32 private constant POW_SPV_CALIBRATION_HASH_ROUNDS = 4497;
     uint256 private constant POW_SPV_MIN_GAS = 2_700_000;
     uint256 private constant POW_SPV_MAX_GAS = 3_300_000;
     bytes32 private constant SOURCE_BLOCK_HASH = bytes32(uint256(0x701));
@@ -453,6 +453,14 @@ contract ExperimentalCostedDirectVerifierTest is TestBase {
     ) private returns (uint256 gasUsed) {
         bytes32 requestId = targetGateway.requestVerification(SOURCE_CHAIN, SOURCE_HEIGHT, SOURCE_BLOCK_HASH);
         bytes memory proof = abi.encode(SOURCE_ROOT, _validSignatures(targetVerifier, targetGateway, checks, rounds));
+
+        // Model a separate top-level transaction: all contract slots start cold, while the
+        // transaction recipient account itself is warm. The verifier remains a cold internal
+        // call target until the Gateway invokes it.
+        vm.cool(address(targetGateway));
+        vm.cool(address(targetVerifier));
+        assertTrue(address(targetGateway).code.length > 0);
+
         uint256 gasBefore = gasleft();
         targetGateway.verifyDirectAndRecord(requestId, proof);
         gasUsed = gasBefore - gasleft();

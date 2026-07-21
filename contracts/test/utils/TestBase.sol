@@ -14,6 +14,7 @@ interface Vm {
     function setBlockhash(uint256 blockNumber, bytes32 blockHash) external;
     function chainId(uint256 newChainId) external;
     function prank(address sender) external;
+    function cool(address target) external;
     function addr(uint256 privateKey) external returns (address);
     function sign(uint256 privateKey, bytes32 digest) external returns (uint8 v, bytes32 r, bytes32 s);
     function recordLogs() external;
