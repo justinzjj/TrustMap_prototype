@@ -162,7 +162,7 @@ defaults:
   confirmations: 2
   merkle_depth: 8
   direct_verifier:
-    profile_id: committee-3
+    profile_id: pow-spv-3m
     authorized_signer_count: 3
     signature_checks: 3
     hash_rounds: 4
@@ -324,6 +324,20 @@ DirectProof 编码 `sourceTrustRoot + signatures[]`。合约先对完整验证�
 - 不能提供任意设置当前 TrustRoot 的生产接口；
 - 通过相同 Gateway 流程发出完整事件；
 - 在 README 和安全说明中写明它不是通用轻客户端。
+
+#### 默认 PoW-SPV 成本校准 profile
+
+首个开源默认 profile 命名为 `pow-spv-3m`，只表示实验成本目标，不表示实现了 PoW SPV 或继承其安全性。它以论文表中的 PoW SPV header verification 代表值为基准：
+
+- 目标成本：`3,000,000 gas`；
+- 自动化验收区间：`2,700,000–3,300,000 gas`（目标值 ±10%）；
+- 校准入口：一次成功的 `TrustMapGateway.verifyDirectAndRecord`，包含实验 DirectVerifier 验证和同一 DirectPlan 的链上依赖记录，不包含前置 `requestVerification` 交易；
+- 校准状态：使用固定 depth、固定请求上下文和确定性的新 dependency 状态，避免重复 dependency 或 tree 状态改变测量边界；
+- 调参优先级：保持默认 `authorized_signer_count = signatureChecks = 3`，主要调整部署时固定的 `hashRounds`，避免靠扩大 calldata 或伪造大量 signer 把成本堆高；
+- 参数发现：校准测试可以先搜索满足区间的 `hashRounds`，最终选定值必须写回 topology 默认 profile，常规回归测试只验证固定 profile，不在每次测试中动态改变部署参数；
+- 成本记录：实测结果写入与 profile 参数绑定的 calibration fixture/deployment manifest，MapNode Planner 后续只读取同一 profile 的实测值。
+
+Gas 校准测试必须在仓库锁定的 Solidity、optimizer、EVM 和 Foundry 配置下运行。若工具链升级使固定 profile 超出区间，测试应失败并要求重新校准，而不是放宽区间。测试和文档必须继续明确：循环 Keccak 与真实 ECDSA 恢复只是成本模拟，不验证 PoW 难度、header chain、Merkle inclusion 或 finality。
 
 ### 7.7 权限与事件
 
@@ -624,7 +638,8 @@ Foundry 单元、fuzz 和 invariant 测试覆盖：
 - Costed DirectVerifier 的 profile 在部署后不可降低；
 - 每个被检查签名都真实有效，并绑定完整请求、链和 Gateway 上下文；
 - 错误 signer、签名数量、hash rounds/profile、跨链或跨 Gateway replay 均失败；
-- Gas 校准 profile 覆盖论文采用的 DirectPlan 成本区间；
+- 默认 `pow-spv-3m` profile 的完整 `verifyDirectAndRecord` 实测成本位于 2.7M–3.3M gas；
+- 校准结果与 profile 的 signer 数、signature checks、hash rounds 和工具链版本绑定；
 - PathVerifier 失败不更新 TrustRoot；
 - 无任意管理员 TrustRoot setter；
 - tree capacity 与部署 depth 一致。
