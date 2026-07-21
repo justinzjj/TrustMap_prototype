@@ -57,7 +57,7 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 	application.PathProofs = store.NewPathProofRepository(database)
 	application.Planner = planner.New(application.TrustView, application.Plans, chainRegistry)
 	application.PathProofBuilder = pathproof.NewBuilder(application.PathProofs, manifest.MerkleDepth)
-	application.Coordinator = coordinator.New(application.Requests, application.TrustView, application.Planner, application.Plans, application.PathProofBuilder, application.PathProofs)
+	application.Coordinator = coordinator.New(application.Requests, application.TrustView, application.Planner, application.Plans, application.PathProofBuilder)
 	application.ready.Store(true)
 	return application, nil
 }

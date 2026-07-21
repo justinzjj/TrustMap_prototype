@@ -111,7 +111,7 @@ func TestPhaseThreeDurableTrustViewPathProofCheckpoint(t *testing.T) {
 	}
 	planning := planner.New(viewRepository, planRepository, calibrated)
 	builder := pathproof.NewBuilder(proofRepository, 1)
-	coordination := coordinator.New(requestRepository, viewRepository, planning, planRepository, builder, proofRepository)
+	coordination := coordinator.New(requestRepository, viewRepository, planning, planRepository, builder)
 	result, err := coordination.Process(ctx, coordinator.Work{Request: successRequest, Attempt: 0, SnapshotID: snapshot.ID, ExpectedHomeTrustRoot: rootC})
 	if err != nil {
 		t.Fatal(err)

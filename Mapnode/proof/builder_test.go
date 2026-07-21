@@ -106,12 +106,22 @@ func TestPathProofBuilderRejectsReversePlannerPath(t *testing.T) {
 	}
 }
 
+func TestPathProofBuilderPropagatesRepositoryCancellation(t *testing.T) {
+	fixture := newPathProofFixture(t)
+	fixture.repository.materialErr = context.Canceled
+	_, err := NewBuilder(fixture.repository, 1).Build(context.Background(), BuildRequest{PlanID: fixture.plan.ID, SourceBlockHash: fixture.nodeA.Key.BlockHash, ExpectedHomeTrustRoot: fixture.snapshot.HomeTrustRoot})
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrProofMaterialMissing) {
+		t.Fatalf("repository cancellation classified as %v", err)
+	}
+}
+
 type memoryPathProofRepository struct {
-	plan      planner.Plan
-	snapshot  trustview.TrustViewSnapshot
-	materials []PathProofMaterial
-	missingAt int
-	saved     map[PathProofID]PathProof
+	plan        planner.Plan
+	snapshot    trustview.TrustViewSnapshot
+	materials   []PathProofMaterial
+	missingAt   int
+	materialErr error
+	saved       map[PathProofID]PathProof
 }
 
 func (repository *memoryPathProofRepository) LoadPathPlan(_ context.Context, id planner.PlanID) (planner.Plan, error) {
@@ -127,6 +137,9 @@ func (repository *memoryPathProofRepository) LoadTrustViewSnapshot(_ context.Con
 	return repository.snapshot.Clone(), nil
 }
 func (repository *memoryPathProofRepository) LoadPathProofMaterial(_ context.Context, planID planner.PlanID, snapshotID trustview.SnapshotID, planHopIndex int, edgeID trustview.EdgeID) (PathProofMaterial, error) {
+	if repository.materialErr != nil {
+		return PathProofMaterial{}, repository.materialErr
+	}
 	if repository.missingAt == planHopIndex {
 		return PathProofMaterial{}, ErrProofMaterialMissing
 	}

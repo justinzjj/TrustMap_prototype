@@ -65,7 +65,10 @@ func (builder *Builder) Build(ctx context.Context, request BuildRequest) (PathPr
 	for index, edgeID := range plan.Hops {
 		material, loadErr := builder.repository.LoadPathProofMaterial(ctx, plan.ID, snapshot.ID, index, edgeID)
 		if loadErr != nil {
-			return PathProof{}, fmt.Errorf("plan hop %d: %w", index, ErrProofMaterialMissing)
+			if errors.Is(loadErr, ErrProofMaterialMissing) {
+				return PathProof{}, fmt.Errorf("plan hop %d: %w", index, ErrProofMaterialMissing)
+			}
+			return PathProof{}, fmt.Errorf("load plan hop %d PathProof material: %w", index, loadErr)
 		}
 		if !validMaterial(plan, snapshot, index, edgeID, expectedFrom, material) {
 			return PathProof{}, fmt.Errorf("plan hop %d: %w", index, ErrProofMaterialMissing)

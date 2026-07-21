@@ -31,10 +31,6 @@ type PathProofBuilder interface {
 	Build(context.Context, pathproof.BuildRequest) (pathproof.PathProof, error)
 }
 
-type CurrentPathProofRepository interface {
-	LoadPathProofForPlan(context.Context, planner.PlanID) (pathproof.PathProof, error)
-}
-
 type Work struct {
 	Request               Request
 	Attempt               uint64
@@ -54,18 +50,17 @@ type Coordinator struct {
 	planner  PlanningService
 	plans    CurrentPlanRepository
 	builder  PathProofBuilder
-	proofs   CurrentPathProofRepository
 }
 
-func New(requests RequestRepository, evidence EvidenceGate, planning PlanningService, plans CurrentPlanRepository, builder PathProofBuilder, proofs CurrentPathProofRepository) *Coordinator {
-	return &Coordinator{requests: requests, evidence: evidence, planner: planning, plans: plans, builder: builder, proofs: proofs}
+func New(requests RequestRepository, evidence EvidenceGate, planning PlanningService, plans CurrentPlanRepository, builder PathProofBuilder) *Coordinator {
+	return &Coordinator{requests: requests, evidence: evidence, planner: planning, plans: plans, builder: builder}
 }
 
 // Process is restart-safe: a plan or PathProof is always persisted by its
 // service before the corresponding state transition. If a transition fails,
 // the next call recovers the already-durable artifact instead of rebuilding it.
 func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result, error) {
-	if coordinator == nil || coordinator.requests == nil || coordinator.evidence == nil || coordinator.planner == nil || coordinator.plans == nil || coordinator.builder == nil || coordinator.proofs == nil {
+	if coordinator == nil || coordinator.requests == nil || coordinator.evidence == nil || coordinator.planner == nil || coordinator.plans == nil || coordinator.builder == nil {
 		return Result{}, errors.New("coordinator dependencies are required")
 	}
 	if work.Request.ID == (domain.RequestID{}) || work.Request.State != Observed || work.SnapshotID == (trustview.SnapshotID{}) || work.ExpectedHomeTrustRoot.Hash == ([32]byte{}) || work.Request.SourceBlockHash == ([32]byte{}) {
@@ -79,17 +74,41 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 
 	for {
 		switch result.Request.State {
-		case Rejected, DirectFallback:
-			if plan, loadErr := coordinator.plans.LoadCurrentPlan(ctx, result.Request.ID); loadErr == nil {
-				result.Plan = plan
+		case Rejected:
+			plan, loadErr := coordinator.plans.LoadCurrentPlan(ctx, result.Request.ID)
+			if errors.Is(loadErr, planner.ErrPlanNotFound) {
+				return result, nil
 			}
+			if loadErr != nil {
+				return Result{}, loadErr
+			}
+			result.Plan = plan
+			return result, nil
+		case DirectFallback:
+			plan, loadErr := coordinator.plans.LoadCurrentPlan(ctx, result.Request.ID)
+			if loadErr != nil {
+				return Result{}, loadErr
+			}
+			if err := validateWorkPlan(work, plan); err != nil {
+				return Result{}, err
+			}
+			if plan.Type != planner.DirectPlan || plan.FallbackReason == "" {
+				return Result{}, errors.New("DirectFallback request lacks a valid durable DirectPlan")
+			}
+			result.Plan = plan
 			return result, nil
 		case ProofReady:
 			plan, loadErr := coordinator.plans.LoadCurrentPlan(ctx, result.Request.ID)
 			if loadErr != nil {
 				return Result{}, loadErr
 			}
-			proofValue, loadErr := coordinator.proofs.LoadPathProofForPlan(ctx, plan.ID)
+			if err := validateWorkPlan(work, plan); err != nil {
+				return Result{}, err
+			}
+			if plan.Type != planner.PathPlan {
+				return Result{}, errors.New("ProofReady request lacks a durable PathPlan")
+			}
+			proofValue, loadErr := coordinator.builder.Build(ctx, pathproof.BuildRequest{PlanID: plan.ID, SourceBlockHash: result.Request.SourceBlockHash, ExpectedHomeTrustRoot: work.ExpectedHomeTrustRoot})
 			if loadErr != nil {
 				return Result{}, loadErr
 			}
@@ -138,10 +157,7 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 			if plan.Type == planner.DirectPlan {
 				return result, nil
 			}
-			proofValue, loadErr := coordinator.proofs.LoadPathProofForPlan(ctx, plan.ID)
-			if errors.Is(loadErr, pathproof.ErrPathProofNotFound) {
-				proofValue, loadErr = coordinator.builder.Build(ctx, pathproof.BuildRequest{PlanID: plan.ID, SourceBlockHash: result.Request.SourceBlockHash, ExpectedHomeTrustRoot: work.ExpectedHomeTrustRoot})
-			}
+			proofValue, loadErr := coordinator.builder.Build(ctx, pathproof.BuildRequest{PlanID: plan.ID, SourceBlockHash: result.Request.SourceBlockHash, ExpectedHomeTrustRoot: work.ExpectedHomeTrustRoot})
 			if loadErr != nil {
 				return Result{}, loadErr
 			}
@@ -150,6 +166,7 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 			if err != nil {
 				return Result{}, err
 			}
+			return result, nil
 		case Retryable:
 			plan, planErr := coordinator.planner.Plan(ctx, planner.Request{ID: result.Request.ID, Attempt: work.Attempt, SnapshotID: work.SnapshotID, HomeChainID: result.Request.HomeChainID})
 			if planErr != nil {
@@ -178,10 +195,7 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 			if err := validateWorkPlan(work, plan); err != nil {
 				return Result{}, err
 			}
-			proofValue, loadErr := coordinator.proofs.LoadPathProofForPlan(ctx, plan.ID)
-			if errors.Is(loadErr, pathproof.ErrPathProofNotFound) {
-				proofValue, loadErr = coordinator.builder.Build(ctx, pathproof.BuildRequest{PlanID: plan.ID, SourceBlockHash: result.Request.SourceBlockHash, ExpectedHomeTrustRoot: work.ExpectedHomeTrustRoot})
-			}
+			proofValue, loadErr := coordinator.builder.Build(ctx, pathproof.BuildRequest{PlanID: plan.ID, SourceBlockHash: result.Request.SourceBlockHash, ExpectedHomeTrustRoot: work.ExpectedHomeTrustRoot})
 			if loadErr != nil {
 				return Result{}, loadErr
 			}
@@ -190,6 +204,7 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 			if err != nil {
 				return Result{}, err
 			}
+			return result, nil
 		default:
 			return Result{}, fmt.Errorf("%w: %s", ErrInvalidRequestState, result.Request.State)
 		}

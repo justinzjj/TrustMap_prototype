@@ -2,10 +2,14 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
 	"errors"
+	"fmt"
 	"math/big"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
@@ -15,6 +19,64 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 	internalproof "github.com/justinzjj/TrustMap_prototype/internal/proof"
 )
+
+func TestParentV1DatabaseUpgradesToV2WithoutChangingChecksumOrProofData(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "parent-v1.sqlite")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(migrationTable); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(phase3Schema); err != nil {
+		t.Fatal(err)
+	}
+	v1Checksum := sha256.Sum256([]byte(phase3Schema))
+	if got := fmt.Sprintf("%x", v1Checksum); got != "ab9d49540980805aa7f76dd84a4c99bce4df85ed61f4f9eeb3285c91ec40dc4a" {
+		t.Fatalf("parent v1 checksum drifted: %s", got)
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(1,'phase3_core',?,?)`, v1Checksum[:], time.Now().UTC().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	legacy := &DB{sql: raw}
+	fixture := persistPathProofGraph(t, legacy)
+	proofValue, err := pathproof.NewBuilder(NewPathProofRepository(legacy), 1).Build(ctx, pathproof.BuildRequest{PlanID: fixture.plan.ID, SourceBlockHash: fixture.sourceBlockHash, ExpectedHomeTrustRoot: fixture.homeTrustRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("upgrade parent v1: %v", err)
+	}
+	defer upgraded.Close()
+	var versions int
+	if err := upgraded.sql.QueryRow("SELECT COUNT(*) FROM schema_migrations WHERE version IN (1,2)").Scan(&versions); err != nil || versions != 2 {
+		t.Fatalf("migration history count=%d err=%v", versions, err)
+	}
+	var persistedChecksum []byte
+	if err := upgraded.sql.QueryRow("SELECT checksum FROM schema_migrations WHERE version=1").Scan(&persistedChecksum); err != nil || !equalBytes(persistedChecksum, v1Checksum[:]) {
+		t.Fatalf("v1 checksum changed: %x err=%v", persistedChecksum, err)
+	}
+	reloaded, err := NewPathProofRepository(upgraded).LoadPathProof(ctx, proofValue.ID)
+	if err != nil || reloaded.ID != proofValue.ID {
+		t.Fatalf("v1 PathProof after upgrade = %+v, %v", reloaded, err)
+	}
+	for _, object := range []string{"prevent_proof_update", "prevent_proof_delete", "prevent_proof_hop_update", "prevent_proof_hop_delete", "unique_pathproof_per_plan"} {
+		var count int
+		if err := upgraded.sql.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name=?", object).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("v2 object %s count=%d err=%v", object, count, err)
+		}
+	}
+}
 
 func TestPathProofRepositoryPersistsSnapshotBoundProofAcrossRestart(t *testing.T) {
 	ctx := context.Background()
@@ -46,6 +108,12 @@ func TestPathProofRepositoryPersistsSnapshotBoundProofAcrossRestart(t *testing.T
 	if _, err := db.sql.Exec("DELETE FROM proof_hops WHERE proof_id=?", built.ID[:]); err == nil {
 		t.Fatal("persisted PathProof hop remained deletable")
 	}
+	duplicateID := built.ID
+	duplicateID[0] ^= 1
+	if _, err := db.sql.Exec(`INSERT INTO proofs(proof_id,request_id,plan_id,snapshot_id,base_trust_root,created_at)
+		VALUES(?,?,?,?,?,1)`, duplicateID[:], built.RequestID[:], built.PlanID[:], built.SnapshotID[:], built.BaseTrustRoot.Hash[:]); err == nil {
+		t.Fatal("v2 accepted multiple PathProof rows for one plan")
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +128,95 @@ func TestPathProofRepositoryPersistsSnapshotBoundProofAcrossRestart(t *testing.T
 	}
 	if reloaded.ID != built.ID || pathproof.ComputePathProofID(reloaded) != built.ID || len(reloaded.Witnesses) != 2 {
 		t.Fatalf("reloaded PathProof = %+v", reloaded)
+	}
+}
+
+func TestLoadPathProofRejectsSemanticallyInvalidParentV1Rows(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "invalid-v1-proofs.sqlite")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	if _, err := raw.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(phase3Schema); err != nil {
+		t.Fatal(err)
+	}
+	legacy := &DB{sql: raw}
+	fixture := persistPathProofGraph(t, legacy)
+	repository := NewPathProofRepository(legacy)
+	valid, err := pathproof.NewBuilder(repository, 1).Build(ctx, pathproof.BuildRequest{PlanID: fixture.plan.ID, SourceBlockHash: fixture.sourceBlockHash, ExpectedHomeTrustRoot: fixture.homeTrustRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	variants := []struct {
+		name   string
+		mutate func(*pathproof.PathProof)
+	}{
+		{"zero hops", func(value *pathproof.PathProof) { value.Hops = nil; value.BlockHashes = nil; value.Witnesses = nil }},
+		{"missing hop", func(value *pathproof.PathProof) {
+			value.Hops = value.Hops[:1]
+			value.BlockHashes = value.BlockHashes[:1]
+			value.Witnesses = value.Witnesses[:1]
+		}},
+		{"wrong reverse order", func(value *pathproof.PathProof) {
+			value.Hops[0], value.Hops[1] = value.Hops[1], value.Hops[0]
+			value.BlockHashes[0], value.BlockHashes[1] = value.BlockHashes[1], value.BlockHashes[0]
+			value.Witnesses[0], value.Witnesses[1] = value.Witnesses[1], value.Witnesses[0]
+		}},
+		{"wrong base TrustRoot", func(value *pathproof.PathProof) { value.BaseTrustRoot.Hash[0] ^= 1 }},
+	}
+	for _, test := range variants {
+		t.Run(test.name, func(t *testing.T) {
+			changed := valid.Clone()
+			test.mutate(&changed)
+			changed.ID = pathproof.ComputePathProofID(changed)
+			insertRawParentV1PathProof(t, raw, changed)
+			if _, err := repository.LoadPathProof(ctx, changed.ID); !errors.Is(err, pathproof.ErrProofMaterialMissing) {
+				t.Fatalf("LoadPathProof invalid row error = %v", err)
+			}
+		})
+	}
+	extra := valid.Clone()
+	extra.BaseTrustRoot.Hash[0] ^= 0x7f
+	extra.ID = pathproof.ComputePathProofID(extra)
+	insertRawParentV1PathProof(t, raw, extra)
+	if _, err := raw.Exec(`INSERT INTO proof_hops(proof_id,plan_id,snapshot_id,hop_index,plan_hop_index,edge_id,to_node_id,block_hash,witness_id)
+		VALUES(?,?,?,?,?,?,?,?,?)`, extra.ID[:], valid.PlanID[:], valid.SnapshotID[:], 2, 2, valid.Hops[0].EdgeID[:], valid.Hops[0].ToNodeID[:], valid.Hops[0].BlockHash[:], valid.Hops[0].WitnessID[:]); err == nil {
+		t.Fatal("parent v1 schema accepted proof hop beyond plan hop count")
+	}
+}
+
+func insertRawParentV1PathProof(t *testing.T, raw *sql.DB, value pathproof.PathProof) {
+	t.Helper()
+	if _, err := raw.Exec(`INSERT INTO proofs(proof_id,request_id,plan_id,snapshot_id,base_trust_root,created_at)
+		VALUES(?,?,?,?,?,?)`, value.ID[:], value.RequestID[:], value.PlanID[:], value.SnapshotID[:], value.BaseTrustRoot.Hash[:], time.Now().UTC().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	for index, hop := range value.Hops {
+		if _, err := raw.Exec(`INSERT INTO proof_hops(proof_id,plan_id,snapshot_id,hop_index,plan_hop_index,edge_id,to_node_id,block_hash,witness_id)
+			VALUES(?,?,?,?,?,?,?,?,?)`, value.ID[:], value.PlanID[:], value.SnapshotID[:], index, hop.PlanHopIndex, hop.EdgeID[:], hop.ToNodeID[:], hop.BlockHash[:], hop.WitnessID[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPathProofRepositoryPropagatesCanceledQueries(t *testing.T) {
+	db := openTestDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	repository := NewPathProofRepository(db)
+	_, err := repository.LoadPathProofMaterial(ctx, planner.PlanID{1}, trustview.SnapshotID{2}, 0, trustview.EdgeID{3})
+	if !errors.Is(err, context.Canceled) || errors.Is(err, pathproof.ErrProofMaterialMissing) {
+		t.Fatalf("LoadPathProofMaterial cancellation = %v", err)
+	}
+	_, err = repository.LoadPathProof(ctx, pathproof.PathProofID{1})
+	if !errors.Is(err, context.Canceled) || errors.Is(err, pathproof.ErrPathProofNotFound) {
+		t.Fatalf("LoadPathProof cancellation = %v", err)
 	}
 }
 

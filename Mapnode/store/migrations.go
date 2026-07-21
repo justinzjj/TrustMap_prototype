@@ -14,7 +14,10 @@ type migration struct {
 	sql     string
 }
 
-var migrations = []migration{{version: 1, name: "phase3_core", sql: phase3Schema}}
+var migrations = []migration{
+	{version: 1, name: "phase3_core", sql: phase3Schema},
+	{version: 2, name: "pathproof_integrity", sql: pathProofIntegrityV2},
+}
 
 const migrationTable = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -494,6 +497,10 @@ CREATE TABLE proof_hops (
     FOREIGN KEY(snapshot_id,to_node_id,block_hash) REFERENCES snapshot_nodes(snapshot_id,node_id,block_hash),
     UNIQUE(proof_id,plan_hop_index)
 ) STRICT;
+`
+
+const pathProofIntegrityV2 = `
+CREATE UNIQUE INDEX unique_pathproof_per_plan ON proofs(plan_id);
 
 CREATE TRIGGER prevent_proof_update
 BEFORE UPDATE ON proofs

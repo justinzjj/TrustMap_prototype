@@ -72,16 +72,25 @@ func loadPathProofMaterial(ctx context.Context, query queryer, planID planner.Pl
 	material.Edge.WitnessID = &witness
 	material.Witness.LeafIndex = uint32(leafIndex)
 	material.Witness.Siblings, err = loadWitnessSiblings(ctx, query, material.Witness.ID)
-	if err != nil || len(material.Witness.Siblings) == 0 {
+	if err != nil {
+		return pathproof.PathProofMaterial{}, fmt.Errorf("load PathProof witness siblings: %w", err)
+	}
+	if len(material.Witness.Siblings) == 0 {
 		return pathproof.PathProofMaterial{}, pathproof.ErrProofMaterialMissing
 	}
 	material.FromNode, err = loadSnapshotNode(ctx, query, snapshotID, material.Edge.From)
 	if err != nil {
-		return pathproof.PathProofMaterial{}, pathproof.ErrProofMaterialMissing
+		if errors.Is(err, sql.ErrNoRows) {
+			return pathproof.PathProofMaterial{}, pathproof.ErrProofMaterialMissing
+		}
+		return pathproof.PathProofMaterial{}, fmt.Errorf("load PathProof from node: %w", err)
 	}
 	material.ToNode, err = loadSnapshotNode(ctx, query, snapshotID, material.Edge.To)
 	if err != nil {
-		return pathproof.PathProofMaterial{}, pathproof.ErrProofMaterialMissing
+		if errors.Is(err, sql.ErrNoRows) {
+			return pathproof.PathProofMaterial{}, pathproof.ErrProofMaterialMissing
+		}
+		return pathproof.PathProofMaterial{}, fmt.Errorf("load PathProof to node: %w", err)
 	}
 	wantWitness := trustview.NewMembershipWitness(material.Witness.EvidenceID, material.Witness.LeafIndex, material.Witness.Siblings)
 	if wantWitness.ID != material.Witness.ID {
@@ -125,11 +134,23 @@ func (repository *PathProofRepository) SavePathProof(ctx context.Context, value 
 	}
 	defer func() { _ = tx.Rollback() }()
 	plan, err := loadPlan(ctx, tx, value.PlanID)
-	if err != nil || plan.Type != planner.PathPlan || plan.RequestID != value.RequestID || plan.SnapshotID != value.SnapshotID || len(plan.Hops) != len(value.Hops) {
+	if err != nil {
+		if errors.Is(err, planner.ErrPlanNotFound) {
+			return pathproof.ErrProofMaterialMissing
+		}
+		return fmt.Errorf("load PathProof plan: %w", err)
+	}
+	if plan.Type != planner.PathPlan || plan.RequestID != value.RequestID || plan.SnapshotID != value.SnapshotID || len(plan.Hops) != len(value.Hops) {
 		return pathproof.ErrProofMaterialMissing
 	}
 	target, err := loadSnapshotNode(ctx, tx, value.SnapshotID, plan.TargetNodeID)
-	if err != nil || target.Root != value.BaseTrustRoot {
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return pathproof.ErrProofMaterialMissing
+		}
+		return fmt.Errorf("load PathProof target node: %w", err)
+	}
+	if target.Root != value.BaseTrustRoot {
 		return pathproof.ErrProofMaterialMissing
 	}
 	for index, hop := range value.Hops {
@@ -138,7 +159,13 @@ func (repository *PathProofRepository) SavePathProof(ctx context.Context, value 
 			return pathproof.ErrProofMaterialMissing
 		}
 		material, loadErr := loadPathProofMaterial(ctx, tx, value.PlanID, value.SnapshotID, wantPlanIndex, hop.EdgeID)
-		if loadErr != nil || material.ToNode.ID != hop.ToNodeID || material.ToNode.Key.BlockHash != hop.BlockHash || material.Witness.ID != hop.WitnessID || material.Witness.LeafIndex != value.Witnesses[index].LeafIndex() || !sameHashes(material.Witness.Siblings, value.Witnesses[index].Siblings()) {
+		if loadErr != nil {
+			if errors.Is(loadErr, pathproof.ErrProofMaterialMissing) {
+				return pathproof.ErrProofMaterialMissing
+			}
+			return fmt.Errorf("load PathProof material %d: %w", index, loadErr)
+		}
+		if material.ToNode.ID != hop.ToNodeID || material.ToNode.Key.BlockHash != hop.BlockHash || material.Witness.ID != hop.WitnessID || material.Witness.LeafIndex != value.Witnesses[index].LeafIndex() || !sameHashes(material.Witness.Siblings, value.Witnesses[index].Siblings()) {
 			return pathproof.ErrProofMaterialMissing
 		}
 	}
@@ -243,9 +270,39 @@ func loadPathProof(ctx context.Context, query queryer, id pathproof.PathProofID)
 	if err := rows.Close(); err != nil {
 		return pathproof.PathProof{}, err
 	}
-	for _, hop := range result.Hops {
+	plan, err := loadPlan(ctx, query, result.PlanID)
+	if err != nil {
+		if errors.Is(err, planner.ErrPlanNotFound) {
+			return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
+		}
+		return pathproof.PathProof{}, fmt.Errorf("load persisted PathProof plan: %w", err)
+	}
+	if plan.Type != planner.PathPlan || plan.RequestID != result.RequestID || plan.SnapshotID != result.SnapshotID || len(result.Hops) == 0 || len(result.Hops) != len(plan.Hops) {
+		return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
+	}
+	target, err := loadSnapshotNode(ctx, query, result.SnapshotID, plan.TargetNodeID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
+		}
+		return pathproof.PathProof{}, fmt.Errorf("load persisted PathProof target: %w", err)
+	}
+	if target.Root != result.BaseTrustRoot {
+		return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
+	}
+	for index, hop := range result.Hops {
+		wantPlanIndex := len(plan.Hops) - 1 - index
+		if hop.PlanHopIndex != wantPlanIndex || hop.EdgeID != plan.Hops[wantPlanIndex] {
+			return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
+		}
 		material, err := loadPathProofMaterial(ctx, query, result.PlanID, result.SnapshotID, hop.PlanHopIndex, hop.EdgeID)
-		if err != nil || material.Witness.ID != hop.WitnessID || material.ToNode.ID != hop.ToNodeID || material.ToNode.Key.BlockHash != hop.BlockHash {
+		if err != nil {
+			if errors.Is(err, pathproof.ErrProofMaterialMissing) {
+				return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
+			}
+			return pathproof.PathProof{}, fmt.Errorf("load persisted PathProof material: %w", err)
+		}
+		if material.Witness.ID != hop.WitnessID || material.ToNode.ID != hop.ToNodeID || material.ToNode.Key.BlockHash != hop.BlockHash {
 			return pathproof.PathProof{}, pathproof.ErrProofMaterialMissing
 		}
 		witness, err := domain.NewMembershipWitness(material.Witness.LeafIndex, material.Witness.Siblings)

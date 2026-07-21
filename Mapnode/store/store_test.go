@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"math/big"
@@ -16,7 +17,7 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
-func TestOpenEnablesWALForeignKeysAndCreatesCompleteV1Schema(t *testing.T) {
+func TestOpenEnablesWALForeignKeysAndCreatesCompletePhaseThreeSchema(t *testing.T) {
 	db := openTestDB(t)
 	var journal string
 	if err := db.sql.QueryRow("PRAGMA journal_mode").Scan(&journal); err != nil {
@@ -54,12 +55,15 @@ func TestOpenEnablesWALForeignKeysAndCreatesCompleteV1Schema(t *testing.T) {
 			t.Fatalf("table %s is not STRICT", table)
 		}
 	}
-	var version int
-	if err := db.sql.QueryRow("SELECT version FROM schema_migrations").Scan(&version); err != nil {
+	var version, count int
+	if err := db.sql.QueryRow("SELECT MAX(version),COUNT(*) FROM schema_migrations").Scan(&version, &count); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
-		t.Fatalf("migration version = %d, want 1", version)
+	if version != 2 || count != 2 {
+		t.Fatalf("migration history = max %d count %d, want max 2 count 2", version, count)
+	}
+	if got := sha256.Sum256([]byte(phase3Schema)); got != [32]byte{0xab, 0x9d, 0x49, 0x54, 0x09, 0x80, 0x80, 0x5a, 0xa7, 0xf7, 0x6d, 0xd8, 0x4a, 0x4c, 0x99, 0xbc, 0xe4, 0xdf, 0x85, 0xed, 0x61, 0xf4, 0xf9, 0xee, 0xb3, 0x28, 0x5c, 0x91, 0xec, 0x40, 0xdc, 0x4a} {
+		t.Fatalf("v1 migration checksum drifted: %x", got)
 	}
 }
 
@@ -406,7 +410,7 @@ func TestMigrationsAreIdempotentAndDetectTampering(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := future.sql.Exec(
-		"INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(2,'future',zeroblob(32),1)",
+		"INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(3,'future',zeroblob(32),1)",
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -421,11 +425,6 @@ func TestMigrationsAreIdempotentAndDetectTampering(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := gap.sql.Exec("DELETE FROM schema_migrations WHERE version=1"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := gap.sql.Exec(
-		"INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(2,'future',zeroblob(32),1)",
-	); err != nil {
 		t.Fatal(err)
 	}
 	_ = gap.Close()

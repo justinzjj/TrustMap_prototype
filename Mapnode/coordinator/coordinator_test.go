@@ -25,7 +25,7 @@ func TestCoordinatorPersistsPathProofBeforeReportingProofReady(t *testing.T) {
 		t.Fatalf("state advanced before durable PathProof: transitions=%+v", fixture.requests.transitions)
 	}
 	second, err := fixture.coordinator.Process(context.Background(), fixture.work)
-	if err != nil || second.PathProof.ID != result.PathProof.ID || fixture.planning.calls != 1 || fixture.proofs.buildCalls != 1 {
+	if err != nil || second.PathProof.ID != result.PathProof.ID || fixture.planning.calls != 1 || fixture.proofs.buildCalls != 2 {
 		t.Fatalf("idempotent replay = %+v, %v; planner=%d builder=%d", second, err, fixture.planning.calls, fixture.proofs.buildCalls)
 	}
 }
@@ -51,8 +51,50 @@ func TestCoordinatorRecoversPlanAndProofPersistedBeforeStateTransition(t *testin
 			if err != nil || result.Request.State != ProofReady {
 				t.Fatalf("recovery = %+v, %v", result, err)
 			}
-			if fixture.planning.calls != 1 || fixture.proofs.buildCalls != 1 {
+			wantBuilds := 1
+			if stage == Planned {
+				wantBuilds = 2
+			}
+			if fixture.planning.calls != 1 || fixture.proofs.buildCalls != wantBuilds {
 				t.Fatalf("durable artifacts rebuilt: planner=%d proof=%d", fixture.planning.calls, fixture.proofs.buildCalls)
+			}
+		})
+	}
+}
+
+func TestCoordinatorCrashWindowRevalidatesCurrentHomeTrustRoot(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	fixture.requests.failTransitionTo[ProofReady] = 1
+	if _, err := fixture.coordinator.Process(context.Background(), fixture.work); err == nil {
+		t.Fatal("injected proof-ready transition failure was hidden")
+	}
+	if fixture.requests.record.State != Planned || !fixture.proofs.saved {
+		t.Fatalf("crash window = state %s saved %t", fixture.requests.record.State, fixture.proofs.saved)
+	}
+	fixture.work.ExpectedHomeTrustRoot.Hash[0] ^= 1
+	_, err := fixture.coordinator.Process(context.Background(), fixture.work)
+	if !errors.Is(err, pathproof.ErrStaleTrustViewSnapshot) {
+		t.Fatalf("changed HomeTrustRoot replay error = %v", err)
+	}
+	if fixture.requests.record.State != Planned {
+		t.Fatalf("stale proof advanced state to %s", fixture.requests.record.State)
+	}
+}
+
+func TestCoordinatorProofReadyAndReplannedReplayRevalidateCurrentHomeTrustRoot(t *testing.T) {
+	for _, state := range []RequestState{ProofReady, Replanned} {
+		t.Run(string(state), func(t *testing.T) {
+			fixture := newCoordinatorFixture()
+			fixture.requests.record, fixture.requests.observed = fixture.work.Request, true
+			fixture.requests.record.State = state
+			fixture.planning.saved, fixture.proofs.saved = true, true
+			fixture.work.ExpectedHomeTrustRoot.Hash[0] ^= 1
+			_, err := fixture.coordinator.Process(context.Background(), fixture.work)
+			if !errors.Is(err, pathproof.ErrStaleTrustViewSnapshot) {
+				t.Fatalf("changed HomeTrustRoot replay error = %v", err)
+			}
+			if fixture.requests.record.State != state {
+				t.Fatalf("stale replay changed state to %s", fixture.requests.record.State)
 			}
 		})
 	}
@@ -91,6 +133,26 @@ func TestCoordinatorUsesOnlyApprovedRetryableTransitions(t *testing.T) {
 	}
 	if result.Request.State != DirectFallback || len(fixture.requests.transitions) != 1 || fixture.requests.transitions[0] != (stateChange{Retryable, DirectFallback}) {
 		t.Fatalf("Retryable Direct fallback = %+v, transitions=%+v", result, fixture.requests.transitions)
+	}
+}
+
+func TestCoordinatorTerminalStatesDoNotHidePlanRepositoryErrors(t *testing.T) {
+	for _, state := range []RequestState{Rejected, DirectFallback} {
+		t.Run(string(state), func(t *testing.T) {
+			fixture := newCoordinatorFixture()
+			fixture.requests.record, fixture.requests.observed = fixture.work.Request, true
+			fixture.requests.record.State = state
+			fixture.planning.loadErr = errors.New("corrupt current plan index")
+			if _, err := fixture.coordinator.Process(context.Background(), fixture.work); !errors.Is(err, fixture.planning.loadErr) {
+				t.Fatalf("terminal state hid plan error: %v", err)
+			}
+		})
+	}
+	fixture := newCoordinatorFixture()
+	fixture.requests.record, fixture.requests.observed = fixture.work.Request, true
+	fixture.requests.record.State = DirectFallback
+	if _, err := fixture.coordinator.Process(context.Background(), fixture.work); !errors.Is(err, planner.ErrPlanNotFound) {
+		t.Fatalf("DirectFallback without durable plan error = %v", err)
 	}
 }
 
@@ -137,9 +199,10 @@ type fakeEvidenceGate struct{ err error }
 func (gate fakeEvidenceGate) RequireEvidenceReady(context.Context, Request) error { return gate.err }
 
 type fakePlanningService struct {
-	plan  planner.Plan
-	calls int
-	saved bool
+	plan    planner.Plan
+	calls   int
+	saved   bool
+	loadErr error
 }
 
 func (service *fakePlanningService) Plan(context.Context, planner.Request) (planner.Plan, error) {
@@ -148,6 +211,9 @@ func (service *fakePlanningService) Plan(context.Context, planner.Request) (plan
 	return service.plan.Clone(), nil
 }
 func (service *fakePlanningService) LoadCurrentPlan(context.Context, domain.RequestID) (planner.Plan, error) {
+	if service.loadErr != nil {
+		return planner.Plan{}, service.loadErr
+	}
 	if !service.saved {
 		return planner.Plan{}, planner.ErrPlanNotFound
 	}
@@ -159,10 +225,14 @@ type fakePathProofService struct {
 	buildCalls            int
 	saved                 bool
 	savedBeforeProofReady bool
+	expectedHomeTrustRoot trustview.TrustRoot
 }
 
-func (service *fakePathProofService) Build(context.Context, pathproof.BuildRequest) (pathproof.PathProof, error) {
+func (service *fakePathProofService) Build(_ context.Context, request pathproof.BuildRequest) (pathproof.PathProof, error) {
 	service.buildCalls++
+	if request.ExpectedHomeTrustRoot != service.expectedHomeTrustRoot {
+		return pathproof.PathProof{}, pathproof.ErrStaleTrustViewSnapshot
+	}
 	service.saved = true
 	service.savedBeforeProofReady = true
 	return service.value.Clone(), nil
@@ -194,8 +264,9 @@ func newCoordinatorFixture() coordinatorFixture {
 	proofValue := pathproof.PathProof{ID: pathproof.PathProofID{9}, RequestID: request.ID, PlanID: plan.ID, SnapshotID: snapshotID}
 	requests := &fakeRequestRepository{failTransitionTo: make(map[RequestState]int)}
 	planning := &fakePlanningService{plan: plan}
-	proofs := &fakePathProofService{value: proofValue}
+	expectedHomeTrustRoot := trustview.TrustRoot{Hash: common.HexToHash("0xc01")}
+	proofs := &fakePathProofService{value: proofValue, expectedHomeTrustRoot: expectedHomeTrustRoot}
 	requests.proofSaved = func() bool { return proofs.saved }
-	coordinator := New(requests, fakeEvidenceGate{}, planning, planning, proofs, proofs)
-	return coordinatorFixture{coordinator: coordinator, requests: requests, planning: planning, proofs: proofs, work: Work{Request: request, Attempt: 0, SnapshotID: snapshotID, ExpectedHomeTrustRoot: trustview.TrustRoot{Hash: common.HexToHash("0xc01")}}}
+	coordinator := New(requests, fakeEvidenceGate{}, planning, planning, proofs)
+	return coordinatorFixture{coordinator: coordinator, requests: requests, planning: planning, proofs: proofs, work: Work{Request: request, Attempt: 0, SnapshotID: snapshotID, ExpectedHomeTrustRoot: expectedHomeTrustRoot}}
 }
