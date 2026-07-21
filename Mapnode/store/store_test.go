@@ -202,6 +202,11 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
 		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
+	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xee), homeA, targetA, evidenceRecord.ID[:], witnessB); err == nil {
+		t.Fatal("snapshot edge accepted witness belonging to different evidence")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
 	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xe3), homeA, targetB, evidenceRecord.ID[:], witnessID); err == nil {
 		t.Fatal("snapshot edge accepted node from another snapshot")
 	}

@@ -20,7 +20,8 @@ func TestPlannerSelectsDirectedPathAndReportsExplicitFallbacks(t *testing.T) {
 	profiles := profileSource{profile: registry.ValidatedDirectProfile{ID: "pow-spv-3m", Fingerprint: common.HexToHash("0x11"), DirectCost: 20, Calibrated: true}}
 	repo := &memoryRepository{snapshot: snapshot}
 	p := New(repo, repo, profiles)
-	request := Request{ID: domain.RequestID(common.HexToHash("0x99")), Attempt: 0, SnapshotID: snapshot.ID, HomeChainID: snapshot.HomeChainID}
+	request := bindSnapshotAttempt(&snapshot, domain.RequestID(common.HexToHash("0x99")), 0)
+	repo.snapshot = snapshot
 	plan, err := p.Plan(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +35,9 @@ func TestPlannerSelectsDirectedPathAndReportsExplicitFallbacks(t *testing.T) {
 	}
 
 	profiles.profile.DirectCost = 19
-	plan, err = New(repo, repo, profiles).Plan(context.Background(), Request{ID: domain.RequestID(common.HexToHash("0x98")), Attempt: 1, SnapshotID: snapshot.ID, HomeChainID: snapshot.HomeChainID})
+	expensiveRequest := bindSnapshotAttempt(&snapshot, domain.RequestID(common.HexToHash("0x98")), 1)
+	repo.snapshot = snapshot
+	plan, err = New(repo, repo, profiles).Plan(context.Background(), expensiveRequest)
 	if err != nil || plan.Type != DirectPlan || plan.FallbackReason != PathCostExceedsDirect {
 		t.Fatalf("expensive Plan() = %+v, %v", plan, err)
 	}
@@ -42,7 +45,9 @@ func TestPlannerSelectsDirectedPathAndReportsExplicitFallbacks(t *testing.T) {
 	profiles.profile.DirectCost = 20
 	snapshot.Edges[0].WitnessID = nil
 	repo.snapshot = snapshot
-	plan, err = New(repo, repo, profiles).Plan(context.Background(), Request{ID: domain.RequestID(common.HexToHash("0x97")), Attempt: 2, SnapshotID: snapshot.ID, HomeChainID: snapshot.HomeChainID})
+	missingRequest := bindSnapshotAttempt(&snapshot, domain.RequestID(common.HexToHash("0x97")), 2)
+	repo.snapshot = snapshot
+	plan, err = New(repo, repo, profiles).Plan(context.Background(), missingRequest)
 	if err != nil || plan.FallbackReason != ProofMaterialMissing {
 		t.Fatalf("missing witness Plan() = %+v, %v", plan, err)
 	}
@@ -59,6 +64,7 @@ func TestPlannerFallbackReachabilityDirectionProfileAndCostValidation(t *testing
 		{"reverse unreachable", func(snapshot *trustview.TrustViewSnapshot, _ *registry.ValidatedDirectProfile) {
 			snapshot.StartNodeID, snapshot.TargetNodeID = snapshot.TargetNodeID, snapshot.StartNodeID
 			snapshot.HomeTrustRoot = snapshot.Nodes[2].Root
+			snapshot.HomeChainID = snapshot.Nodes[2].Key.ChainID
 		}, NoPath, nil},
 		{"no path", func(snapshot *trustview.TrustViewSnapshot, _ *registry.ValidatedDirectProfile) {
 			snapshot.Edges = snapshot.Edges[:1]
@@ -94,8 +100,10 @@ func TestPlannerFallbackReachabilityDirectionProfileAndCostValidation(t *testing
 			snapshot := base.Clone()
 			profile := registry.ValidatedDirectProfile{ID: "pow-spv-3m", Fingerprint: common.HexToHash("0x11"), DirectCost: 20, Calibrated: true}
 			tt.mutate(&snapshot, &profile)
+			requestID := domain.RequestID(common.BigToHash(big.NewInt(1)))
+			request := bindSnapshotAttempt(&snapshot, requestID, uint64(index))
 			repo := &memoryRepository{snapshot: snapshot}
-			plan, err := New(repo, repo, profileSource{profile: profile}).Plan(context.Background(), Request{ID: domain.RequestID(common.BigToHash(big.NewInt(1))), Attempt: uint64(index), SnapshotID: snapshot.ID, HomeChainID: snapshot.HomeChainID})
+			plan, err := New(repo, repo, profileSource{profile: profile}).Plan(context.Background(), request)
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("Plan() error = %v, want %v", err, tt.wantErr)
@@ -104,6 +112,37 @@ func TestPlannerFallbackReachabilityDirectionProfileAndCostValidation(t *testing
 			}
 			if err != nil || plan.Type != DirectPlan || plan.FallbackReason != tt.wantReason {
 				t.Fatalf("Plan() = %+v, %v", plan, err)
+			}
+		})
+	}
+}
+
+func TestPlannerRejectsSnapshotBoundToDifferentRequestAttemptOrHomeChain(t *testing.T) {
+	base := plannerSnapshot(t, 10, 10, true)
+	bound := bindSnapshotAttempt(&base, domain.RequestID(common.HexToHash("0x1234")), 7)
+	profile := profileSource{profile: registry.ValidatedDirectProfile{ID: "pow-spv-3m", Fingerprint: common.HexToHash("0x11"), DirectCost: 20, Calibrated: true}}
+	tests := []struct {
+		name   string
+		mutate func(*Request, *trustview.TrustViewSnapshot)
+	}{
+		{"request ID", func(request *Request, _ *trustview.TrustViewSnapshot) { request.ID[0] ^= 1 }},
+		{"attempt", func(request *Request, _ *trustview.TrustViewSnapshot) { request.Attempt++ }},
+		{"start chain", func(request *Request, snapshot *trustview.TrustViewSnapshot) {
+			other, _ := domain.NewChainID(999)
+			snapshot.HomeChainID = other
+			request.HomeChainID = other
+			snapshot.ID = trustview.ComputeSnapshotID(request.ID, request.Attempt, snapshot.Revision, snapshot.StartNodeID, snapshot.TargetNodeID, snapshot.HomeTrustRoot)
+			request.SnapshotID = snapshot.ID
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot := base.Clone()
+			request := bound
+			tt.mutate(&request, &snapshot)
+			repo := &memoryRepository{snapshot: snapshot}
+			if _, err := New(repo, repo, profile).Plan(context.Background(), request); !errors.Is(err, ErrSnapshotEndpoint) {
+				t.Fatalf("Plan() error = %v", err)
 			}
 		})
 	}
@@ -136,8 +175,10 @@ func TestPlannerDeterministicTieBreakIgnoresInsertionOrderAndCycles(t *testing.T
 		random.Shuffle(len(edges), func(i, j int) { edges[i], edges[j] = edges[j], edges[i] })
 		random.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
 		snapshot := trustview.TrustViewSnapshot{ID: trustview.SnapshotID(common.HexToHash("0x77")), Revision: 1, HomeChainID: chainC, HomeTrustRoot: c.Root, StartNodeID: c.ID, TargetNodeID: a.ID, Sealed: true, Nodes: append([]trustview.TrustNode(nil), nodes...), Edges: append([]trustview.TrustEdge(nil), edges...)}
+		requestID := domain.RequestID(common.BigToHash(big.NewInt(1)))
+		request := bindSnapshotAttempt(&snapshot, requestID, uint64(iteration))
 		repo := &memoryRepository{snapshot: snapshot}
-		plan, err := New(repo, repo, profile).Plan(context.Background(), Request{ID: domain.RequestID(common.BigToHash(big.NewInt(1))), Attempt: uint64(iteration), SnapshotID: snapshot.ID, HomeChainID: chainC})
+		plan, err := New(repo, repo, profile).Plan(context.Background(), request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -218,4 +259,9 @@ func plannerSnapshot(t *testing.T, firstCost, secondCost uint64, witnesses bool)
 	e1, _ := trustview.NewTrustEdge(c.ID, b.ID, evidence.ID{4}, p1, firstCost)
 	e2, _ := trustview.NewTrustEdge(b.ID, a.ID, evidence.ID{5}, p2, secondCost)
 	return trustview.TrustViewSnapshot{ID: trustview.SnapshotID(common.HexToHash("0x55")), Revision: 1, HomeChainID: chainC, HomeTrustRoot: c.Root, StartNodeID: c.ID, TargetNodeID: a.ID, Sealed: true, Nodes: []trustview.TrustNode{c, b, a}, Edges: []trustview.TrustEdge{e1, e2}}
+}
+
+func bindSnapshotAttempt(snapshot *trustview.TrustViewSnapshot, requestID domain.RequestID, attempt uint64) Request {
+	snapshot.ID = trustview.ComputeSnapshotID(requestID, attempt, snapshot.Revision, snapshot.StartNodeID, snapshot.TargetNodeID, snapshot.HomeTrustRoot)
+	return Request{ID: requestID, Attempt: attempt, SnapshotID: snapshot.ID, HomeChainID: snapshot.HomeChainID}
 }

@@ -23,6 +23,7 @@ func (repository *TrustViewRepository) MergeActiveTrustEdge(
 	ctx context.Context,
 	from, to trustview.TrustNode,
 	edge trustview.TrustEdge,
+	dependency trustview.VerifiedDependency,
 ) (bool, error) {
 	if repository == nil || repository.db == nil {
 		return false, errors.New("nil TrustView repository database")
@@ -50,10 +51,24 @@ func (repository *TrustViewRepository) MergeActiveTrustEdge(
 		return false, fmt.Errorf("begin TrustView merge: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, id := range []evidence.ID{from.EvidenceID, to.EvidenceID, edge.EvidenceID} {
-		if err := requireActiveEvidence(ctx, tx, id); err != nil {
-			return false, err
-		}
+	fromEvidence, err := loadActiveEvidence(ctx, tx, from.EvidenceID)
+	if err != nil {
+		return false, err
+	}
+	toEvidence, err := loadActiveEvidence(ctx, tx, to.EvidenceID)
+	if err != nil {
+		return false, err
+	}
+	edgeEvidence, err := loadActiveEvidence(ctx, tx, edge.EvidenceID)
+	if err != nil {
+		return false, err
+	}
+	if !evidenceLocatorMatchesNode(fromEvidence.Locator, from) || !evidenceLocatorMatchesNode(toEvidence.Locator, to) ||
+		!evidenceLocatorMatchesNode(edgeEvidence.Locator, from) || dependency.EvidenceID != edge.EvidenceID {
+		return false, ErrEvidenceBinding
+	}
+	if err := dependency.Validate(to, edgeEvidence.Locator.PayloadDigest); err != nil {
+		return false, fmt.Errorf("%w: %v", ErrEvidenceBinding, err)
 	}
 	changed := false
 	for _, node := range []trustview.TrustNode{from, to} {
@@ -80,17 +95,26 @@ func (repository *TrustViewRepository) MergeActiveTrustEdge(
 }
 
 func requireActiveEvidence(ctx context.Context, tx *sql.Tx, id evidence.ID) error {
-	var state evidence.State
-	if err := tx.QueryRowContext(ctx, "SELECT state FROM evidence WHERE id=?", id[:]).Scan(&state); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: evidence %x not found", ErrInactiveEvidence, id)
-		}
-		return fmt.Errorf("load TrustView evidence: %w", err)
+	_, err := loadActiveEvidence(ctx, tx, id)
+	return err
+}
+
+func loadActiveEvidence(ctx context.Context, tx *sql.Tx, id evidence.ID) (evidence.Record, error) {
+	record, err := scanEvidence(tx.QueryRowContext(ctx, evidenceSelect+" WHERE id=?", id[:]))
+	if errors.Is(err, ErrRecordNotFound) {
+		return evidence.Record{}, fmt.Errorf("%w: evidence %x not found", ErrInactiveEvidence, id)
 	}
-	if state != evidence.Active {
-		return fmt.Errorf("%w: evidence %x is %s", ErrInactiveEvidence, id, state)
+	if err != nil {
+		return evidence.Record{}, err
 	}
-	return nil
+	if record.State != evidence.Active {
+		return evidence.Record{}, fmt.Errorf("%w: evidence %x is %s", ErrInactiveEvidence, id, record.State)
+	}
+	return record, nil
+}
+
+func evidenceLocatorMatchesNode(locator evidence.Locator, node trustview.TrustNode) bool {
+	return locator.ChainID == node.Key.ChainID && locator.BlockNumber == node.Key.Height && locator.BlockHash == node.Key.BlockHash
 }
 
 func mergeTrustNode(ctx context.Context, tx *sql.Tx, node trustview.TrustNode) (bool, error) {
@@ -240,15 +264,26 @@ func (repository *TrustViewRepository) CreateTrustViewSnapshot(ctx context.Conte
 	if err := tx.QueryRowContext(ctx, "SELECT revision FROM graph_state WHERE singleton=1").Scan(&revision); err != nil {
 		return trustview.TrustViewSnapshot{}, err
 	}
+	persistedRequest, err := scanRequest(tx.QueryRowContext(ctx, requestSelect+" WHERE id=?", request.RequestID[:]))
+	if err != nil {
+		return trustview.TrustViewSnapshot{}, fmt.Errorf("load snapshot request: %w", err)
+	}
+	if persistedRequest.HomeChainID != request.HomeChainID {
+		return trustview.TrustViewSnapshot{}, ErrRecordConflict
+	}
 	start, err := loadActiveTrustNode(ctx, tx, request.StartNodeID)
 	if err != nil {
 		return trustview.TrustViewSnapshot{}, err
 	}
-	if _, err := loadActiveTrustNode(ctx, tx, request.TargetNodeID); err != nil {
+	target, err := loadActiveTrustNode(ctx, tx, request.TargetNodeID)
+	if err != nil {
 		return trustview.TrustViewSnapshot{}, err
 	}
 	if start.Key.ChainID != request.HomeChainID || start.Root != request.ExpectedHomeTrustRoot {
 		return trustview.TrustViewSnapshot{}, trustview.ErrTrustRootConflict
+	}
+	if target.Key.ChainID != persistedRequest.SourceChainID || target.Key.Height != persistedRequest.SourceHeight || target.Key.BlockHash != persistedRequest.SourceBlockHash {
+		return trustview.TrustViewSnapshot{}, ErrEvidenceBinding
 	}
 	id := trustview.ComputeSnapshotID(request.RequestID, request.Attempt, uint64(revision), request.StartNodeID, request.TargetNodeID, request.ExpectedHomeTrustRoot)
 	if existing, err := loadSnapshot(ctx, tx, id); err == nil {

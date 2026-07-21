@@ -11,14 +11,16 @@ import (
 )
 
 var (
-	ErrMigrationChecksum = errors.New("migration checksum mismatch")
-	ErrFutureMigration   = errors.New("database contains a future migration")
-	ErrMigrationGap      = errors.New("database migration history has a gap")
-	ErrRecordNotFound    = errors.New("record not found")
-	ErrRecordConflict    = errors.New("record conflicts with persisted identity")
-	ErrConcurrentUpdate  = errors.New("record state changed concurrently")
-	ErrInactiveEvidence  = errors.New("TrustView mutation requires active evidence")
-	ErrGraphConflict     = errors.New("TrustView graph record conflicts with persisted data")
+	ErrMigrationChecksum    = errors.New("migration checksum mismatch")
+	ErrFutureMigration      = errors.New("database contains a future migration")
+	ErrMigrationGap         = errors.New("database migration history has a gap")
+	ErrRecordNotFound       = errors.New("record not found")
+	ErrRecordConflict       = errors.New("record conflicts with persisted identity")
+	ErrConcurrentUpdate     = errors.New("record state changed concurrently")
+	ErrInactiveEvidence     = errors.New("TrustView mutation requires active evidence")
+	ErrGraphConflict        = errors.New("TrustView graph record conflicts with persisted data")
+	ErrEvidenceBinding      = errors.New("TrustView evidence does not bind the claimed block dependency")
+	ErrStalePlanningAttempt = errors.New("planning attempt is older than the current persisted plan")
 )
 
 type DB struct {

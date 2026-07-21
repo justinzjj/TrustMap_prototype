@@ -271,7 +271,7 @@ CREATE TABLE snapshot_edges (
     FOREIGN KEY(snapshot_id,from_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(snapshot_id,to_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(evidence_id) REFERENCES evidence(id),
-    FOREIGN KEY(witness_id) REFERENCES membership_witnesses(witness_id),
+    FOREIGN KEY(witness_id,evidence_id) REFERENCES membership_witnesses(witness_id,evidence_id),
     UNIQUE(snapshot_id,edge_id,witness_id,to_node_id)
 ) STRICT;
 
@@ -331,7 +331,8 @@ CREATE TABLE membership_witnesses (
     evidence_id BLOB NOT NULL UNIQUE CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
     leaf_index INTEGER NOT NULL CHECK(leaf_index BETWEEN 0 AND 4294967295),
     created_at INTEGER NOT NULL CHECK(created_at > 0),
-    FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE
+    FOREIGN KEY(evidence_id) REFERENCES evidence(id) ON DELETE CASCADE,
+    UNIQUE(witness_id,evidence_id)
 ) STRICT;
 
 CREATE TABLE membership_witness_siblings (

@@ -114,6 +114,10 @@ func (planner *Planner) Plan(ctx context.Context, request Request) (Plan, error)
 	if snapshot.ID != request.SnapshotID || snapshot.HomeChainID != request.HomeChainID {
 		return Plan{}, ErrSnapshotEndpoint
 	}
+	expectedSnapshotID := trustview.ComputeSnapshotID(request.ID, request.Attempt, snapshot.Revision, snapshot.StartNodeID, snapshot.TargetNodeID, snapshot.HomeTrustRoot)
+	if expectedSnapshotID != snapshot.ID {
+		return Plan{}, ErrSnapshotEndpoint
+	}
 	if snapshot.StartNodeID == snapshot.TargetNodeID {
 		return Plan{}, ErrSnapshotEndpoint
 	}
@@ -125,6 +129,9 @@ func (planner *Planner) Plan(ctx context.Context, request Request) (Plan, error)
 		return Plan{}, fmtErrorSnapshot(err)
 	}
 	startNode, _ := findSnapshotNode(snapshot, snapshot.StartNodeID)
+	if startNode.Key.ChainID != request.HomeChainID {
+		return Plan{}, ErrSnapshotEndpoint
+	}
 	if startNode.Root != snapshot.HomeTrustRoot {
 		return Plan{}, ErrStaleSnapshot
 	}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/planner"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
+	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
 type PlanRepository struct{ db *DB }
@@ -23,25 +24,53 @@ func (repository *PlanRepository) SavePlan(ctx context.Context, plan planner.Pla
 	if err := validatePlanForStorage(plan); err != nil {
 		return err
 	}
-	if persisted, err := repository.LoadPlan(ctx, plan.ID); err == nil {
-		if samePlanDecision(persisted, plan) {
-			return nil
-		}
-		return ErrRecordConflict
-	} else if !errors.Is(err, planner.ErrPlanNotFound) {
-		return err
-	}
 	tx, err := repository.db.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin plan save: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	var currentID []byte
+	var currentAttempt int64
+	err = tx.QueryRowContext(ctx, `SELECT p.plan_id,p.attempt FROM request_current_plan c
+		JOIN plans p ON p.plan_id=c.plan_id WHERE c.request_id=?`, plan.RequestID[:]).Scan(&currentID, &currentAttempt)
+	if err == nil {
+		if plan.Attempt < uint64(currentAttempt) {
+			return ErrStalePlanningAttempt
+		}
+		if plan.Attempt == uint64(currentAttempt) {
+			if !equalBytes(currentID, plan.ID[:]) {
+				return ErrRecordConflict
+			}
+			persisted, loadErr := loadPlan(ctx, tx, plan.ID)
+			if loadErr != nil {
+				return loadErr
+			}
+			if !samePlanDecision(persisted, plan) {
+				return ErrRecordConflict
+			}
+			return tx.Commit()
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("load current planning attempt: %w", err)
+	}
+	if err := validatePlanSnapshotBinding(ctx, tx, plan); err != nil {
+		return err
+	}
+	if persisted, loadErr := loadPlan(ctx, tx, plan.ID); loadErr == nil {
+		if !samePlanDecision(persisted, plan) {
+			return ErrRecordConflict
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO request_current_plan(request_id,plan_id) VALUES(?,?)
+			ON CONFLICT(request_id) DO UPDATE SET plan_id=excluded.plan_id`, plan.RequestID[:], plan.ID[:]); err != nil {
+			return err
+		}
+		return tx.Commit()
+	} else if !errors.Is(loadErr, planner.ErrPlanNotFound) {
+		return loadErr
+	}
 	var conflicting []byte
 	err = tx.QueryRowContext(ctx, "SELECT plan_id FROM plans WHERE request_id=? AND attempt=?", plan.RequestID[:], int64(plan.Attempt)).Scan(&conflicting)
 	if err == nil {
-		if equalBytes(conflicting, plan.ID[:]) {
-			return tx.Commit()
-		}
 		return ErrRecordConflict
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -89,6 +118,14 @@ func validatePlanForStorage(plan planner.Plan) error {
 			return errors.New("plan cost exceeds SQLite range")
 		}
 	}
+	if len(plan.Hops) > 0 {
+		if plan.PathStepCost == 0 || plan.PathCost == nil || uint64(len(plan.Hops)) > math.MaxUint64/plan.PathStepCost || *plan.PathCost != uint64(len(plan.Hops))*plan.PathStepCost {
+			return errors.New("plan path cost does not match hop count and trusted step cost")
+		}
+	} else if plan.PathCost != nil || plan.PathStepCost != 0 {
+		return errors.New("zero-hop plan must not persist a path cost")
+	}
+
 	switch plan.Type {
 	case planner.PathPlan:
 		if len(plan.Hops) == 0 || plan.PathCost == nil || plan.DirectCost == nil || plan.FallbackReason != "" {
@@ -115,12 +152,33 @@ func (repository *PlanRepository) LoadPlan(ctx context.Context, id planner.PlanI
 	if repository == nil || repository.db == nil {
 		return planner.Plan{}, errors.New("nil plan repository database")
 	}
+	return loadPlan(ctx, repository.db.sql, id)
+}
+
+func (repository *PlanRepository) LoadCurrentPlan(ctx context.Context, requestID domain.RequestID) (planner.Plan, error) {
+	if repository == nil || repository.db == nil {
+		return planner.Plan{}, errors.New("nil plan repository database")
+	}
+	var raw []byte
+	if err := repository.db.sql.QueryRowContext(ctx, "SELECT plan_id FROM request_current_plan WHERE request_id=?", requestID[:]).Scan(&raw); errors.Is(err, sql.ErrNoRows) {
+		return planner.Plan{}, planner.ErrPlanNotFound
+	} else if err != nil {
+		return planner.Plan{}, err
+	}
+	var id planner.PlanID
+	if err := copyExact(id[:], raw, "current plan ID"); err != nil {
+		return planner.Plan{}, err
+	}
+	return repository.LoadPlan(ctx, id)
+}
+
+func loadPlan(ctx context.Context, query queryer, id planner.PlanID) (planner.Plan, error) {
 	var plan planner.Plan
 	var planID, requestID, snapshotID, fingerprint, home, target []byte
 	var attempt, hopCount, stepCost int64
 	var pathCost, directCost sql.NullInt64
 	var createdAt int64
-	err := repository.db.sql.QueryRowContext(ctx, `SELECT plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+	err := query.QueryRowContext(ctx, `SELECT plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
 		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at FROM plans WHERE plan_id=?`, id[:]).Scan(
 		&planID, &requestID, &snapshotID, &plan.ProfileID, &fingerprint, &attempt, &plan.Type, &home, &target, &hopCount, &stepCost, &pathCost, &directCost, &plan.FallbackReason, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -146,7 +204,7 @@ func (repository *PlanRepository) LoadPlan(ctx context.Context, id planner.PlanI
 		value := uint64(directCost.Int64)
 		plan.DirectCost = &value
 	}
-	rows, err := repository.db.sql.QueryContext(ctx, "SELECT edge_id FROM plan_hops WHERE plan_id=? ORDER BY hop_index", id[:])
+	rows, err := query.QueryContext(ctx, "SELECT edge_id FROM plan_hops WHERE plan_id=? ORDER BY hop_index", id[:])
 	if err != nil {
 		return planner.Plan{}, err
 	}
@@ -170,6 +228,34 @@ func (repository *PlanRepository) LoadPlan(ctx context.Context, id planner.PlanI
 		return planner.Plan{}, errors.New("corrupt plan hop count")
 	}
 	return plan, nil
+}
+
+func validatePlanSnapshotBinding(ctx context.Context, tx *sql.Tx, plan planner.Plan) error {
+	var revision int64
+	var root, start, target []byte
+	var sealed int
+	if err := tx.QueryRowContext(ctx, `SELECT graph_revision,home_trust_root,start_node_id,target_node_id,sealed
+		FROM trustview_snapshots WHERE snapshot_id=?`, plan.SnapshotID[:]).Scan(&revision, &root, &start, &target, &sealed); err != nil {
+		return fmt.Errorf("load plan TrustViewSnapshot: %w", err)
+	}
+	if sealed != 1 {
+		return planner.ErrSnapshotUnsealed
+	}
+	var homeRoot trustview.TrustRoot
+	var startID, targetID trustview.NodeID
+	for _, item := range []struct {
+		to, from []byte
+		label    string
+	}{{homeRoot.Hash[:], root, "home TrustRoot"}, {startID[:], start, "start node"}, {targetID[:], target, "target node"}} {
+		if err := copyExact(item.to, item.from, item.label); err != nil {
+			return err
+		}
+	}
+	expected := trustview.ComputeSnapshotID(plan.RequestID, plan.Attempt, uint64(revision), startID, targetID, homeRoot)
+	if expected != plan.SnapshotID || startID != plan.HomeNodeID || targetID != plan.TargetNodeID {
+		return planner.ErrSnapshotEndpoint
+	}
+	return nil
 }
 
 func samePlanDecision(left, right planner.Plan) bool {
