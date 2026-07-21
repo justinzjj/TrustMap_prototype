@@ -8,7 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -26,7 +29,7 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer application.Close()
-	if !application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.CanonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.PathProofBuilder == nil {
+	if !application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.canonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.PathProofBuilder == nil {
 		t.Fatalf("incomplete Phase 3 composition: %+v", application)
 	}
 	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, coordinator.ErrInvalidObservation) {
@@ -63,10 +66,10 @@ func TestAppPersistedDegradedGateDisablesReadyHealthAndProcessAcrossRestart(t *t
 	height, _ := domain.NewBlockHeight(7)
 	nextHeight, _ := domain.NewBlockHeight(8)
 	initial := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
-	if _, _, err := application.CanonicalCursors.Initialize(ctx, initial); err != nil {
+	if _, _, err := application.InitializeCanonicalCursor(ctx, initial); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := application.CanonicalCursors.Advance(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70")}); !errors.Is(err, reorg.ErrCanonicalMismatch) {
+	if _, _, err := application.AdvanceCanonicalCursor(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70")}); !errors.Is(err, reorg.ErrCanonicalMismatch) {
 		t.Fatalf("degrade cursor err=%v", err)
 	}
 	if application.Ready() {
@@ -99,6 +102,82 @@ func TestAppPersistedDegradedGateDisablesReadyHealthAndProcessAcrossRestart(t *t
 	}
 	if _, err := application.Process(ctx, coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
 		t.Fatalf("restarted Process err=%v", err)
+	}
+}
+
+func TestProcessAndCanonicalDegradationAreLinearized(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	ctx := context.Background()
+	application, err := Open(ctx, config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(7)
+	nextHeight, _ := domain.NewBlockHeight(8)
+	initial := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
+	if _, _, err := application.InitializeCanonicalCursor(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+
+	processor := &blockingProcessor{entered: make(chan struct{}), release: make(chan struct{})}
+	application.coordinator = processor
+	processDone := make(chan error, 1)
+	go func() {
+		_, err := application.Process(ctx, coordinator.Work{})
+		processDone <- err
+	}()
+	<-processor.entered
+
+	advanceStarted := make(chan struct{})
+	advanceDone := make(chan error, 1)
+	go func() {
+		close(advanceStarted)
+		_, _, err := application.AdvanceCanonicalCursor(ctx, chainID, initial.Hash, reorg.CanonicalBlock{
+			Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70"),
+		})
+		advanceDone <- err
+	}()
+	<-advanceStarted
+	select {
+	case err := <-advanceDone:
+		t.Fatalf("degradation completed while Process held the operational read lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(processor.release)
+	if err := <-processDone; err != nil {
+		t.Fatalf("in-flight Process err=%v", err)
+	}
+	if err := <-advanceDone; !errors.Is(err, reorg.ErrCanonicalMismatch) {
+		t.Fatalf("degrade cursor err=%v", err)
+	}
+	if _, err := application.Process(ctx, coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
+		t.Fatalf("Process after degradation err=%v", err)
+	}
+	if calls := processor.calls.Load(); calls != 1 {
+		t.Fatalf("processor calls=%d, want 1", calls)
+	}
+}
+
+type blockingProcessor struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	calls   atomic.Int32
+}
+
+func (processor *blockingProcessor) Process(ctx context.Context, _ coordinator.Work) (coordinator.Result, error) {
+	processor.calls.Add(1)
+	processor.once.Do(func() { close(processor.entered) })
+	select {
+	case <-processor.release:
+		return coordinator.Result{}, nil
+	case <-ctx.Done():
+		return coordinator.Result{}, ctx.Err()
 	}
 }
 

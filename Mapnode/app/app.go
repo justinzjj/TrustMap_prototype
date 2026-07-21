@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -16,6 +17,7 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/planner"
 	pathproof "github.com/justinzjj/TrustMap_prototype/Mapnode/proof"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/registry"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/reorg"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/store"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
@@ -29,7 +31,6 @@ type App struct {
 	Registry              *registry.Registry
 	ChainCatalog          *chain.Registry
 	LiveChains            *store.LiveChainRepository
-	CanonicalCursors      *store.CanonicalCursorRepository
 	TrustRootObservations *store.TrustRootObservationRepository
 	Evidence              *store.EvidenceRepository
 	Requests              *store.RequestRepository
@@ -38,11 +39,17 @@ type App struct {
 	PathProofs            *store.PathProofRepository
 	PathProofBuilder      *pathproof.Builder
 
-	database      *store.DB
-	pathTreeDepth uint8
-	ready         atomic.Bool
-	planner       *planner.Planner
-	coordinator   *coordinator.Coordinator
+	database         *store.DB
+	pathTreeDepth    uint8
+	ready            atomic.Bool
+	operationalMu    sync.RWMutex
+	canonicalCursors *store.CanonicalCursorRepository
+	planner          *planner.Planner
+	coordinator      requestProcessor
+}
+
+type requestProcessor interface {
+	Process(context.Context, coordinator.Work) (coordinator.Result, error)
 }
 
 // Open performs live chain/code binding before opening SQLite, then maps the
@@ -83,7 +90,7 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 		_ = database.Close()
 		return nil, fmt.Errorf("persist home Gateway deployment: %w", err)
 	}
-	application.CanonicalCursors = store.NewCanonicalCursorRepository(database)
+	application.canonicalCursors = store.NewCanonicalCursorRepository(database)
 	application.TrustRootObservations = store.NewTrustRootObservationRepository(database)
 	application.Evidence = store.NewEvidenceRepository(database)
 	application.Requests = store.NewRequestRepository(database)
@@ -133,10 +140,20 @@ func mustDecimal(value string) *big.Int {
 }
 
 func (application *App) Ready() bool {
+	if application == nil {
+		return false
+	}
+	application.operationalMu.RLock()
+	defer application.operationalMu.RUnlock()
 	return application.operationalGate(context.Background()) == nil
 }
 
 func (application *App) Process(ctx context.Context, work coordinator.Work) (coordinator.Result, error) {
+	if application == nil {
+		return coordinator.Result{}, ErrOperationalUnavailable
+	}
+	application.operationalMu.RLock()
+	defer application.operationalMu.RUnlock()
 	if err := application.operationalGate(ctx); err != nil {
 		return coordinator.Result{}, err
 	}
@@ -144,10 +161,10 @@ func (application *App) Process(ctx context.Context, work coordinator.Work) (coo
 }
 
 func (application *App) operationalGate(ctx context.Context) error {
-	if application == nil || !application.ready.Load() || application.CanonicalCursors == nil {
+	if !application.ready.Load() || application.canonicalCursors == nil || application.coordinator == nil {
 		return ErrOperationalUnavailable
 	}
-	degraded, err := application.CanonicalCursors.HasDegradedCanonicalCursor(ctx)
+	degraded, err := application.canonicalCursors.HasDegradedCanonicalCursor(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrOperationalUnavailable, err)
 	}
@@ -155,6 +172,42 @@ func (application *App) operationalGate(ctx context.Context) error {
 		return ErrOperationalDegraded
 	}
 	return nil
+}
+
+func (application *App) InitializeCanonicalCursor(ctx context.Context, cursor reorg.CanonicalCursor) (reorg.CanonicalCursor, bool, error) {
+	if application == nil {
+		return reorg.CanonicalCursor{}, false, ErrOperationalUnavailable
+	}
+	application.operationalMu.Lock()
+	defer application.operationalMu.Unlock()
+	if !application.ready.Load() || application.canonicalCursors == nil {
+		return reorg.CanonicalCursor{}, false, ErrOperationalUnavailable
+	}
+	return application.canonicalCursors.Initialize(ctx, cursor)
+}
+
+func (application *App) AdvanceCanonicalCursor(ctx context.Context, chainID domain.ChainID, recheckedHash common.Hash, next reorg.CanonicalBlock) (reorg.CanonicalCursor, bool, error) {
+	if application == nil {
+		return reorg.CanonicalCursor{}, false, ErrOperationalUnavailable
+	}
+	application.operationalMu.Lock()
+	defer application.operationalMu.Unlock()
+	if !application.ready.Load() || application.canonicalCursors == nil {
+		return reorg.CanonicalCursor{}, false, ErrOperationalUnavailable
+	}
+	return application.canonicalCursors.Advance(ctx, chainID, recheckedHash, next)
+}
+
+func (application *App) LoadCanonicalCursor(ctx context.Context, chainID domain.ChainID) (reorg.CanonicalCursor, error) {
+	if application == nil {
+		return reorg.CanonicalCursor{}, ErrOperationalUnavailable
+	}
+	application.operationalMu.RLock()
+	defer application.operationalMu.RUnlock()
+	if !application.ready.Load() || application.canonicalCursors == nil {
+		return reorg.CanonicalCursor{}, ErrOperationalUnavailable
+	}
+	return application.canonicalCursors.Load(ctx, chainID)
 }
 
 func (application *App) PathTreeDepth() uint8 {
@@ -168,6 +221,8 @@ func (application *App) Close() error {
 	if application == nil {
 		return nil
 	}
+	application.operationalMu.Lock()
+	defer application.operationalMu.Unlock()
 	application.ready.Store(false)
 	if application.database == nil {
 		return nil
