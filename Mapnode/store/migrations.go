@@ -216,7 +216,8 @@ CREATE TABLE snapshot_nodes (
     block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
     trust_root BLOB NOT NULL CHECK(typeof(trust_root)='blob' AND length(trust_root)=32),
     PRIMARY KEY(snapshot_id,node_id),
-    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id) ON DELETE CASCADE
+    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id) ON DELETE CASCADE,
+    UNIQUE(snapshot_id,node_id,block_hash)
 ) STRICT;
 
 CREATE TABLE snapshot_edges (
@@ -225,14 +226,15 @@ CREATE TABLE snapshot_edges (
     from_node_id BLOB NOT NULL CHECK(typeof(from_node_id)='blob' AND length(from_node_id)=32),
     to_node_id BLOB NOT NULL CHECK(typeof(to_node_id)='blob' AND length(to_node_id)=32),
     evidence_id BLOB NOT NULL CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
-    witness_id BLOB NOT NULL CHECK(typeof(witness_id)='blob' AND length(witness_id)=32),
+    witness_id BLOB CHECK(witness_id IS NULL OR (typeof(witness_id)='blob' AND length(witness_id)=32)),
     path_step_cost INTEGER NOT NULL CHECK(path_step_cost >= 0),
     PRIMARY KEY(snapshot_id,edge_id),
     FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id) ON DELETE CASCADE,
     FOREIGN KEY(snapshot_id,from_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(snapshot_id,to_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(evidence_id) REFERENCES evidence(id),
-    FOREIGN KEY(witness_id) REFERENCES membership_witnesses(witness_id)
+    FOREIGN KEY(witness_id) REFERENCES membership_witnesses(witness_id),
+    UNIQUE(snapshot_id,edge_id,witness_id,to_node_id)
 ) STRICT;
 
 CREATE TRIGGER prevent_sealed_snapshot_update
@@ -354,7 +356,9 @@ CREATE TABLE plans (
     FOREIGN KEY(snapshot_id,home_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     FOREIGN KEY(snapshot_id,target_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
     UNIQUE(request_id,attempt),
-    UNIQUE(plan_id,snapshot_id)
+    UNIQUE(plan_id,snapshot_id),
+    UNIQUE(request_id,plan_id),
+    UNIQUE(request_id,plan_id,snapshot_id)
 ) STRICT;
 
 CREATE TRIGGER require_sealed_snapshot_for_plan
@@ -364,6 +368,18 @@ BEGIN
     SELECT RAISE(ABORT,'plan requires a sealed snapshot');
 END;
 
+CREATE TRIGGER prevent_plan_update
+BEFORE UPDATE ON plans
+BEGIN
+    SELECT RAISE(ABORT,'plan is append-only');
+END;
+
+CREATE TRIGGER prevent_plan_delete
+BEFORE DELETE ON plans
+BEGIN
+    SELECT RAISE(ABORT,'plan is append-only');
+END;
+
 CREATE TABLE plan_hops (
     plan_id BLOB NOT NULL CHECK(typeof(plan_id)='blob' AND length(plan_id)=32),
     snapshot_id BLOB NOT NULL CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
@@ -371,14 +387,36 @@ CREATE TABLE plan_hops (
     edge_id BLOB NOT NULL CHECK(typeof(edge_id)='blob' AND length(edge_id)=32),
     PRIMARY KEY(plan_id,hop_index),
     FOREIGN KEY(plan_id,snapshot_id) REFERENCES plans(plan_id,snapshot_id) ON DELETE CASCADE,
-    FOREIGN KEY(snapshot_id,edge_id) REFERENCES snapshot_edges(snapshot_id,edge_id)
+    FOREIGN KEY(snapshot_id,edge_id) REFERENCES snapshot_edges(snapshot_id,edge_id),
+    UNIQUE(plan_id,snapshot_id,hop_index,edge_id)
 ) STRICT;
+
+CREATE TRIGGER enforce_plan_hop_count
+BEFORE INSERT ON plan_hops
+WHEN NEW.hop_index >= COALESCE((
+    SELECT hop_count FROM plans WHERE plan_id=NEW.plan_id AND snapshot_id=NEW.snapshot_id
+),-1)
+BEGIN
+    SELECT RAISE(ABORT,'plan hop index exceeds hop count');
+END;
+
+CREATE TRIGGER prevent_plan_hop_update
+BEFORE UPDATE ON plan_hops
+BEGIN
+    SELECT RAISE(ABORT,'plan hop is append-only');
+END;
+
+CREATE TRIGGER prevent_plan_hop_delete
+BEFORE DELETE ON plan_hops
+BEGIN
+    SELECT RAISE(ABORT,'plan hop is append-only');
+END;
 
 CREATE TABLE request_current_plan (
     request_id BLOB PRIMARY KEY CHECK(typeof(request_id)='blob' AND length(request_id)=32),
     plan_id BLOB NOT NULL UNIQUE CHECK(typeof(plan_id)='blob' AND length(plan_id)=32),
     FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE,
-    FOREIGN KEY(plan_id) REFERENCES plans(plan_id)
+    FOREIGN KEY(request_id,plan_id) REFERENCES plans(request_id,plan_id)
 ) STRICT;
 
 CREATE TABLE proofs (
@@ -389,17 +427,25 @@ CREATE TABLE proofs (
     base_trust_root BLOB NOT NULL CHECK(typeof(base_trust_root)='blob' AND length(base_trust_root)=32),
     created_at INTEGER NOT NULL CHECK(created_at > 0),
     FOREIGN KEY(request_id) REFERENCES requests(id),
-    FOREIGN KEY(plan_id) REFERENCES plans(plan_id),
-    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id)
+    FOREIGN KEY(request_id,plan_id,snapshot_id) REFERENCES plans(request_id,plan_id,snapshot_id),
+    UNIQUE(proof_id,plan_id,snapshot_id)
 ) STRICT;
 
 CREATE TABLE proof_hops (
     proof_id BLOB NOT NULL CHECK(typeof(proof_id)='blob' AND length(proof_id)=32),
+    plan_id BLOB NOT NULL CHECK(typeof(plan_id)='blob' AND length(plan_id)=32),
+    snapshot_id BLOB NOT NULL CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
     hop_index INTEGER NOT NULL CHECK(hop_index >= 0),
+    plan_hop_index INTEGER NOT NULL CHECK(plan_hop_index >= 0),
+    edge_id BLOB NOT NULL CHECK(typeof(edge_id)='blob' AND length(edge_id)=32),
+    to_node_id BLOB NOT NULL CHECK(typeof(to_node_id)='blob' AND length(to_node_id)=32),
     block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
     witness_id BLOB NOT NULL CHECK(typeof(witness_id)='blob' AND length(witness_id)=32),
     PRIMARY KEY(proof_id,hop_index),
-    FOREIGN KEY(proof_id) REFERENCES proofs(proof_id) ON DELETE CASCADE,
-    FOREIGN KEY(witness_id) REFERENCES membership_witnesses(witness_id)
+    FOREIGN KEY(proof_id,plan_id,snapshot_id) REFERENCES proofs(proof_id,plan_id,snapshot_id) ON DELETE CASCADE,
+    FOREIGN KEY(plan_id,snapshot_id,plan_hop_index,edge_id) REFERENCES plan_hops(plan_id,snapshot_id,hop_index,edge_id),
+    FOREIGN KEY(snapshot_id,edge_id,witness_id,to_node_id) REFERENCES snapshot_edges(snapshot_id,edge_id,witness_id,to_node_id),
+    FOREIGN KEY(snapshot_id,to_node_id,block_hash) REFERENCES snapshot_nodes(snapshot_id,node_id,block_hash),
+    UNIQUE(proof_id,plan_hop_index)
 ) STRICT;
 `

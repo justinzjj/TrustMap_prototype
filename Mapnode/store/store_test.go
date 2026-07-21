@@ -92,8 +92,18 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 	if _, _, err := NewEvidenceRepository(db).Observe(ctx, evidenceRecord); err != nil {
 		t.Fatal(err)
 	}
+	evidenceRecordB := evidenceRecord
+	evidenceRecordB.Locator.PayloadDigest[31] ^= 1
+	evidenceRecordB.ID, _ = evidence.ComputeID(evidenceRecordB.Locator)
+	if _, _, err := NewEvidenceRepository(db).Observe(ctx, evidenceRecordB); err != nil {
+		t.Fatal(err)
+	}
 	request := testRequest(t)
 	if _, _, err := NewRequestRepository(db).Observe(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	requestB := testRequestWithNonceLastByte(t, 0xfe)
+	if _, _, err := NewRequestRepository(db).Observe(ctx, requestB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -124,10 +134,18 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 	) VALUES(?,0,zeroblob(32))`, witnessID); err != nil {
 		t.Fatalf("insert witness sibling before snapshot use: %v", err)
 	}
+	witnessB := blob32(0x73)
+	if _, err := db.sql.Exec(`INSERT INTO membership_witnesses(
+		witness_id,evidence_id,leaf_index,created_at
+	) VALUES(?,?,0,1)`, witnessB, evidenceRecordB.ID[:]); err != nil {
+		t.Fatal(err)
+	}
 
 	snapshotA, snapshotB := blob32(0xa1), blob32(0xb1)
 	homeA, targetA := blob32(0xa2), blob32(0xa3)
 	homeB, targetB := blob32(0xb2), blob32(0xb3)
+	homeAHash, targetAHash := blob32(0x41), blob32(0x42)
+	homeBHash, targetBHash := blob32(0x51), blob32(0x52)
 	chainID, _ := domain.NewChainID(99)
 	height, _ := domain.NewBlockHeight(100)
 	for _, snapshot := range [][]byte{snapshotA, snapshotB} {
@@ -137,12 +155,13 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 			t.Fatalf("insert unsealed snapshot: %v", err)
 		}
 	}
-	for _, row := range []struct{ snapshot, node []byte }{
-		{snapshotA, homeA}, {snapshotA, targetA}, {snapshotB, homeB}, {snapshotB, targetB},
+	for _, row := range []struct{ snapshot, node, blockHash []byte }{
+		{snapshotA, homeA, homeAHash}, {snapshotA, targetA, targetAHash},
+		{snapshotB, homeB, homeBHash}, {snapshotB, targetB, targetBHash},
 	} {
 		if _, err := db.sql.Exec(`INSERT INTO snapshot_nodes(
 			snapshot_id,node_id,chain_id,block_height,block_hash,trust_root
-		) VALUES(?,?,?,?,zeroblob(32),zeroblob(32))`, row.snapshot, row.node, chainID[:], height[:]); err != nil {
+		) VALUES(?,?,?,?,?,zeroblob(32))`, row.snapshot, row.node, chainID[:], height[:], row.blockHash); err != nil {
 			t.Fatalf("insert snapshot node: %v", err)
 		}
 	}
@@ -155,6 +174,12 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 	}
 
 	edgeA, edgeB := blob32(0xe1), blob32(0xe2)
+	missingWitnessEdge := blob32(0xe0)
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
+	) VALUES(?,?,?,?,?,NULL,1)`, snapshotA, missingWitnessEdge, homeA, targetA, evidenceRecord.ID[:]); err != nil {
+		t.Fatalf("insert active edge with missing proof material: %v", err)
+	}
 	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
 		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
 	) VALUES(?,?,?,?,?,?,1)`, snapshotA, edgeA, homeA, targetA, evidenceRecord.ID[:], witnessID); err != nil {
@@ -200,6 +225,14 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 	if _, err := db.sql.Exec(`UPDATE trustview_snapshots
 		SET start_node_id=?,target_node_id=?,sealed=1 WHERE snapshot_id=?`, homeB, targetB, snapshotB); err != nil {
 		t.Fatalf("seal snapshot B: %v", err)
+	}
+	var missingProofMaterial int
+	if err := db.sql.QueryRow(`SELECT count(*) FROM snapshot_edges
+		WHERE snapshot_id=? AND edge_id=? AND witness_id IS NULL`, snapshotA, missingWitnessEdge).Scan(&missingProofMaterial); err != nil {
+		t.Fatal(err)
+	}
+	if missingProofMaterial != 1 {
+		t.Fatal("sealed snapshot lost active edge with missing proof material")
 	}
 	if _, err := db.sql.Exec("UPDATE trustview_snapshots SET graph_revision=1 WHERE snapshot_id=?", snapshotA); err == nil {
 		t.Fatal("sealed snapshot remained mutable")
@@ -250,6 +283,81 @@ func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T)
 		plan_id,snapshot_id,hop_index,edge_id
 	) VALUES(?,?,0,?)`, planID, snapshotA, edgeA); err != nil {
 		t.Fatalf("insert same-snapshot plan hop: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plan_hops(
+		plan_id,snapshot_id,hop_index,edge_id
+	) VALUES(?,?,1,?)`, planID, snapshotA, edgeA); err == nil {
+		t.Fatal("plan hop index equal to hop_count accepted")
+	}
+	if _, err := db.sql.Exec("UPDATE plans SET fallback_reason='mutated' WHERE plan_id=?", planID); err == nil {
+		t.Fatal("persisted plan remained mutable")
+	}
+	if _, err := db.sql.Exec("UPDATE plan_hops SET hop_index=7 WHERE plan_id=?", planID); err == nil {
+		t.Fatal("persisted plan hop remained mutable")
+	}
+	if _, err := db.sql.Exec("DELETE FROM plan_hops WHERE plan_id=?", planID); err == nil {
+		t.Fatal("persisted plan hop remained deletable")
+	}
+	if _, err := db.sql.Exec("DELETE FROM plans WHERE plan_id=?", planID); err == nil {
+		t.Fatal("persisted plan remained deletable")
+	}
+
+	planB := blob32(0xd1)
+	if _, err := db.sql.Exec(`INSERT INTO plans(
+		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at
+	) VALUES(?,?,?,?,?,0,'direct',?,?,0,1,NULL,3000096,'no_path',1)`,
+		planB, requestB.ID[:], snapshotB, "pow-spv-3m", blob32(0xd2), homeB, targetB,
+	); err != nil {
+		t.Fatalf("insert request B plan: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO request_current_plan(request_id,plan_id)
+		VALUES(?,?)`, request.ID[:], planB); err == nil {
+		t.Fatal("request A accepted request B plan as current")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO request_current_plan(request_id,plan_id)
+		VALUES(?,?)`, request.ID[:], planID); err != nil {
+		t.Fatalf("bind request A current plan: %v", err)
+	}
+
+	proofID := blob32(0xf1)
+	if _, err := db.sql.Exec(`INSERT INTO proofs(
+		proof_id,request_id,plan_id,snapshot_id,base_trust_root,created_at
+	) VALUES(?,?,?,?,zeroblob(32),1)`, blob32(0xf2), requestB.ID[:], planID, snapshotA); err == nil {
+		t.Fatal("proof combined request B with request A plan")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO proofs(
+		proof_id,request_id,plan_id,snapshot_id,base_trust_root,created_at
+	) VALUES(?,?,?,?,zeroblob(32),1)`, blob32(0xf3), request.ID[:], planID, snapshotB); err == nil {
+		t.Fatal("proof combined plan A with snapshot B")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO proofs(
+		proof_id,request_id,plan_id,snapshot_id,base_trust_root,created_at
+	) VALUES(?,?,?,?,zeroblob(32),1)`, proofID, request.ID[:], planID, snapshotA); err != nil {
+		t.Fatalf("insert bound proof: %v", err)
+	}
+	insertProofHop := func(plan, snapshot []byte, edge []byte, toNode []byte, blockHash []byte, witness []byte) error {
+		_, err := db.sql.Exec(`INSERT INTO proof_hops(
+			proof_id,plan_id,snapshot_id,hop_index,plan_hop_index,edge_id,to_node_id,block_hash,witness_id
+		) VALUES(?,?,?,0,0,?,?,?,?)`, proofID, plan, snapshot, edge, toNode, blockHash, witness)
+		return err
+	}
+	for _, invalid := range []struct {
+		name                                  string
+		plan, snapshot, edge, node, hash, wit []byte
+	}{
+		{"plan", planB, snapshotA, edgeA, targetA, targetAHash, witnessID},
+		{"snapshot", planID, snapshotB, edgeB, targetB, targetBHash, witnessID},
+		{"edge", planID, snapshotA, edgeB, targetA, targetAHash, witnessID},
+		{"witness", planID, snapshotA, edgeA, targetA, targetAHash, witnessB},
+		{"block hash", planID, snapshotA, edgeA, targetA, homeAHash, witnessID},
+	} {
+		if err := insertProofHop(invalid.plan, invalid.snapshot, invalid.edge, invalid.node, invalid.hash, invalid.wit); err == nil {
+			t.Fatalf("proof hop accepted mismatched %s", invalid.name)
+		}
+	}
+	if err := insertProofHop(planID, snapshotA, edgeA, targetA, targetAHash, witnessID); err != nil {
+		t.Fatalf("insert fully bound proof hop: %v", err)
 	}
 	if _, err := db.sql.Exec(`INSERT INTO plans(
 		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
@@ -517,6 +625,10 @@ func testEvidenceRecord(t *testing.T, maximum bool) evidence.Record {
 }
 
 func testRequest(t *testing.T) coordinator.Request {
+	return testRequestWithNonceLastByte(t, 0xff)
+}
+
+func testRequestWithNonceLastByte(t *testing.T, last byte) coordinator.Request {
 	t.Helper()
 	home, _ := domain.NewChainIDFromBig(maxUint256())
 	source, _ := domain.NewChainIDFromBig(new(big.Int).Sub(maxUint256(), big.NewInt(1)))
@@ -525,10 +637,11 @@ func testRequest(t *testing.T) coordinator.Request {
 	for index := range nonce {
 		nonce[index] = 0xff
 	}
+	nonce[31] = last
 	gateway := common.HexToAddress("0x1000000000000000000000000000000000000001")
 	requester := common.HexToAddress("0x2000000000000000000000000000000000000002")
 	blockHash := common.HexToHash("0x44")
-	id, err := evidence.ComputeGatewayRequestID(home, gateway, requester, maxUint256(), source, height, blockHash)
+	id, err := evidence.ComputeGatewayRequestID(home, gateway, requester, new(big.Int).SetBytes(nonce[:]), source, height, blockHash)
 	if err != nil {
 		t.Fatal(err)
 	}
