@@ -17,6 +17,8 @@ var (
 	ErrRecordNotFound    = errors.New("record not found")
 	ErrRecordConflict    = errors.New("record conflicts with persisted identity")
 	ErrConcurrentUpdate  = errors.New("record state changed concurrently")
+	ErrInactiveEvidence  = errors.New("TrustView mutation requires active evidence")
+	ErrGraphConflict     = errors.New("TrustView graph record conflicts with persisted data")
 )
 
 type DB struct {

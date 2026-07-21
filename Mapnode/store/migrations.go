@@ -194,6 +194,44 @@ CREATE TABLE trust_edges (
     UNIQUE(from_node_id,to_node_id,evidence_id)
 ) STRICT;
 
+CREATE TRIGGER require_active_evidence_for_trust_node_insert
+BEFORE INSERT ON trust_nodes
+WHEN NEW.evidence_id IS NULL OR NEW.evidence_state<>'active'
+  OR COALESCE((SELECT state FROM evidence WHERE id=NEW.evidence_id),'')<>'active'
+BEGIN
+    SELECT RAISE(ABORT,'TrustView node requires active evidence');
+END;
+
+CREATE TRIGGER require_active_evidence_for_trust_node_update
+BEFORE UPDATE ON trust_nodes
+WHEN NEW.evidence_id IS NULL OR NEW.evidence_state<>'active'
+  OR COALESCE((SELECT state FROM evidence WHERE id=NEW.evidence_id),'')<>'active'
+BEGIN
+    SELECT RAISE(ABORT,'TrustView node requires active evidence');
+END;
+
+CREATE TRIGGER require_active_evidence_for_trust_edge_insert
+BEFORE INSERT ON trust_edges
+WHEN NEW.active=1 AND (
+  COALESCE((SELECT state FROM evidence WHERE id=NEW.evidence_id),'')<>'active'
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.from_node_id),'')<>'active'
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.to_node_id),'')<>'active'
+)
+BEGIN
+    SELECT RAISE(ABORT,'active TrustEdge requires active evidence');
+END;
+
+CREATE TRIGGER require_active_evidence_for_trust_edge_update
+BEFORE UPDATE ON trust_edges
+WHEN NEW.active=1 AND (
+  COALESCE((SELECT state FROM evidence WHERE id=NEW.evidence_id),'')<>'active'
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.from_node_id),'')<>'active'
+  OR COALESCE((SELECT evidence_state FROM trust_nodes WHERE node_id=NEW.to_node_id),'')<>'active'
+)
+BEGIN
+    SELECT RAISE(ABORT,'active TrustEdge requires active evidence');
+END;
+
 CREATE TABLE trustview_snapshots (
     snapshot_id BLOB PRIMARY KEY CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
     graph_revision INTEGER NOT NULL CHECK(graph_revision >= 0),
