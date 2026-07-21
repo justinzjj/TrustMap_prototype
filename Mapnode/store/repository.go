@@ -97,7 +97,8 @@ func (repository *EvidenceRepository) Transition(
 	if repository == nil || repository.db == nil {
 		return evidence.Record{}, false, errors.New("nil evidence repository database")
 	}
-	if err := to.Validate(); err != nil {
+	requestedChange, err := evidence.ValidateTransition(expectedFrom, to, metadata.Reason)
+	if err != nil {
 		return evidence.Record{}, false, err
 	}
 	tx, err := repository.db.sql.BeginTx(ctx, nil)
@@ -118,11 +119,7 @@ func (repository *EvidenceRepository) Transition(
 	if current.State != expectedFrom {
 		return evidence.Record{}, false, fmt.Errorf("%w: evidence state is %s, expected %s", ErrConcurrentUpdate, current.State, expectedFrom)
 	}
-	changed, err := evidence.ValidateTransition(expectedFrom, to, metadata.Reason)
-	if err != nil {
-		return evidence.Record{}, false, err
-	}
-	if !changed {
+	if !requestedChange {
 		return current, false, nil
 	}
 	at := metadata.At.UTC()
@@ -247,7 +244,8 @@ func (repository *RequestRepository) Transition(
 	if repository == nil || repository.db == nil {
 		return coordinator.Request{}, false, errors.New("nil request repository database")
 	}
-	if err := to.Validate(); err != nil {
+	requestedChange, err := coordinator.ValidateTransition(expectedFrom, to)
+	if err != nil {
 		return coordinator.Request{}, false, err
 	}
 	tx, err := repository.db.sql.BeginTx(ctx, nil)
@@ -268,11 +266,7 @@ func (repository *RequestRepository) Transition(
 	if current.State != expectedFrom {
 		return coordinator.Request{}, false, fmt.Errorf("%w: request state is %s, expected %s", ErrConcurrentUpdate, current.State, expectedFrom)
 	}
-	changed, err := coordinator.ValidateTransition(expectedFrom, to)
-	if err != nil {
-		return coordinator.Request{}, false, err
-	}
-	if !changed {
+	if !requestedChange {
 		return current, false, nil
 	}
 	at := metadata.At.UTC()

@@ -142,7 +142,7 @@ CREATE TABLE requests (
     source_chain_id BLOB NOT NULL CHECK(typeof(source_chain_id)='blob' AND length(source_chain_id)=32),
     source_height BLOB NOT NULL CHECK(typeof(source_height)='blob' AND length(source_height)=32),
     source_block_hash BLOB NOT NULL CHECK(typeof(source_block_hash)='blob' AND length(source_block_hash)=32),
-    state TEXT NOT NULL CHECK(state IN ('observed','evidence_ready','planned','proof_ready','rejected','retryable','replanned','direct_fallback','submitted','confirmed')),
+    state TEXT NOT NULL CHECK(state IN ('observed','evidence_ready','planned','proof_ready','rejected','retryable','replanned','direct_fallback')),
     reason TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL CHECK(created_at > 0),
     updated_at INTEGER NOT NULL CHECK(updated_at > 0),

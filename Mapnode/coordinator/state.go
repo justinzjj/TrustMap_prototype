@@ -21,8 +21,6 @@ const (
 	Retryable      RequestState = "retryable"
 	Replanned      RequestState = "replanned"
 	DirectFallback RequestState = "direct_fallback"
-	Submitted      RequestState = "submitted"
-	Confirmed      RequestState = "confirmed"
 )
 
 var (
@@ -62,12 +60,12 @@ type RequestRepository interface {
 }
 
 func AllRequestStates() []RequestState {
-	return []RequestState{Observed, EvidenceReady, Planned, ProofReady, Rejected, Retryable, Replanned, DirectFallback, Submitted, Confirmed}
+	return []RequestState{Observed, EvidenceReady, Planned, ProofReady, Rejected, Retryable, Replanned, DirectFallback}
 }
 
 func (state RequestState) Validate() error {
 	switch state {
-	case Observed, EvidenceReady, Planned, ProofReady, Rejected, Retryable, Replanned, DirectFallback, Submitted, Confirmed:
+	case Observed, EvidenceReady, Planned, ProofReady, Rejected, Retryable, Replanned, DirectFallback:
 		return nil
 	default:
 		return fmt.Errorf("%w: %q", ErrInvalidRequestState, state)

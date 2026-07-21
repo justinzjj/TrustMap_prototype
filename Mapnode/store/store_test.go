@@ -141,6 +141,12 @@ func TestEvidenceRepositoryPersistsMaxUint256AndTransitionsAtomically(t *testing
 	if after := countRows(t, db.sql, "evidence_transitions"); after != before {
 		t.Fatalf("idempotent transition added history: %d -> %d", before, after)
 	}
+	if _, changed, err := repo.Transition(context.Background(), record.ID, evidence.Active, evidence.Verified, evidence.TransitionMetadata{}); err == nil || changed {
+		t.Fatalf("illegal edge masked by current target state: changed=%t err=%v", changed, err)
+	}
+	if after := countRows(t, db.sql, "evidence_transitions"); after != before {
+		t.Fatalf("masked illegal transition added history: %d -> %d", before, after)
+	}
 	if _, _, err := repo.Transition(context.Background(), record.ID, evidence.Verified, evidence.Invalid, evidence.TransitionMetadata{}); err == nil {
 		t.Fatal("illegal transition accepted")
 	}
@@ -247,6 +253,15 @@ func TestRequestRepositoryImplementsConsumerInterfaceAndPersists(t *testing.T) {
 	}
 	if got := countRows(t, db.sql, "request_transitions"); got != before {
 		t.Fatalf("idempotent request transition history = %d, want %d", got, before)
+	}
+	if _, changed, err := repo.Transition(context.Background(), request.ID, coordinator.Rejected, coordinator.ProofReady, coordinator.TransitionMetadata{}); err == nil || changed {
+		t.Fatalf("illegal request edge masked by current target state: changed=%t err=%v", changed, err)
+	}
+	if got := countRows(t, db.sql, "request_transitions"); got != before {
+		t.Fatalf("masked illegal request transition history = %d, want %d", got, before)
+	}
+	if _, err := db.sql.Exec("UPDATE requests SET state='submitted' WHERE id=?", request.ID[:]); err == nil {
+		t.Fatal("Phase 4 submitted state accepted by Phase 3 schema")
 	}
 }
 

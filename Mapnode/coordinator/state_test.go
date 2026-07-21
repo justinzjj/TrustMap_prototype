@@ -20,11 +20,19 @@ func TestRequestStateTransitionGraph(t *testing.T) {
 		}
 	}
 	for _, edge := range [][2]RequestState{
-		{Observed, Planned}, {EvidenceReady, Observed}, {ProofReady, Submitted},
-		{Retryable, ProofReady}, {DirectFallback, Confirmed}, {Rejected, Observed},
+		{Observed, Planned}, {EvidenceReady, Observed}, {ProofReady, RequestState("submitted")},
+		{Retryable, ProofReady}, {DirectFallback, RequestState("confirmed")}, {Rejected, Observed},
 	} {
 		if changed, err := ValidateTransition(edge[0], edge[1]); err == nil || changed {
 			t.Fatalf("%s -> %s accepted", edge[0], edge[1])
+		}
+	}
+}
+
+func TestPhase3DoesNotExposeSubmissionStates(t *testing.T) {
+	for _, state := range []RequestState{"submitted", "confirmed"} {
+		if err := state.Validate(); err == nil {
+			t.Fatalf("Phase 4 state %q accepted by Phase 3", state)
 		}
 	}
 }
