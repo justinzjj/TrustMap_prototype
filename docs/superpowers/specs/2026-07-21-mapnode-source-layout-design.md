@@ -63,7 +63,7 @@ Geth events, open libp2p streams or broadcast transactions.
 It must deliver:
 
 1. deterministic evidence and request identifiers;
-2. embedded, ordered SQLite migrations using `modernc.org/sqlite`, a pure-Go
+2. embedded, ordered SQLite migrations using `modernc.org/sqlite v1.45.0`, a pure-Go
    driver compatible with the repository's `CGO_ENABLED=0` container build;
 3. WAL mode, foreign keys and transaction-backed repositories;
 4. evidence transitions `candidate -> verified -> confirmed -> active`, with
