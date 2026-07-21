@@ -18,11 +18,16 @@ contract ExperimentalCostedDirectVerifierTest is TestBase {
     uint256 private constant SOURCE_HEIGHT = 700;
     uint32 private constant SIGNATURE_CHECKS = 3;
     uint32 private constant HASH_ROUNDS = 4;
+    uint32 private constant POW_SPV_CALIBRATION_HASH_ROUNDS = 4553;
+    uint256 private constant POW_SPV_MIN_GAS = 2_700_000;
+    uint256 private constant POW_SPV_MAX_GAS = 3_300_000;
     bytes32 private constant SOURCE_BLOCK_HASH = bytes32(uint256(0x701));
     bytes32 private constant SOURCE_ROOT = bytes32(uint256(0x702));
 
     ExperimentalCostedDirectVerifier private verifier;
     TrustMapGateway private gateway;
+
+    event log_named_uint(string key, uint256 value);
 
     function setUp() public {
         vm.roll(200);
@@ -300,6 +305,20 @@ contract ExperimentalCostedDirectVerifierTest is TestBase {
         uint256 costedGas = _measureDirectVerification(verifier, gateway, SIGNATURE_CHECKS, HASH_ROUNDS);
 
         assertTrue(costedGas > baselineGas);
+    }
+
+    /// @dev This calibrates synthetic execution cost only. It does not test or imply PoW SPV security.
+    function testPowSpvCostCalibrationMeasuresFullGatewayVerification() public {
+        (ExperimentalCostedDirectVerifier calibrationVerifier, TrustMapGateway calibrationGateway) =
+            _newBoundPairWithProfile(SIGNATURE_CHECKS, POW_SPV_CALIBRATION_HASH_ROUNDS);
+
+        uint256 gasUsed = _measureDirectVerification(
+            calibrationVerifier, calibrationGateway, SIGNATURE_CHECKS, POW_SPV_CALIBRATION_HASH_ROUNDS
+        );
+
+        emit log_named_uint("pow-spv-3m verifyDirectAndRecord gas", gasUsed);
+        assertTrue(gasUsed >= POW_SPV_MIN_GAS);
+        assertTrue(gasUsed <= POW_SPV_MAX_GAS);
     }
 
     function _expectContextMismatch(
