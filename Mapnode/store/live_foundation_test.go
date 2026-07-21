@@ -17,7 +17,7 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
-func TestLiveFoundationMigrationIsV3AndPreservesV1V2Checksums(t *testing.T) {
+func TestLiveFoundationMigrationIsV4AndPreservesPriorChecksums(t *testing.T) {
 	db := openTestDB(t)
 	for _, table := range []string{"live_chains", "canonical_cursors", "trust_root_observations"} {
 		var strict int
@@ -26,11 +26,11 @@ func TestLiveFoundationMigrationIsV3AndPreservesV1V2Checksums(t *testing.T) {
 		}
 	}
 	var version, count int
-	if err := db.sql.QueryRow("SELECT MAX(version),COUNT(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 3 || count != 3 {
+	if err := db.sql.QueryRow("SELECT MAX(version),COUNT(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 4 || count != 4 {
 		t.Fatalf("migration history max=%d count=%d err=%v", version, count, err)
 	}
-	checksums := [][32]byte{sha256.Sum256([]byte(phase3Schema)), sha256.Sum256([]byte(pathProofIntegrityV2))}
-	wants := []string{"ab9d49540980805aa7f76dd84a4c99bce4df85ed61f4f9eeb3285c91ec40dc4a", "795e28e399ac9df3d8a39a1dbf309ca964de3025a5f4090758bd98a2eda8841e"}
+	checksums := [][32]byte{sha256.Sum256([]byte(phase3Schema)), sha256.Sum256([]byte(pathProofIntegrityV2)), sha256.Sum256([]byte(liveObservationFoundationV3))}
+	wants := []string{"ab9d49540980805aa7f76dd84a4c99bce4df85ed61f4f9eeb3285c91ec40dc4a", "795e28e399ac9df3d8a39a1dbf309ca964de3025a5f4090758bd98a2eda8841e", "dff57af6e30db4a26d11a45c29ac46a5425f563552b6a5430af05b9f69c3a088"}
 	for index, checksum := range checksums {
 		if got := common.Bytes2Hex(checksum[:]); got != wants[index] {
 			t.Fatalf("v%d checksum drifted: %s", index+1, got)
@@ -39,7 +39,11 @@ func TestLiveFoundationMigrationIsV3AndPreservesV1V2Checksums(t *testing.T) {
 }
 
 func TestLiveChainRepositoryIsStaticAndDeploymentBindingFailsClosed(t *testing.T) {
-	db := openTestDB(t)
+	path := filepath.Join(t.TempDir(), "live-chain.sqlite")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	repository := NewLiveChainRepository(db)
 	registry := liveRegistry(t)
 	if err := repository.Sync(context.Background(), registry); err != nil {
@@ -53,11 +57,32 @@ func TestLiveChainRepositoryIsStaticAndDeploymentBindingFailsClosed(t *testing.T
 	}
 	changed := deployment
 	changed.CodeHash[31] ^= 1
-	if err := repository.BindDeployment(context.Background(), changed, block); !errors.Is(err, ErrRecordConflict) {
-		t.Fatalf("changed deployment error=%v", err)
-	}
 	if _, err := db.sql.Exec(`UPDATE live_chains SET gateway=NULL,gateway_code_hash=NULL,deployment_block=NULL,validated_at=NULL WHERE chain_id=?`, chainID[:]); err == nil {
 		t.Fatal("validated deployment binding was cleared")
+	}
+	if _, err := db.sql.Exec(`DELETE FROM live_chains WHERE chain_id=?`, chainID[:]); err == nil {
+		t.Fatal("live chain catalog row was deleted")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	repository = NewLiveChainRepository(db)
+	entries := registry.All()
+	entries[1].HTTPRPC = "http://changed-beta:8545"
+	changedRegistry, err := chain.NewRegistry(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Sync(context.Background(), changedRegistry); !errors.Is(err, ErrRecordConflict) {
+		t.Fatalf("restarted changed catalog error=%v", err)
+	}
+	if err := repository.BindDeployment(context.Background(), changed, block); !errors.Is(err, ErrRecordConflict) {
+		t.Fatalf("restarted changed deployment error=%v", err)
 	}
 }
 
@@ -163,7 +188,7 @@ func TestCanonicalCursorMismatchPersistsDegradedAcrossRestartAndBlocksAdvance(t 
 		t.Fatalf("Initialize created=%v err=%v", created, err)
 	}
 	nextHeight, _ := domain.NewBlockHeight(8)
-	cursor, _, err := repository.Advance(ctx, chainID, common.HexToHash("0xbad"), reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8")})
+	cursor, _, err := repository.Advance(ctx, chainID, common.HexToHash("0xbad"), reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0xbad")})
 	if !errors.Is(err, reorg.ErrCanonicalMismatch) || cursor.State != reorg.Degraded {
 		t.Fatalf("Advance cursor=%+v err=%v", cursor, err)
 	}
@@ -180,7 +205,7 @@ func TestCanonicalCursorMismatchPersistsDegradedAcrossRestartAndBlocksAdvance(t 
 	if err != nil || loaded.State != reorg.Degraded {
 		t.Fatalf("Load cursor=%+v err=%v", loaded, err)
 	}
-	if _, _, err := repository.Advance(ctx, chainID, loaded.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8")}); !errors.Is(err, reorg.ErrCursorDegraded) {
+	if _, _, err := repository.Advance(ctx, chainID, loaded.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: loaded.Hash}); !errors.Is(err, reorg.ErrCursorDegraded) {
 		t.Fatalf("degraded Advance err=%v", err)
 	}
 }
@@ -198,13 +223,67 @@ func TestCanonicalCursorSameHeightReplacementPersistsDegraded(t *testing.T) {
 	if _, _, err := repository.Initialize(ctx, initial); err != nil {
 		t.Fatal(err)
 	}
-	cursor, changed, err := repository.Advance(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: height, Hash: common.HexToHash("0x77")})
+	cursor, changed, err := repository.Advance(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: height, Hash: common.HexToHash("0x77"), ParentHash: common.HexToHash("0x6")})
 	if !errors.Is(err, reorg.ErrCanonicalMismatch) || !changed || cursor.State != reorg.Degraded {
 		t.Fatalf("same-height replacement cursor=%+v changed=%v err=%v", cursor, changed, err)
 	}
 	loaded, err := repository.Load(ctx, chainID)
 	if err != nil || loaded.State != reorg.Degraded || loaded.Hash != initial.Hash {
 		t.Fatalf("persisted cursor=%+v err=%v", loaded, err)
+	}
+}
+
+func TestCanonicalCursorForkSwitchPersistsDegradedWithoutSplicing(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := NewLiveChainRepository(db).Sync(ctx, liveRegistry(t)); err != nil {
+		t.Fatal(err)
+	}
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(7)
+	nextHeight, _ := domain.NewBlockHeight(8)
+	repository := NewCanonicalCursorRepository(db)
+	initial := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
+	if _, _, err := repository.Initialize(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	next := reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70")}
+	cursor, changed, err := repository.Advance(ctx, chainID, initial.Hash, next)
+	if !errors.Is(err, reorg.ErrCanonicalMismatch) || !changed || cursor.State != reorg.Degraded || cursor.Height != initial.Height || cursor.Hash != initial.Hash {
+		t.Fatalf("fork-switch cursor=%+v changed=%v err=%v", cursor, changed, err)
+	}
+	loaded, err := repository.Load(ctx, chainID)
+	if err != nil || loaded != cursor {
+		t.Fatalf("persisted degraded cursor=%+v err=%v", loaded, err)
+	}
+}
+
+func TestCanonicalCursorRepositoryReportsDegradedAndDatabaseFailure(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	repository := NewCanonicalCursorRepository(db)
+	degraded, err := repository.HasDegradedCanonicalCursor(ctx)
+	if err != nil || degraded {
+		t.Fatalf("empty degraded=%v err=%v", degraded, err)
+	}
+	if err := NewLiveChainRepository(db).Sync(ctx, liveRegistry(t)); err != nil {
+		t.Fatal(err)
+	}
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(7)
+	nextHeight, _ := domain.NewBlockHeight(8)
+	initial := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
+	_, _, _ = repository.Initialize(ctx, initial)
+	_, _, _ = repository.Advance(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70")})
+	degraded, err = repository.HasDegradedCanonicalCursor(ctx)
+	if err != nil || !degraded {
+		t.Fatalf("persisted degraded=%v err=%v", degraded, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.HasDegradedCanonicalCursor(ctx); err == nil {
+		t.Fatal("closed database was reported operational")
 	}
 }
 
@@ -225,7 +304,7 @@ func TestCanonicalCursorConcurrentDuplicateAdvanceIsIdempotent(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, err := repository.Advance(ctx, chainID, common.HexToHash("0x7"), reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8")})
+			_, _, err := repository.Advance(ctx, chainID, common.HexToHash("0x7"), reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x7")})
 			errs <- err
 		}()
 	}

@@ -48,6 +48,17 @@ func (repository *CanonicalCursorRepository) Load(ctx context.Context, chainID d
 	return scanCanonicalCursor(repository.db.sql.QueryRowContext(ctx, `SELECT chain_id,block_height,block_hash,state,degraded_reason FROM canonical_cursors WHERE chain_id=?`, chainID[:]))
 }
 
+func (repository *CanonicalCursorRepository) HasDegradedCanonicalCursor(ctx context.Context) (bool, error) {
+	if repository == nil || repository.db == nil {
+		return false, errors.New("nil canonical cursor repository database")
+	}
+	var degraded int
+	if err := repository.db.sql.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM canonical_cursors WHERE state='degraded')`).Scan(&degraded); err != nil {
+		return false, fmt.Errorf("query degraded canonical cursor: %w", err)
+	}
+	return degraded == 1, nil
+}
+
 func (repository *CanonicalCursorRepository) Advance(ctx context.Context, chainID domain.ChainID, recheckedHash common.Hash, next reorg.CanonicalBlock) (reorg.CanonicalCursor, bool, error) {
 	tx, err := repository.db.sql.BeginTx(ctx, nil)
 	if err != nil {
@@ -64,6 +75,13 @@ func (repository *CanonicalCursorRepository) Advance(ctx context.Context, chainI
 	if current.Height == next.Height {
 		if current.Hash != next.Hash {
 			degraded, persistErr := persistCursorDegraded(ctx, tx, current, "canonical block hash changed at persisted height")
+			if persistErr != nil {
+				return current, false, persistErr
+			}
+			return degraded, true, reorg.ErrCanonicalMismatch
+		}
+		if next.ParentHash != recheckedHash {
+			degraded, persistErr := persistCursorDegraded(ctx, tx, current, "duplicate canonical block parent no longer matches rechecked parent")
 			if persistErr != nil {
 				return current, false, persistErr
 			}

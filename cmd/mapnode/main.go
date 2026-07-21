@@ -74,7 +74,7 @@ func run(arguments []string, stderr io.Writer) int {
 	}
 	server := &http.Server{
 		Addr:              config.API.Listen,
-		Handler:           bootstrap.NewHealthHandler(application.Ready()),
+		Handler:           bootstrap.NewDynamicHealthHandler(application.Ready),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	stop := make(chan os.Signal, 1)

@@ -1,6 +1,7 @@
 package chain_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math/big"
@@ -26,6 +27,22 @@ type readerRPC struct {
 	root      common.Hash
 	callBlock common.Hash
 	callData  []byte
+}
+
+type switchingHeaderRPC struct {
+	first, replacement, head *types.Header
+	targetReads              int
+}
+
+func (rpc *switchingHeaderRPC) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	if number == nil {
+		return rpc.head, nil
+	}
+	rpc.targetReads++
+	if rpc.targetReads == 1 {
+		return rpc.first, nil
+	}
+	return rpc.replacement, nil
 }
 
 func (rpc *readerRPC) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
@@ -143,6 +160,18 @@ func TestTrustRootReaderFailsClosedOnCanonicalConfirmationChainAndCodeMismatch(t
 	}
 }
 
+func TestCanonicalBlockReaderRejectsTargetReorgBetweenHeadChecks(t *testing.T) {
+	first := &types.Header{Number: big.NewInt(40), ParentHash: common.HexToHash("0x39"), Extra: []byte("fork-a")}
+	replacement := &types.Header{Number: big.NewInt(40), ParentHash: common.HexToHash("0x390"), Extra: []byte("fork-b")}
+	head := &types.Header{Number: big.NewInt(42), ParentHash: common.HexToHash("0x41")}
+	height, _ := domain.NewBlockHeight(40)
+	rpc := &switchingHeaderRPC{first: first, replacement: replacement, head: head}
+	block, err := chain.NewCanonicalBlockReader(rpc).Confirmed(context.Background(), height, first.Hash(), 2)
+	if !errors.Is(err, chain.ErrCanonicalBlockMismatch) {
+		t.Fatalf("TOCTOU block=%+v err=%v", block, err)
+	}
+}
+
 func TestNewTrustRootReaderForChainStrictlyLoadsRemoteManifestLazily(t *testing.T) {
 	manifest := `{"version":1,"status":"deployed","chainId":"10001","deploymentBlock":5,"merkleDepth":8,"gateway":"0x1000000000000000000000000000000000000001","directVerifier":"0x2000000000000000000000000000000000000002","profileId":"p","authorizedSigners":[],"signatureChecks":1,"hashRounds":0,"measuredDirectCostGas":null,"codeHashes":{"gateway":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directVerifier":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`
 	path := filepath.Join(t.TempDir(), "gateway-manifest.json")
@@ -167,5 +196,28 @@ func TestNewTrustRootReaderForChainStrictlyLoadsRemoteManifestLazily(t *testing.
 	_ = os.WriteFile(path, []byte(badHash), 0o600)
 	if _, _, _, err := chain.NewTrustRootReaderForChain(entry, rpc); err == nil {
 		t.Fatal("remote manifest Gateway code hash mismatch accepted")
+	}
+}
+
+func TestRemoteManifestLimitDoesNotHideTrailingJSON(t *testing.T) {
+	manifest := []byte(`{"version":1,"status":"deployed","chainId":"10001","deploymentBlock":5,"merkleDepth":8,"gateway":"0x1000000000000000000000000000000000000001","directVerifier":"0x2000000000000000000000000000000000000002","profileId":"p","authorizedSigners":[],"signatureChecks":1,"hashRounds":0,"measuredDirectCostGas":null,"codeHashes":{"gateway":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","directVerifier":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}`)
+	const limit = 1 << 20
+	manifest = append(manifest, bytes.Repeat([]byte{' '}, limit-len(manifest))...)
+	path := filepath.Join(t.TempDir(), "gateway-manifest.json")
+	if err := os.WriteFile(path, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry := catalogChain(t, "alpha", 10001, true)
+	entry.DeploymentManifest = path
+	rpc := &readerRPC{chainID: big.NewInt(10001)}
+	if _, _, _, err := chain.NewTrustRootReaderForChain(entry, rpc); err != nil {
+		t.Fatalf("valid manifest at exact limit rejected: %v", err)
+	}
+	manifest = append(manifest, []byte(`{}`)...)
+	if err := os.WriteFile(path, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := chain.NewTrustRootReaderForChain(entry, rpc); err == nil {
+		t.Fatal("second JSON value beyond manifest limit was hidden")
 	}
 }

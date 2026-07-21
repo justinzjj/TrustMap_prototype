@@ -18,6 +18,7 @@ var migrations = []migration{
 	{version: 1, name: "phase3_core", sql: phase3Schema},
 	{version: 2, name: "pathproof_integrity", sql: pathProofIntegrityV2},
 	{version: 3, name: "live_observation_foundation", sql: liveObservationFoundationV3},
+	{version: 4, name: "live_chain_delete_protection", sql: liveChainDeleteProtectionV4},
 }
 
 const migrationTable = `
@@ -638,5 +639,13 @@ WHEN NEW.active=1 AND (
 )
 BEGIN
     SELECT RAISE(ABORT,'active TrustEdge requires active non-observation evidence');
+END;
+`
+
+const liveChainDeleteProtectionV4 = `
+CREATE TRIGGER prevent_live_chain_delete
+BEFORE DELETE ON live_chains
+BEGIN
+    SELECT RAISE(ABORT,'live chain catalog is immutable');
 END;
 `

@@ -23,6 +23,7 @@ type canonicalHeaderRPC interface {
 type CanonicalBlock struct {
 	Height              domain.BlockHeight
 	Hash                common.Hash
+	ParentHash          common.Hash
 	ConfirmedHeadHeight domain.BlockHeight
 	ConfirmedHeadHash   common.Hash
 	Confirmations       uint64
@@ -59,9 +60,16 @@ func (reader *CanonicalBlockReader) Confirmed(ctx context.Context, height domain
 	if head.Number.Cmp(requiredHead) < 0 {
 		return CanonicalBlock{}, ErrBlockUnconfirmed
 	}
+	rechecked, err := reader.rpc.HeaderByNumber(ctx, height.BigInt())
+	if err != nil {
+		return CanonicalBlock{}, fmt.Errorf("recheck canonical block %s: %w", height.BigInt(), err)
+	}
+	if rechecked == nil || rechecked.Number == nil || rechecked.Number.Cmp(height.BigInt()) != 0 || rechecked.Hash() != expectedHash {
+		return CanonicalBlock{}, ErrCanonicalBlockMismatch
+	}
 	headHeight, err := domain.NewBlockHeightFromBig(head.Number)
 	if err != nil {
 		return CanonicalBlock{}, fmt.Errorf("canonical head height: %w", err)
 	}
-	return CanonicalBlock{Height: height, Hash: expectedHash, ConfirmedHeadHeight: headHeight, ConfirmedHeadHash: head.Hash(), Confirmations: confirmations}, nil
+	return CanonicalBlock{Height: height, Hash: expectedHash, ParentHash: rechecked.ParentHash, ConfirmedHeadHeight: headHeight, ConfirmedHeadHash: head.Hash(), Confirmations: confirmations}, nil
 }

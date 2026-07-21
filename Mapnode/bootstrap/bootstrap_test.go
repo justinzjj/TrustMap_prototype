@@ -557,6 +557,23 @@ func TestHealthHandlerReadinessTracksValidation(t *testing.T) {
 	}
 }
 
+func TestDynamicHealthHandlerRechecksReadinessPerRequest(t *testing.T) {
+	ready := true
+	handler := NewDynamicHealthHandler(func() bool { return ready })
+	request := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("initial readiness=%d", recorder.Code)
+	}
+	ready = false
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("dynamic readiness=%d", recorder.Code)
+	}
+}
+
 func TestCheckHealthUsesHTTPStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ok" {

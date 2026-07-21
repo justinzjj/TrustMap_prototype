@@ -23,8 +23,9 @@ const (
 )
 
 type CanonicalBlock struct {
-	Height domain.BlockHeight
-	Hash   common.Hash
+	Height     domain.BlockHeight
+	Hash       common.Hash
+	ParentHash common.Hash
 }
 
 type CanonicalCursor struct {
@@ -44,6 +45,9 @@ func (cursor CanonicalCursor) Advance(recheckedHash common.Hash, next CanonicalB
 		return cursor, ErrCursorDegraded
 	}
 	if recheckedHash != cursor.Hash {
+		return cursor, ErrCanonicalMismatch
+	}
+	if next.ParentHash != recheckedHash {
 		return cursor, ErrCanonicalMismatch
 	}
 	want := new(big.Int).Add(cursor.Height.BigInt(), big.NewInt(1))

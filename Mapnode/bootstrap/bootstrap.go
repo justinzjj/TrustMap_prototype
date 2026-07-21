@@ -461,6 +461,10 @@ func requireReadableFile(field, path string) error {
 }
 
 func NewHealthHandler(ready bool) http.Handler {
+	return NewDynamicHealthHandler(func() bool { return ready })
+}
+
+func NewDynamicHealthHandler(ready func() bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health/live", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -477,7 +481,7 @@ func NewHealthHandler(ready bool) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if !ready {
+		if ready == nil || !ready() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = io.WriteString(w, `{"status":"not_ready"}`+"\n")
 			return

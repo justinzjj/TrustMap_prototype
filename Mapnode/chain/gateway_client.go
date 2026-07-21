@@ -1,6 +1,7 @@
 package chain
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -115,7 +116,15 @@ func NewTrustRootReaderForChain(entry Chain, rpc TrustRootRPC) (*TrustRootReader
 		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("open Gateway deployment manifest: %w", err)
 	}
 	defer file.Close()
-	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	const maxGatewayManifestBytes = 1 << 20
+	content, err := io.ReadAll(io.LimitReader(file, maxGatewayManifestBytes+1))
+	if err != nil {
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("read Gateway deployment manifest: %w", err)
+	}
+	if len(content) > maxGatewayManifestBytes {
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, errors.New("Gateway deployment manifest exceeds 1 MiB")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(content))
 	decoder.DisallowUnknownFields()
 	var manifest gatewayManifest
 	if err := decoder.Decode(&manifest); err != nil {

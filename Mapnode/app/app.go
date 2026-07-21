@@ -20,6 +20,11 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
+var (
+	ErrOperationalDegraded    = errors.New("MapNode canonical cursor is degraded")
+	ErrOperationalUnavailable = errors.New("MapNode operational gate is unavailable")
+)
+
 type App struct {
 	Registry              *registry.Registry
 	ChainCatalog          *chain.Registry
@@ -31,13 +36,13 @@ type App struct {
 	TrustView             *store.TrustViewRepository
 	Plans                 *store.PlanRepository
 	PathProofs            *store.PathProofRepository
-	Planner               *planner.Planner
 	PathProofBuilder      *pathproof.Builder
-	Coordinator           *coordinator.Coordinator
 
 	database      *store.DB
 	pathTreeDepth uint8
 	ready         atomic.Bool
+	planner       *planner.Planner
+	coordinator   *coordinator.Coordinator
 }
 
 // Open performs live chain/code binding before opening SQLite, then maps the
@@ -85,9 +90,9 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 	application.TrustView = store.NewTrustViewRepository(database)
 	application.Plans = store.NewPlanRepository(database)
 	application.PathProofs = store.NewPathProofRepository(database)
-	application.Planner = planner.New(application.TrustView, application.Plans, chainRegistry)
+	application.planner = planner.New(application.TrustView, application.Plans, chainRegistry)
 	application.PathProofBuilder = pathproof.NewBuilder(application.PathProofs, manifest.MerkleDepth)
-	application.Coordinator = coordinator.New(application.Requests, application.TrustView, application.Planner, application.Plans, application.PathProofBuilder)
+	application.coordinator = coordinator.New(application.Requests, application.TrustView, application.planner, application.Plans, application.PathProofBuilder)
 	application.ready.Store(true)
 	return application, nil
 }
@@ -127,7 +132,30 @@ func mustDecimal(value string) *big.Int {
 	return number
 }
 
-func (application *App) Ready() bool { return application != nil && application.ready.Load() }
+func (application *App) Ready() bool {
+	return application.operationalGate(context.Background()) == nil
+}
+
+func (application *App) Process(ctx context.Context, work coordinator.Work) (coordinator.Result, error) {
+	if err := application.operationalGate(ctx); err != nil {
+		return coordinator.Result{}, err
+	}
+	return application.coordinator.Process(ctx, work)
+}
+
+func (application *App) operationalGate(ctx context.Context) error {
+	if application == nil || !application.ready.Load() || application.CanonicalCursors == nil {
+		return ErrOperationalUnavailable
+	}
+	degraded, err := application.CanonicalCursors.HasDegradedCanonicalCursor(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrOperationalUnavailable, err)
+	}
+	if degraded {
+		return ErrOperationalDegraded
+	}
+	return nil
+}
 
 func (application *App) PathTreeDepth() uint8 {
 	if application == nil {

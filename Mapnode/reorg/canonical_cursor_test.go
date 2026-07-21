@@ -14,14 +14,25 @@ func TestCanonicalCursorFailsClosedAfterMismatch(t *testing.T) {
 	height, _ := domain.NewBlockHeight(7)
 	nextHeight, _ := domain.NewBlockHeight(8)
 	cursor := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
-	if _, err := cursor.Advance(common.HexToHash("0x8"), reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x9")}); !errors.Is(err, reorg.ErrCanonicalMismatch) {
+	if _, err := cursor.Advance(common.HexToHash("0x8"), reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x9"), ParentHash: common.HexToHash("0x8")}); !errors.Is(err, reorg.ErrCanonicalMismatch) {
 		t.Fatalf("mismatch error = %v", err)
 	}
 	degraded := cursor.Degrade("persisted block hash no longer canonical")
 	if degraded.State != reorg.Degraded || degraded.DegradedReason == "" {
 		t.Fatalf("degraded cursor = %+v", degraded)
 	}
-	if _, err := degraded.Advance(degraded.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x9")}); !errors.Is(err, reorg.ErrCursorDegraded) {
+	if _, err := degraded.Advance(degraded.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x9"), ParentHash: degraded.Hash}); !errors.Is(err, reorg.ErrCursorDegraded) {
 		t.Fatalf("degraded advance error = %v", err)
+	}
+}
+
+func TestCanonicalCursorRejectsForkSpliceWhenNextParentDiffers(t *testing.T) {
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(7)
+	nextHeight, _ := domain.NewBlockHeight(8)
+	cursor := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
+	_, err := cursor.Advance(cursor.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70")})
+	if !errors.Is(err, reorg.ErrCanonicalMismatch) {
+		t.Fatalf("fork splice error=%v", err)
 	}
 }

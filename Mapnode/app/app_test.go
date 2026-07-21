@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/reorg"
+	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
 func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
@@ -22,8 +26,11 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer application.Close()
-	if !application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.CanonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.Planner == nil || application.PathProofBuilder == nil || application.Coordinator == nil {
+	if !application.Ready() || application.Registry == nil || application.ChainCatalog == nil || application.LiveChains == nil || application.CanonicalCursors == nil || application.TrustRootObservations == nil || application.TrustView == nil || application.PathProofBuilder == nil {
 		t.Fatalf("incomplete Phase 3 composition: %+v", application)
+	}
+	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, coordinator.ErrInvalidObservation) {
+		t.Fatalf("healthy Process did not reach coordinator validation: %v", err)
 	}
 	home, err := application.Registry.HomeChain()
 	if err != nil || !home.Home || !home.SignerAuthority || !home.TransactionAuthority {
@@ -41,6 +48,57 @@ func TestOpenBuildsReadyPhaseThreeAppFromValidatedDeployment(t *testing.T) {
 	}
 	if _, err := os.Stat(config.Database.Path); err != nil {
 		t.Fatalf("SQLite database was not opened/migrated: %v", err)
+	}
+}
+
+func TestAppPersistedDegradedGateDisablesReadyHealthAndProcessAcrossRestart(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	ctx := context.Background()
+	application, err := Open(ctx, config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainID, _ := domain.NewChainID(10001)
+	height, _ := domain.NewBlockHeight(7)
+	nextHeight, _ := domain.NewBlockHeight(8)
+	initial := reorg.NewCanonicalCursor(chainID, height, common.HexToHash("0x7"))
+	if _, _, err := application.CanonicalCursors.Initialize(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := application.CanonicalCursors.Advance(ctx, chainID, initial.Hash, reorg.CanonicalBlock{Height: nextHeight, Hash: common.HexToHash("0x8"), ParentHash: common.HexToHash("0x70")}); !errors.Is(err, reorg.ErrCanonicalMismatch) {
+		t.Fatalf("degrade cursor err=%v", err)
+	}
+	if application.Ready() {
+		t.Fatal("running App remained ready after persisted degradation")
+	}
+	if _, err := application.Process(ctx, coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
+		t.Fatalf("running Process err=%v", err)
+	}
+	recorder := httptest.NewRecorder()
+	bootstrap.NewDynamicHealthHandler(application.Ready).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("degraded health status=%d", recorder.Code)
+	}
+	if err := application.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	application, err = Open(ctx, config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+	if application.Ready() {
+		t.Fatal("restarted App ignored persisted degradation")
+	}
+	recorder = httptest.NewRecorder()
+	bootstrap.NewDynamicHealthHandler(application.Ready).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("restarted degraded health status=%d", recorder.Code)
+	}
+	if _, err := application.Process(ctx, coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
+		t.Fatalf("restarted Process err=%v", err)
 	}
 }
 
