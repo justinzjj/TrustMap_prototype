@@ -3,14 +3,16 @@ pragma solidity ^0.8.30;
 
 import {IDirectVerifier} from "./IDirectVerifier.sol";
 
-/// @notice DEVELOPMENT/EXPERIMENTAL verifier backed by one authorized signer.
-/// @dev This is an integration aid, not a production consensus or light-client verifier.
-///      It never reads or writes the Gateway's TrustRoot and is callable only by its
-///      one-time-bound Gateway. Repeated signatures and hash rounds model a configured
-///      direct-verification workload; they do not provide committee or light-client security.
-contract ExperimentalAttestationDirectVerifier is IDirectVerifier {
+/// @notice EXPERIMENTAL direct verifier with a deployment-fixed synthetic gas profile.
+/// @dev This contract is a cost simulator, not a PoW SPV verifier, consensus verifier, or
+///      light client. Chained hashes and distinct real ECDSA checks approximate a configured
+///      verification workload without claiming the security properties of those protocols.
+contract ExperimentalCostedDirectVerifier is IDirectVerifier {
+    error EmptyAuthorizedSigners();
     error ZeroAuthorizedSigner();
+    error DuplicateAuthorizedSigner();
     error InvalidSignatureCheckCount();
+    error SignatureChecksExceedSignerCount();
     error TooManySignatureChecks();
     error TooManyHashRounds();
     error OnlyBinder();
@@ -27,27 +29,42 @@ contract ExperimentalAttestationDirectVerifier is IDirectVerifier {
     event GatewayBound(address indexed gateway);
 
     bytes32 public constant ATTESTATION_TYPEHASH = keccak256(
-        "TrustMapExperimentalAttestation(address verifier,address gateway,uint256 homeChainId,uint256 sourceChainId,uint256 sourceHeight,bytes32 sourceBlockHash,bytes32 sourceTrustRoot)"
+        "TrustMapExperimentalCostedDirect(address verifier,address gateway,uint256 homeChainId,uint256 sourceChainId,uint256 sourceHeight,bytes32 sourceBlockHash,bytes32 sourceTrustRoot)"
     );
     uint256 private constant SECP256K1_HALF_ORDER = 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
     uint32 public constant MAX_SIGNATURE_CHECKS = 4096;
     uint32 public constant MAX_HASH_ROUNDS = 16384;
 
-    address public immutable authorizedSigner;
+    address[] public authorizedSigners;
+    mapping(address signer => bool authorized) public isAuthorizedSigner;
     uint32 public immutable signatureChecks;
     uint32 public immutable hashRounds;
     address private immutable binder;
     address public gateway;
 
-    constructor(address signer, uint32 signatureChecks_, uint32 hashRounds_) {
-        if (signer == address(0)) revert ZeroAuthorizedSigner();
+    constructor(address[] memory authorizedSigners_, uint32 signatureChecks_, uint32 hashRounds_) {
+        uint256 signerCount = authorizedSigners_.length;
+        if (signerCount == 0) revert EmptyAuthorizedSigners();
         if (signatureChecks_ == 0) revert InvalidSignatureCheckCount();
         if (signatureChecks_ > MAX_SIGNATURE_CHECKS) revert TooManySignatureChecks();
+        if (signatureChecks_ > signerCount) revert SignatureChecksExceedSignerCount();
         if (hashRounds_ > MAX_HASH_ROUNDS) revert TooManyHashRounds();
-        authorizedSigner = signer;
+
+        for (uint256 i = 0; i < signerCount; ++i) {
+            address signer = authorizedSigners_[i];
+            if (signer == address(0)) revert ZeroAuthorizedSigner();
+            if (isAuthorizedSigner[signer]) revert DuplicateAuthorizedSigner();
+            isAuthorizedSigner[signer] = true;
+            authorizedSigners.push(signer);
+        }
+
         signatureChecks = signatureChecks_;
         hashRounds = hashRounds_;
         binder = msg.sender;
+    }
+
+    function authorizedSignerCount() external view returns (uint256) {
+        return authorizedSigners.length;
     }
 
     /// @notice One-time deployment wiring; no authority remains after binding.
@@ -65,6 +82,7 @@ contract ExperimentalAttestationDirectVerifier is IDirectVerifier {
         emit GatewayBound(gateway_);
     }
 
+    /// @notice Computes the fully context-bound digest signed by every checked signer.
     function attestationDigest(
         uint256 sourceChainId,
         uint256 sourceHeight,
@@ -90,8 +108,8 @@ contract ExperimentalAttestationDirectVerifier is IDirectVerifier {
     }
 
     /// @param proof ABI encoding of `(bytes32 sourceTrustRoot, bytes[] signatures)`.
-    /// @dev Every signature authenticates the same context with the same development signer.
-    ///      Repetition deliberately models signature-verification gas and calldata, not quorum.
+    /// @dev Signature i must be produced by authorizedSigners[i]. The profile and therefore
+    ///      the amount of work is fixed at deployment and cannot be reduced by the submitter.
     function verify(uint256 sourceChainId, uint256 sourceHeight, bytes32 sourceBlockHash, bytes calldata proof)
         external
         view
@@ -102,9 +120,10 @@ contract ExperimentalAttestationDirectVerifier is IDirectVerifier {
         bytes[] memory signatures;
         (sourceTrustRoot, signatures) = abi.decode(proof, (bytes32, bytes[]));
         if (signatures.length != signatureChecks) revert InvalidProofSignatureCount();
+
         bytes32 digest = attestationDigest(sourceChainId, sourceHeight, sourceBlockHash, sourceTrustRoot);
         for (uint256 i = 0; i < signatures.length; ++i) {
-            if (_recover(digest, signatures[i]) != authorizedSigner) revert InvalidSignature();
+            if (_recover(digest, signatures[i]) != authorizedSigners[i]) revert InvalidSignature();
         }
     }
 
