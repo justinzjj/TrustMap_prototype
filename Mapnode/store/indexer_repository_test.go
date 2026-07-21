@@ -142,6 +142,20 @@ func TestIndexerRepositoryRejectsDependencyLocatorReceiptTransactionMismatchAtom
 	assertDependencyApplyRolledBack(t, fixture)
 }
 
+func TestIndexerRepositoryRejectsResolutionLogReceiptTransactionIndexMismatchAtomically(t *testing.T) {
+	fixture := newDependencyApplyFixture(t)
+	for index := range fixture.block.Logs {
+		if fixture.block.Logs[index].EventTopic == chainabi.RequestResolvedTopic {
+			fixture.block.Logs[index].TxIndex++
+		}
+	}
+
+	if _, err := fixture.repository.ApplyConfirmedBlock(context.Background(), fixture.block); !errors.Is(err, ErrEvidenceBinding) {
+		t.Fatalf("resolution log receipt transaction index mismatch error=%v", err)
+	}
+	assertDependencyApplyRolledBack(t, fixture)
+}
+
 func TestIndexerRepositoryRejectsDependencyEdgeLeafMismatchAtomically(t *testing.T) {
 	fixture := newDependencyApplyFixture(t)
 	material := &fixture.block.Dependencies[0]

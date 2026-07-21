@@ -336,8 +336,17 @@ func verifyPersistedReceipt(ctx context.Context, tx *sql.Tx, chainID domain.Chai
 }
 
 func verifyResolutionIndexedLog(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock, want indexer.RequestResolutionRecord) error {
-	var topicsRaw, data []byte
-	if err := tx.QueryRowContext(ctx, `SELECT topics,data FROM indexed_gateway_logs WHERE chain_id=? AND block_hash=? AND tx_hash=? AND log_index=? AND event_topic=?`, block.ChainID[:], block.Hash[:], want.TxHash[:], int64(want.LogIndex), chainabi.RequestResolvedTopic[:]).Scan(&topicsRaw, &data); err != nil {
+	var indexedBlock, indexedHash, indexedTx, receiptBlock, receiptHash, receiptTx, topicsRaw, data []byte
+	var indexedTxIndex, indexedLogIndex, receiptTxIndex int64
+	if err := tx.QueryRowContext(ctx, `SELECT gateway_log.block_number,gateway_log.block_hash,gateway_log.tx_hash,gateway_log.tx_index,gateway_log.log_index,gateway_log.topics,gateway_log.data,
+		receipt.block_number,receipt.block_hash,receipt.tx_hash,receipt.tx_index
+		FROM indexed_gateway_logs gateway_log JOIN verification_receipts receipt
+		ON receipt.chain_id=gateway_log.chain_id AND receipt.tx_hash=gateway_log.tx_hash AND receipt.tx_index=gateway_log.tx_index
+		WHERE gateway_log.chain_id=? AND gateway_log.block_hash=? AND gateway_log.tx_hash=? AND gateway_log.log_index=? AND gateway_log.event_topic=? AND receipt.request_id=?`, block.ChainID[:], block.Hash[:], want.TxHash[:], int64(want.LogIndex), chainabi.RequestResolvedTopic[:], want.RequestID[:]).Scan(&indexedBlock, &indexedHash, &indexedTx, &indexedTxIndex, &indexedLogIndex, &topicsRaw, &data, &receiptBlock, &receiptHash, &receiptTx, &receiptTxIndex); err != nil {
+		return fmt.Errorf("%w: load RequestResolved coordinates: %v", ErrEvidenceBinding, err)
+	}
+	blockHeight, _ := domain.NewBlockHeight(block.Number)
+	if !equalBytes(indexedBlock, blockHeight[:]) || !equalBytes(indexedHash, block.Hash[:]) || !equalBytes(indexedTx, want.TxHash[:]) || indexedLogIndex != int64(want.LogIndex) || !equalBytes(receiptBlock, blockHeight[:]) || !equalBytes(receiptHash, block.Hash[:]) || !equalBytes(receiptTx, want.TxHash[:]) || indexedTxIndex != receiptTxIndex {
 		return ErrEvidenceBinding
 	}
 	if len(topicsRaw)%32 != 0 {
