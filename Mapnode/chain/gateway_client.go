@@ -20,8 +20,10 @@ import (
 )
 
 var (
-	ErrRemoteChainIDMismatch = errors.New("remote RPC chain ID mismatch")
-	ErrGatewayCodeMismatch   = errors.New("Gateway code hash mismatch")
+	ErrRemoteChainIDMismatch  = errors.New("remote RPC chain ID mismatch")
+	ErrGatewayCodeMismatch    = errors.New("Gateway code hash mismatch")
+	ErrGatewayABIMismatch     = errors.New("Gateway historical ABI response mismatch")
+	ErrInvalidGatewayManifest = errors.New("invalid Gateway deployment manifest")
 )
 
 type gatewayRPC interface {
@@ -80,7 +82,7 @@ func (client *GatewayClient) CurrentTrustRoot(ctx context.Context, block Canonic
 	}
 	root, err := chainabi.DecodeCurrentTrustRootResult(encoded)
 	if err != nil {
-		return trustview.TrustRoot{}, err
+		return trustview.TrustRoot{}, fmt.Errorf("%w: %v", ErrGatewayABIMismatch, err)
 	}
 	return trustview.TrustRoot{Hash: root}, nil
 }
@@ -100,6 +102,7 @@ type gatewayManifest struct {
 	SignatureChecks       uint32   `json:"signatureChecks"`
 	HashRounds            uint32   `json:"hashRounds"`
 	MeasuredDirectCostGas *uint64  `json:"measuredDirectCostGas"`
+	PathStepCostGas       *uint64  `json:"pathStepCostGas,omitempty"`
 	CodeHashes            struct {
 		Gateway        string `json:"gateway"`
 		DirectVerifier string `json:"directVerifier"`
@@ -122,28 +125,31 @@ func NewTrustRootReaderForChain(entry Chain, rpc TrustRootRPC) (*TrustRootReader
 		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("read Gateway deployment manifest: %w", err)
 	}
 	if len(content) > maxGatewayManifestBytes {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, errors.New("Gateway deployment manifest exceeds 1 MiB")
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: exceeds 1 MiB", ErrInvalidGatewayManifest)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(content))
 	decoder.DisallowUnknownFields()
 	var manifest gatewayManifest
 	if err := decoder.Decode(&manifest); err != nil {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("decode Gateway deployment manifest: %w", err)
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: decode: %v", ErrInvalidGatewayManifest, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, errors.New("Gateway deployment manifest contains trailing JSON")
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: trailing JSON", ErrInvalidGatewayManifest)
 	}
 	manifestChainID, ok := new(big.Int).SetString(manifest.ChainID, 10)
 	if manifest.Version != 1 || manifest.Status != "deployed" || !ok || manifestChainID.String() != manifest.ChainID || manifestChainID.Cmp(entry.ChainID.BigInt()) != 0 {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, errors.New("Gateway deployment manifest chain identity mismatch")
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: chain identity mismatch", ErrInvalidGatewayManifest)
 	}
 	if manifest.DeploymentBlock == 0 || !common.IsHexAddress(manifest.Gateway) {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, errors.New("Gateway deployment manifest is incomplete")
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: incomplete", ErrInvalidGatewayManifest)
+	}
+	if manifest.PathStepCostGas != nil && (*manifest.PathStepCostGas == 0 || *manifest.PathStepCostGas > uint64(^uint64(0)>>1)) {
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: pathStepCostGas must be positive and SQLite-safe", ErrInvalidGatewayManifest)
 	}
 	decodedHash := common.FromHex(manifest.CodeHashes.Gateway)
 	if len(decodedHash) != common.HashLength || !strings.HasPrefix(manifest.CodeHashes.Gateway, "0x") {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, errors.New("Gateway deployment manifest code hash must be 32 bytes")
+		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: code hash must be 32 bytes", ErrInvalidGatewayManifest)
 	}
 	deployment := GatewayDeployment{ChainID: entry.ChainID, Address: common.HexToAddress(manifest.Gateway), CodeHash: common.BytesToHash(decodedHash)}
 	block, err := domain.NewBlockHeight(manifest.DeploymentBlock)

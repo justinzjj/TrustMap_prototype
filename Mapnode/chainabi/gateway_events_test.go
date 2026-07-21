@@ -19,6 +19,8 @@ func TestGatewayEventTopicsMatchSolidityGoldenValues(t *testing.T) {
 		{"TrustRootUpdated", chainabi.TrustRootUpdatedTopic, "0xa2f90931b38050126801af291616bf523773603805893f350031b8b3cdf182a2"},
 		{"DependencyRecorded", chainabi.DependencyRecordedTopic, "0x26fe4056692e22cb6515b58329b35b50d71b7605c18b7bcaf3bacdf8297245f5"},
 		{"RequestResolved", chainabi.RequestResolvedTopic, "0x9e14f05723283ecafaae8f806553da1d3df582379f2502195bc237b3902da290"},
+		{"DirectVerificationSucceeded", chainabi.DirectVerificationSucceededTopic, "0xf823b7a644bb08196389f4340810ad3d39e780aa8e99daf540a4622416ab28ba"},
+		{"PathVerificationSucceeded", chainabi.PathVerificationSucceededTopic, "0x068d0b8a6ae7f5a6b9ec3c158eb348081e3e4ce74b6d9d5294584f3bf6ec103f"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

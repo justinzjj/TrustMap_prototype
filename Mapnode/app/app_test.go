@@ -17,7 +17,9 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/indexer"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/reorg"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/store"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
@@ -168,6 +170,59 @@ type blockingProcessor struct {
 	release chan struct{}
 	once    sync.Once
 	calls   atomic.Int32
+}
+
+func TestIndexerApplyHoldsOperationalWriteLockAgainstPlanning(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "lock.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	blocks := &blockingIndexerStore{entered: make(chan struct{}), release: make(chan struct{})}
+	processor := &countingProcessor{}
+	application := &App{database: database, canonicalCursors: store.NewCanonicalCursorRepository(database), indexerRepository: blocks, coordinator: processor}
+	application.ready.Store(true)
+	applyDone := make(chan error, 1)
+	go func() {
+		_, err := application.ApplyIndexerBlock(context.Background(), indexer.ConfirmedBlock{})
+		applyDone <- err
+	}()
+	<-blocks.entered
+	processDone := make(chan error, 1)
+	go func() { _, err := application.Process(context.Background(), coordinator.Work{}); processDone <- err }()
+	select {
+	case err := <-processDone:
+		t.Fatalf("planning crossed in-flight indexer write lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(blocks.release)
+	if err := <-applyDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-processDone; err != nil {
+		t.Fatal(err)
+	}
+	if processor.calls.Load() != 1 {
+		t.Fatalf("processor calls=%d", processor.calls.Load())
+	}
+}
+
+type blockingIndexerStore struct{ entered, release chan struct{} }
+
+func (*blockingIndexerStore) Configure(context.Context, store.IndexerConfig) error { return nil }
+func (store *blockingIndexerStore) ApplyConfirmedBlock(context.Context, indexer.ConfirmedBlock) (bool, error) {
+	close(store.entered)
+	<-store.release
+	return true, nil
+}
+func (*blockingIndexerStore) Degrade(context.Context, domain.ChainID, string) error { return nil }
+func (*blockingIndexerStore) HasDegraded(context.Context) (bool, error)             { return false, nil }
+
+type countingProcessor struct{ calls atomic.Int32 }
+
+func (processor *countingProcessor) Process(context.Context, coordinator.Work) (coordinator.Result, error) {
+	processor.calls.Add(1)
+	return coordinator.Result{}, nil
 }
 
 func (processor *blockingProcessor) Process(ctx context.Context, _ coordinator.Work) (coordinator.Result, error) {

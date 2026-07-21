@@ -35,6 +35,8 @@ for name in RPC_URL CHAIN_ID MERKLE_DEPTH AUTHORIZED_SIGNERS_FILE DEPLOYER_KEYST
 done
 require_positive_decimal CHAIN_ID "$CHAIN_ID"
 require_positive_decimal MERKLE_DEPTH "$MERKLE_DEPTH"
+PATH_STEP_COST_GAS=${PATH_STEP_COST_GAS:-30713}
+require_positive_decimal PATH_STEP_COST_GAS "$PATH_STEP_COST_GAS"
 [ "$MERKLE_DEPTH" -le 32 ] || die "MERKLE_DEPTH must not exceed 32"
 for file in "$AUTHORIZED_SIGNERS_FILE" "$DEPLOYER_KEYSTORE" "$DEPLOYER_PASSWORD_FILE"; do
     [ -f "$file" ] && [ -r "$file" ] || die "required runtime file is missing or unreadable: $file"
@@ -164,12 +166,14 @@ jq -n \
     --argjson measured_direct_cost_gas "$measured_direct_cost_gas" \
     --argjson deployment_block "$deployment_block" \
 	--argjson merkle_depth "$MERKLE_DEPTH" \
+	--argjson path_step_cost_gas "$PATH_STEP_COST_GAS" \
     '{
       version: 1,
       status: "deployed",
       chainId: $chain_id,
       deploymentBlock: $deployment_block,
 	  merkleDepth: $merkle_depth,
+	  pathStepCostGas: $path_step_cost_gas,
       gateway: $gateway,
       directVerifier: $direct_verifier,
       profileId: $profile_id,

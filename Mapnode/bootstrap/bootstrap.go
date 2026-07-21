@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 )
 
 const SupportedConfigVersion = 1
+const DefaultPathStepCostGas uint64 = 30_713
 
 var (
 	addressPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
@@ -111,6 +113,7 @@ type DeploymentManifest struct {
 	SignatureChecks       uint32     `json:"signatureChecks"`
 	HashRounds            uint32     `json:"hashRounds"`
 	MeasuredDirectCostGas *uint64    `json:"measuredDirectCostGas"`
+	PathStepCostGas       *uint64    `json:"pathStepCostGas,omitempty"`
 	CodeHashes            CodeHashes `json:"codeHashes"`
 	Transactions          any        `json:"transactions,omitempty"`
 }
@@ -143,6 +146,10 @@ func LoadValidated(configPath string) (Config, DeploymentManifest, error) {
 	var manifest DeploymentManifest
 	if err := decodeStrictFile(config.HomeChain.GatewayManifest, &manifest); err != nil {
 		return config, manifest, fmt.Errorf("load deployment manifest: %w", err)
+	}
+	if manifest.PathStepCostGas == nil {
+		value := DefaultPathStepCostGas
+		manifest.PathStepCostGas = &value
 	}
 	if err := validateManifest(config.HomeChain.ChainID, manifest); err != nil {
 		return config, manifest, fmt.Errorf("validate deployment manifest: %w", err)
@@ -367,6 +374,9 @@ func validateManifest(chainID string, manifest DeploymentManifest) error {
 	}
 	if manifest.MerkleDepth == 0 || manifest.MerkleDepth > 32 {
 		return errors.New("merkleDepth must be between 1 and 32")
+	}
+	if manifest.PathStepCostGas == nil || *manifest.PathStepCostGas == 0 || *manifest.PathStepCostGas > math.MaxInt64 {
+		return errors.New("pathStepCostGas must be a positive SQLite-safe deployment value")
 	}
 	if !addressPattern.MatchString(manifest.Gateway) || !addressPattern.MatchString(manifest.DirectVerifier) {
 		return errors.New("gateway and directVerifier must be 20-byte hex addresses")

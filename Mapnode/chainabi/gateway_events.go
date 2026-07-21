@@ -12,11 +12,24 @@ import (
 )
 
 var (
-	VerificationRequestedTopic = common.HexToHash("0x6e4486cba7e09fd23bd6d6edc0fc893ff7f02d9266d863047e298f7b132ee71a")
-	TrustRootUpdatedTopic      = common.HexToHash("0xa2f90931b38050126801af291616bf523773603805893f350031b8b3cdf182a2")
-	DependencyRecordedTopic    = common.HexToHash("0x26fe4056692e22cb6515b58329b35b50d71b7605c18b7bcaf3bacdf8297245f5")
-	RequestResolvedTopic       = common.HexToHash("0x9e14f05723283ecafaae8f806553da1d3df582379f2502195bc237b3902da290")
+	VerificationRequestedTopic       = common.HexToHash("0x6e4486cba7e09fd23bd6d6edc0fc893ff7f02d9266d863047e298f7b132ee71a")
+	TrustRootUpdatedTopic            = common.HexToHash("0xa2f90931b38050126801af291616bf523773603805893f350031b8b3cdf182a2")
+	DependencyRecordedTopic          = common.HexToHash("0x26fe4056692e22cb6515b58329b35b50d71b7605c18b7bcaf3bacdf8297245f5")
+	RequestResolvedTopic             = common.HexToHash("0x9e14f05723283ecafaae8f806553da1d3df582379f2502195bc237b3902da290")
+	DirectVerificationSucceededTopic = common.HexToHash("0xf823b7a644bb08196389f4340810ad3d39e780aa8e99daf540a4622416ab28ba")
+	PathVerificationSucceededTopic   = common.HexToHash("0x068d0b8a6ae7f5a6b9ec3c158eb348081e3e4ce74b6d9d5294584f3bf6ec103f")
 )
+
+type VerificationSucceeded struct {
+	RequestID       domain.RequestID
+	SourceChainID   domain.ChainID
+	SourceHeight    domain.BlockHeight
+	SourceBlockHash common.Hash
+	SourceTrustRoot common.Hash
+	DependencyKey   common.Hash
+	Path            bool
+	HopCount        *big.Int
+}
 
 type VerificationRequested struct {
 	RequestID       domain.RequestID
@@ -116,6 +129,41 @@ func ParseRequestResolved(log types.Log) (RequestResolved, error) {
 		return RequestResolved{}, err
 	}
 	return RequestResolved{RequestID: domain.RequestID(log.Topics[1]), Requester: requester, DependencyKey: log.Topics[3], NewDependency: newDependency, HomeTrustRoot: common.BytesToHash(word(log.Data, 1))}, nil
+}
+
+func ParseVerificationSucceeded(log types.Log) (VerificationSucceeded, error) {
+	words := 4
+	path := false
+	switch {
+	case len(log.Topics) > 0 && log.Topics[0] == DirectVerificationSucceededTopic:
+	case len(log.Topics) > 0 && log.Topics[0] == PathVerificationSucceededTopic:
+		words, path = 5, true
+	default:
+		return VerificationSucceeded{}, errors.New("unsupported verification success event")
+	}
+	if err := requireEvent(log, log.Topics[0], 3, words); err != nil {
+		return VerificationSucceeded{}, err
+	}
+	chainID, err := domain.NewChainIDFromBig(new(big.Int).SetBytes(log.Topics[2][:]))
+	if err != nil {
+		return VerificationSucceeded{}, err
+	}
+	height, err := domain.NewBlockHeightFromBig(new(big.Int).SetBytes(word(log.Data, 0)))
+	if err != nil {
+		return VerificationSucceeded{}, err
+	}
+	result := VerificationSucceeded{
+		RequestID: domain.RequestID(log.Topics[1]), SourceChainID: chainID, SourceHeight: height,
+		SourceBlockHash: common.BytesToHash(word(log.Data, 1)), SourceTrustRoot: common.BytesToHash(word(log.Data, 2)),
+		DependencyKey: common.BytesToHash(word(log.Data, words-1)), Path: path,
+	}
+	if path {
+		result.HopCount = new(big.Int).SetBytes(word(log.Data, 3))
+		if result.HopCount.Sign() == 0 {
+			return VerificationSucceeded{}, errors.New("path verification hop count must be positive")
+		}
+	}
+	return result, nil
 }
 
 func requireEvent(log types.Log, topic common.Hash, topics, words int) error {

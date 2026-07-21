@@ -538,6 +538,28 @@ func TestLoadValidatedRequiresDeploymentFixedMerkleDepth(t *testing.T) {
 	}
 }
 
+func TestLoadValidatedDefaultsAndValidatesDeploymentPathStepCost(t *testing.T) {
+	configPath, manifestPath := validFixture(t)
+	_, manifest, err := LoadValidated(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.PathStepCostGas == nil || *manifest.PathStepCostGas != DefaultPathStepCostGas {
+		t.Fatalf("pathStepCostGas=%v", manifest.PathStepCostGas)
+	}
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = []byte(strings.Replace(string(body), `"merkleDepth": 8,`, `"merkleDepth": 8, "pathStepCostGas": 0,`, 1))
+	if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadValidated(configPath); err == nil || !strings.Contains(err.Error(), "pathStepCostGas") {
+		t.Fatalf("zero pathStepCostGas error=%v", err)
+	}
+}
+
 func TestHealthHandlerReadinessTracksValidation(t *testing.T) {
 	for _, tc := range []struct {
 		ready bool

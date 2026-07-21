@@ -118,6 +118,7 @@ func renderCompose(topology *config.Topology, identities map[string]identity, ou
 			Environment: map[string]string{
 				"CHAIN_ID":                fmt.Sprint(chain.ChainID),
 				"MERKLE_DEPTH":            fmt.Sprint(chain.MerkleDepth),
+				"PATH_STEP_COST_GAS":      "30713",
 				"RPC_URL":                 fmt.Sprintf("http://%s:8545", gethName),
 				"DEPLOYER_ADDRESS":        chainIdentity.DeployerAddress,
 				"DEPLOYER_KEYSTORE":       "/run/secrets/deployer-keystore.json",

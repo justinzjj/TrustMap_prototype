@@ -59,6 +59,28 @@ func (repository *CanonicalCursorRepository) HasDegradedCanonicalCursor(ctx cont
 	return degraded == 1, nil
 }
 
+func (repository *CanonicalCursorRepository) Degrade(ctx context.Context, chainID domain.ChainID, reason string) (reorg.CanonicalCursor, error) {
+	if repository == nil || repository.db == nil || reason == "" {
+		return reorg.CanonicalCursor{}, errors.New("canonical cursor degradation requires repository and reason")
+	}
+	tx, err := repository.db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return reorg.CanonicalCursor{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := scanCanonicalCursor(tx.QueryRowContext(ctx, `SELECT chain_id,block_height,block_hash,state,degraded_reason FROM canonical_cursors WHERE chain_id=?`, chainID[:]))
+	if err != nil {
+		return reorg.CanonicalCursor{}, err
+	}
+	if current.State == reorg.Degraded {
+		if err := tx.Commit(); err != nil {
+			return current, err
+		}
+		return current, nil
+	}
+	return persistCursorDegraded(ctx, tx, current, reason)
+}
+
 func (repository *CanonicalCursorRepository) Advance(ctx context.Context, chainID domain.ChainID, recheckedHash common.Hash, next reorg.CanonicalBlock) (reorg.CanonicalCursor, bool, error) {
 	tx, err := repository.db.sql.BeginTx(ctx, nil)
 	if err != nil {

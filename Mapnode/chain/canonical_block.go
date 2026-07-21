@@ -14,6 +14,7 @@ import (
 var (
 	ErrCanonicalBlockMismatch = errors.New("canonical block hash mismatch")
 	ErrBlockUnconfirmed       = errors.New("canonical block lacks required confirmations")
+	ErrMalformedRPCResponse   = errors.New("malformed canonical RPC response")
 )
 
 type canonicalHeaderRPC interface {
@@ -54,7 +55,7 @@ func (reader *CanonicalBlockReader) Confirmed(ctx context.Context, height domain
 		return CanonicalBlock{}, fmt.Errorf("read canonical head: %w", err)
 	}
 	if head == nil || head.Number == nil {
-		return CanonicalBlock{}, errors.New("canonical head is missing its number")
+		return CanonicalBlock{}, ErrMalformedRPCResponse
 	}
 	requiredHead := new(big.Int).Add(height.BigInt(), new(big.Int).SetUint64(confirmations))
 	if head.Number.Cmp(requiredHead) < 0 {

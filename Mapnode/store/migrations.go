@@ -19,6 +19,7 @@ var migrations = []migration{
 	{version: 2, name: "pathproof_integrity", sql: pathProofIntegrityV2},
 	{version: 3, name: "live_observation_foundation", sql: liveObservationFoundationV3},
 	{version: 4, name: "live_chain_delete_protection", sql: liveChainDeleteProtectionV4},
+	{version: 5, name: "confirmed_gateway_indexer", sql: confirmedGatewayIndexerV5},
 }
 
 const migrationTable = `
@@ -648,4 +649,80 @@ BEFORE DELETE ON live_chains
 BEGIN
     SELECT RAISE(ABORT,'live chain catalog is immutable');
 END;
+`
+
+const confirmedGatewayIndexerV5 = `
+CREATE TABLE live_indexer_configs (
+    chain_id BLOB PRIMARY KEY CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    gateway BLOB NOT NULL CHECK(typeof(gateway)='blob' AND length(gateway)=20),
+    gateway_code_hash BLOB NOT NULL CHECK(typeof(gateway_code_hash)='blob' AND length(gateway_code_hash)=32),
+    deployment_block BLOB NOT NULL CHECK(typeof(deployment_block)='blob' AND length(deployment_block)=32),
+    merkle_depth INTEGER NOT NULL CHECK(merkle_depth BETWEEN 1 AND 32),
+    path_step_cost_gas INTEGER NOT NULL CHECK(path_step_cost_gas>0),
+    created_at INTEGER NOT NULL CHECK(created_at>0),
+    FOREIGN KEY(chain_id) REFERENCES live_chains(chain_id)
+) STRICT;
+
+CREATE TABLE indexed_gateway_logs (
+    chain_id BLOB NOT NULL CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    gateway BLOB NOT NULL CHECK(typeof(gateway)='blob' AND length(gateway)=20),
+    block_number BLOB NOT NULL CHECK(typeof(block_number)='blob' AND length(block_number)=32),
+    block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
+    tx_hash BLOB NOT NULL CHECK(typeof(tx_hash)='blob' AND length(tx_hash)=32),
+    tx_index INTEGER NOT NULL CHECK(tx_index BETWEEN 0 AND 4294967295),
+    log_index INTEGER NOT NULL CHECK(log_index BETWEEN 0 AND 4294967295),
+    event_topic BLOB NOT NULL CHECK(typeof(event_topic)='blob' AND length(event_topic)=32),
+    content_digest BLOB NOT NULL CHECK(typeof(content_digest)='blob' AND length(content_digest)=32),
+    topics BLOB NOT NULL CHECK(typeof(topics)='blob' AND length(topics) BETWEEN 32 AND 128 AND length(topics)%32=0),
+    data BLOB NOT NULL CHECK(typeof(data)='blob' AND length(data)%32=0),
+    PRIMARY KEY(chain_id,block_hash,tx_hash,tx_index,log_index),
+    UNIQUE(chain_id,gateway,block_number,block_hash,tx_hash,tx_index,log_index,content_digest),
+    FOREIGN KEY(chain_id) REFERENCES live_indexer_configs(chain_id)
+) STRICT;
+
+CREATE TABLE indexer_degraded_states (
+    chain_id BLOB PRIMARY KEY CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    reason TEXT NOT NULL CHECK(length(reason)>0),
+    degraded_at INTEGER NOT NULL CHECK(degraded_at>0),
+    FOREIGN KEY(chain_id) REFERENCES live_indexer_configs(chain_id)
+) STRICT;
+
+CREATE TABLE verification_receipts (
+    chain_id BLOB NOT NULL CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    tx_hash BLOB NOT NULL CHECK(typeof(tx_hash)='blob' AND length(tx_hash)=32),
+    block_number BLOB NOT NULL CHECK(typeof(block_number)='blob' AND length(block_number)=32),
+    block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
+    tx_index INTEGER NOT NULL CHECK(tx_index BETWEEN 0 AND 4294967295),
+    request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32),
+    status INTEGER NOT NULL CHECK(status=1),
+    PRIMARY KEY(chain_id,tx_hash),
+    UNIQUE(chain_id,block_hash,tx_index),
+    FOREIGN KEY(chain_id) REFERENCES live_indexer_configs(chain_id),
+    FOREIGN KEY(request_id) REFERENCES requests(id)
+) STRICT;
+
+CREATE TABLE request_resolutions (
+    request_id BLOB PRIMARY KEY CHECK(typeof(request_id)='blob' AND length(request_id)=32),
+    chain_id BLOB NOT NULL CHECK(typeof(chain_id)='blob' AND length(chain_id)=32),
+    tx_hash BLOB NOT NULL CHECK(typeof(tx_hash)='blob' AND length(tx_hash)=32),
+    dependency_key BLOB NOT NULL CHECK(typeof(dependency_key)='blob' AND length(dependency_key)=32),
+    new_dependency INTEGER NOT NULL CHECK(new_dependency IN (0,1)),
+    home_trust_root BLOB NOT NULL CHECK(typeof(home_trust_root)='blob' AND length(home_trust_root)=32),
+    log_index INTEGER NOT NULL CHECK(log_index BETWEEN 0 AND 4294967295),
+    created_at INTEGER NOT NULL CHECK(created_at>0),
+    FOREIGN KEY(chain_id,tx_hash) REFERENCES verification_receipts(chain_id,tx_hash),
+    FOREIGN KEY(request_id) REFERENCES requests(id),
+    UNIQUE(chain_id,tx_hash,log_index)
+) STRICT;
+
+CREATE TRIGGER prevent_live_indexer_config_update BEFORE UPDATE ON live_indexer_configs BEGIN SELECT RAISE(ABORT,'live indexer config is immutable'); END;
+CREATE TRIGGER prevent_live_indexer_config_delete BEFORE DELETE ON live_indexer_configs BEGIN SELECT RAISE(ABORT,'live indexer config is immutable'); END;
+CREATE TRIGGER prevent_indexer_degraded_state_update BEFORE UPDATE ON indexer_degraded_states BEGIN SELECT RAISE(ABORT,'indexer degraded state is immutable'); END;
+CREATE TRIGGER prevent_indexer_degraded_state_delete BEFORE DELETE ON indexer_degraded_states BEGIN SELECT RAISE(ABORT,'indexer degraded state is immutable'); END;
+CREATE TRIGGER prevent_indexed_gateway_log_update BEFORE UPDATE ON indexed_gateway_logs BEGIN SELECT RAISE(ABORT,'indexed Gateway log is append-only'); END;
+CREATE TRIGGER prevent_indexed_gateway_log_delete BEFORE DELETE ON indexed_gateway_logs BEGIN SELECT RAISE(ABORT,'indexed Gateway log is append-only'); END;
+CREATE TRIGGER prevent_verification_receipt_update BEFORE UPDATE ON verification_receipts BEGIN SELECT RAISE(ABORT,'verification receipt is append-only'); END;
+CREATE TRIGGER prevent_verification_receipt_delete BEFORE DELETE ON verification_receipts BEGIN SELECT RAISE(ABORT,'verification receipt is append-only'); END;
+CREATE TRIGGER prevent_request_resolution_update BEFORE UPDATE ON request_resolutions BEGIN SELECT RAISE(ABORT,'request resolution is append-only'); END;
+CREATE TRIGGER prevent_request_resolution_delete BEFORE DELETE ON request_resolutions BEGIN SELECT RAISE(ABORT,'request resolution is append-only'); END;
 `
