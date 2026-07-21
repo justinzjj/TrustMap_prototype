@@ -75,7 +75,10 @@ func (repository *IndexerRepository) Configure(ctx context.Context, config Index
 	if err != nil {
 		return fmt.Errorf("configure confirmed indexer: %w", err)
 	}
-	affected, _ := result.RowsAffected()
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count configured confirmed indexer: %w", err)
+	}
 	if affected == 1 {
 		return nil
 	}
@@ -129,31 +132,48 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 			return false, err
 		}
 	}
+	durableChanged := false
 	for _, item := range block.Logs {
-		if err := insertIndexedGatewayLog(ctx, tx, block, item); err != nil {
+		changed, err := insertIndexedGatewayLog(ctx, tx, block, item)
+		if err != nil {
 			return false, err
 		}
+		durableChanged = durableChanged || changed
 	}
 	for _, request := range block.Requests {
-		if err := insertObservedRequest(ctx, tx, request); err != nil {
+		changed, err := insertObservedRequest(ctx, tx, request)
+		if err != nil {
 			return false, err
 		}
+		durableChanged = durableChanged || changed
 	}
 	for _, receipt := range block.Receipts {
 		if receipt.BlockNumber != block.Number || receipt.BlockHash != block.Hash || receipt.TxHash == (common.Hash{}) || receipt.RequestID == (domain.RequestID{}) {
 			return false, ErrRecordConflict
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO verification_receipts(chain_id,tx_hash,block_number,block_hash,tx_index,request_id,status) VALUES(?,?,?,?,?,?,1) ON CONFLICT(chain_id,tx_hash) DO NOTHING`, block.ChainID[:], receipt.TxHash[:], blockHeight[:], block.Hash[:], int64(receipt.TxIndex), receipt.RequestID[:]); err != nil {
+		result, err := tx.ExecContext(ctx, `INSERT INTO verification_receipts(chain_id,tx_hash,block_number,block_hash,tx_index,request_id,status) VALUES(?,?,?,?,?,?,1) ON CONFLICT(chain_id,tx_hash) DO NOTHING`, block.ChainID[:], receipt.TxHash[:], blockHeight[:], block.Hash[:], int64(receipt.TxIndex), receipt.RequestID[:])
+		if err != nil {
 			return false, fmt.Errorf("insert verification receipt: %w", err)
 		}
+		changed, err := oneRowChanged(result)
+		if err != nil {
+			return false, fmt.Errorf("count inserted verification receipt: %w", err)
+		}
+		durableChanged = durableChanged || changed
 		if err := verifyPersistedReceipt(ctx, tx, block.ChainID, receipt); err != nil {
 			return false, err
 		}
 	}
 	for _, resolution := range block.Resolutions {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO request_resolutions(request_id,chain_id,tx_hash,dependency_key,new_dependency,home_trust_root,log_index,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(request_id) DO NOTHING`, resolution.RequestID[:], block.ChainID[:], resolution.TxHash[:], resolution.DependencyKey[:], boolInt(resolution.NewDependency), resolution.HomeTrustRoot[:], int64(resolution.LogIndex), time.Now().UTC().UnixNano()); err != nil {
+		result, err := tx.ExecContext(ctx, `INSERT INTO request_resolutions(request_id,chain_id,tx_hash,dependency_key,new_dependency,home_trust_root,log_index,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(request_id) DO NOTHING`, resolution.RequestID[:], block.ChainID[:], resolution.TxHash[:], resolution.DependencyKey[:], boolInt(resolution.NewDependency), resolution.HomeTrustRoot[:], int64(resolution.LogIndex), time.Now().UTC().UnixNano())
+		if err != nil {
 			return false, fmt.Errorf("insert request resolution: %w", err)
 		}
+		changed, err := oneRowChanged(result)
+		if err != nil {
+			return false, fmt.Errorf("count inserted request resolution: %w", err)
+		}
+		durableChanged = durableChanged || changed
 		if err := verifyPersistedResolution(ctx, tx, block.ChainID, resolution); err != nil {
 			return false, err
 		}
@@ -181,6 +201,10 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 		}
 		graphChanged = graphChanged || changed
 	}
+	durableChanged = durableChanged || graphChanged
+	if replay && durableChanged {
+		return false, ErrRecordConflict
+	}
 	if graphChanged {
 		if err := bumpGraphRevision(ctx, tx); err != nil {
 			return false, err
@@ -191,7 +215,11 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 		if err != nil {
 			return false, err
 		}
-		if affected, _ := result.RowsAffected(); affected != 1 {
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("count canonical cursor advance: %w", err)
+		}
+		if affected != 1 {
 			return false, ErrConcurrentUpdate
 		}
 	}
@@ -218,9 +246,9 @@ func requireIndexerConfig(ctx context.Context, tx *sql.Tx, block indexer.Confirm
 	return nil
 }
 
-func insertIndexedGatewayLog(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock, item indexer.IndexedGatewayLog) error {
+func insertIndexedGatewayLog(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock, item indexer.IndexedGatewayLog) (bool, error) {
 	if item.Address != block.Gateway || item.BlockNumber != block.Number || item.BlockHash != block.Hash || item.TxHash == (common.Hash{}) || item.EventTopic == (common.Hash{}) || item.ContentDigest == (common.Hash{}) || len(item.Topics) == 0 || item.Topics[0] != item.EventTopic || len(item.Topics) > 4 || len(item.Data)%32 != 0 {
-		return ErrRecordConflict
+		return false, ErrRecordConflict
 	}
 	topics := make([]byte, 0, len(item.Topics)*32)
 	for _, topic := range item.Topics {
@@ -229,38 +257,57 @@ func insertIndexedGatewayLog(ctx context.Context, tx *sql.Tx, block indexer.Conf
 	height, _ := domain.NewBlockHeight(item.BlockNumber)
 	result, err := tx.ExecContext(ctx, `INSERT INTO indexed_gateway_logs(chain_id,gateway,block_number,block_hash,tx_hash,tx_index,log_index,event_topic,content_digest,topics,data) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(chain_id,block_hash,tx_hash,tx_index,log_index) DO NOTHING`, block.ChainID[:], block.Gateway[:], height[:], block.Hash[:], item.TxHash[:], int64(item.TxIndex), int64(item.LogIndex), item.EventTopic[:], item.ContentDigest[:], topics, item.Data)
 	if err != nil {
-		return fmt.Errorf("insert indexed Gateway log: %w", err)
+		return false, fmt.Errorf("insert indexed Gateway log: %w", err)
 	}
-	affected, _ := result.RowsAffected()
-	if affected == 0 {
+	changed, err := oneRowChanged(result)
+	if err != nil {
+		return false, fmt.Errorf("count inserted indexed Gateway log: %w", err)
+	}
+	if !changed {
 		var digest, persistedTopics, data []byte
 		if err := tx.QueryRowContext(ctx, `SELECT content_digest,topics,data FROM indexed_gateway_logs WHERE chain_id=? AND block_hash=? AND tx_hash=? AND tx_index=? AND log_index=?`, block.ChainID[:], block.Hash[:], item.TxHash[:], int64(item.TxIndex), int64(item.LogIndex)).Scan(&digest, &persistedTopics, &data); err != nil {
-			return err
+			return false, err
 		}
 		if !equalBytes(digest, item.ContentDigest[:]) || !equalBytes(persistedTopics, topics) || !equalBytes(data, item.Data) {
-			return ErrRecordConflict
+			return false, ErrRecordConflict
 		}
 	}
-	return nil
+	return changed, nil
 }
 
-func insertObservedRequest(ctx context.Context, tx *sql.Tx, request coordinator.Request) error {
+func insertObservedRequest(ctx context.Context, tx *sql.Tx, request coordinator.Request) (bool, error) {
 	if request.State != coordinator.Observed {
-		return ErrRecordConflict
+		return false, ErrRecordConflict
 	}
 	want, err := evidence.ComputeGatewayRequestID(request.HomeChainID, request.Gateway, request.Requester, new(big.Int).SetBytes(request.Nonce[:]), request.SourceChainID, request.SourceHeight, request.SourceBlockHash)
 	if err != nil || want != request.ID {
-		return ErrRecordConflict
+		return false, ErrRecordConflict
 	}
 	request.CreatedAt, request.UpdatedAt = normalizedTimes(request.CreatedAt, request.UpdatedAt)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO requests(id,home_chain_id,gateway,requester,nonce,source_chain_id,source_height,source_block_hash,state,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, request.ID[:], request.HomeChainID[:], request.Gateway[:], request.Requester[:], request.Nonce[:], request.SourceChainID[:], request.SourceHeight[:], request.SourceBlockHash[:], request.State, request.Reason, toUnix(request.CreatedAt), toUnix(request.UpdatedAt)); err != nil {
-		return err
+	result, err := tx.ExecContext(ctx, `INSERT INTO requests(id,home_chain_id,gateway,requester,nonce,source_chain_id,source_height,source_block_hash,state,reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, request.ID[:], request.HomeChainID[:], request.Gateway[:], request.Requester[:], request.Nonce[:], request.SourceChainID[:], request.SourceHeight[:], request.SourceBlockHash[:], request.State, request.Reason, toUnix(request.CreatedAt), toUnix(request.UpdatedAt))
+	if err != nil {
+		return false, err
+	}
+	changed, err := oneRowChanged(result)
+	if err != nil {
+		return false, fmt.Errorf("count inserted observed request: %w", err)
 	}
 	persisted, err := scanRequest(tx.QueryRowContext(ctx, requestSelect+" WHERE id=?", request.ID[:]))
 	if err != nil || !sameRequestIdentity(persisted, request) {
-		return ErrRecordConflict
+		return false, ErrRecordConflict
 	}
-	return nil
+	return changed, nil
+}
+
+func oneRowChanged(result sql.Result) (bool, error) {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected < 0 || affected > 1 {
+		return false, ErrConcurrentUpdate
+	}
+	return affected == 1, nil
 }
 
 func verifyPersistedResolution(ctx context.Context, tx *sql.Tx, chainID domain.ChainID, want indexer.RequestResolutionRecord) error {
@@ -312,17 +359,18 @@ func verifyResolutionIndexedLog(ctx context.Context, tx *sql.Tx, block indexer.C
 }
 
 func applyDependencyMaterialization(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock, material indexer.DependencyMaterialization) (bool, error) {
-	if material.Evidence.State != evidence.Candidate || material.Evidence.ID != material.Dependency.EvidenceID || material.Edge.EvidenceID != material.Evidence.ID || material.Witness.EvidenceID != material.Evidence.ID || material.Edge.WitnessID == nil || *material.Edge.WitnessID != material.Witness.ID || material.Edge.PathStepCost != block.PathStepCostGas {
+	if material.Edge.Validate() != nil || material.Evidence.State != evidence.Candidate || material.Evidence.ID != material.Dependency.EvidenceID || material.Edge.EvidenceID != material.Evidence.ID || material.Witness.EvidenceID != material.Evidence.ID || material.Edge.WitnessID == nil || *material.Edge.WitnessID != material.Witness.ID || material.Edge.LeafIndex != material.Dependency.LeafIndex || material.Witness.LeafIndex != material.Dependency.LeafIndex || material.Edge.PathStepCost != block.PathStepCostGas {
 		return false, ErrEvidenceBinding
 	}
+	blockHeight, _ := domain.NewBlockHeight(block.Number)
 	wantEvidenceID, err := evidence.ComputeID(material.Evidence.Locator)
-	if err != nil || wantEvidenceID != material.Evidence.ID || material.Evidence.Locator.ChainID != block.ChainID || material.Evidence.Locator.ContractAddress != block.Gateway || material.Evidence.Locator.BlockHash != block.Hash {
+	if err != nil || wantEvidenceID != material.Evidence.ID || material.Evidence.Locator.ChainID != block.ChainID || material.Evidence.Locator.ContractAddress != block.Gateway || material.Evidence.Locator.BlockNumber != blockHeight || material.Evidence.Locator.BlockHash != block.Hash {
 		return false, ErrEvidenceBinding
 	}
 	if err := material.Dependency.Validate(material.To, material.Evidence.Locator.PayloadDigest); err != nil {
 		return false, ErrEvidenceBinding
 	}
-	if material.From.ID != material.Edge.From || material.To.ID != material.Edge.To || material.From.Root.Hash == (common.Hash{}) || material.From.Key.ChainID != block.ChainID || material.From.Key.BlockHash != block.Hash {
+	if material.From.ID != material.Edge.From || material.To.ID != material.Edge.To || material.From.Root.Hash == (common.Hash{}) || material.From.Key.ChainID != block.ChainID || material.From.Key.Height != blockHeight || material.From.Key.BlockHash != block.Hash {
 		return false, ErrEvidenceBinding
 	}
 	if err := verifyActiveNodeContent(ctx, tx, material.From); err != nil {
@@ -331,8 +379,7 @@ func applyDependencyMaterialization(ctx context.Context, tx *sql.Tx, block index
 	if err := verifyActiveNodeContent(ctx, tx, material.To); err != nil {
 		return false, err
 	}
-	var homeRoot []byte
-	if err := tx.QueryRowContext(ctx, `SELECT home_trust_root FROM request_resolutions WHERE request_id=? AND new_dependency=1`, material.Dependency.RequestID[:]).Scan(&homeRoot); err != nil || !equalBytes(homeRoot, material.From.Root.Hash[:]) {
+	if err := verifyDependencyReceiptAndResolution(ctx, tx, block, material); err != nil {
 		return false, ErrEvidenceBinding
 	}
 	leaf := domain.LeafHash(material.Dependency.SourceTrustRoot.Hash, material.Dependency.SourceBlockHash)
@@ -348,8 +395,10 @@ func applyDependencyMaterialization(ctx context.Context, tx *sql.Tx, block index
 	if err != nil {
 		return false, err
 	}
-	inserted, _ := result.RowsAffected()
-	changed := inserted == 1
+	changed, err := oneRowChanged(result)
+	if err != nil {
+		return false, fmt.Errorf("count inserted dependency evidence: %w", err)
+	}
 	if changed {
 		from := evidence.Candidate
 		for _, to := range []evidence.State{evidence.Verified, evidence.Confirmed, evidence.Active} {
@@ -357,7 +406,11 @@ func applyDependencyMaterialization(ctx context.Context, tx *sql.Tx, block index
 			if err != nil {
 				return false, err
 			}
-			if affected, _ := result.RowsAffected(); affected != 1 {
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return false, fmt.Errorf("count dependency evidence transition: %w", err)
+			}
+			if affected != 1 {
 				return false, ErrConcurrentUpdate
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO evidence_transitions(evidence_id,from_state,to_state,reason,changed_at) VALUES(?,?,?,'confirmed Gateway receipt validation',?)`, material.Evidence.ID[:], from, to, toUnix(now)); err != nil {
@@ -365,8 +418,14 @@ func applyDependencyMaterialization(ctx context.Context, tx *sql.Tx, block index
 			}
 			from = to
 		}
-	} else if _, err := loadActiveEvidence(ctx, tx, material.Evidence.ID); err != nil {
-		return false, err
+	} else {
+		persisted, err := loadActiveEvidence(ctx, tx, material.Evidence.ID)
+		if err != nil {
+			return false, err
+		}
+		if persisted.ID != material.Evidence.ID || persisted.Locator != material.Evidence.Locator || persisted.State != evidence.Active || persisted.InvalidReason != "" {
+			return false, ErrEvidenceBinding
+		}
 	}
 	wantWitness := trustview.NewMembershipWitness(material.Evidence.ID, material.Witness.LeafIndex, material.Witness.Siblings)
 	if wantWitness.ID != material.Witness.ID || len(material.Witness.Siblings) != int(block.MerkleDepth) {
@@ -394,6 +453,23 @@ func applyDependencyMaterialization(ctx context.Context, tx *sql.Tx, block index
 	return changed || edgeInserted, nil
 }
 
+func verifyDependencyReceiptAndResolution(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock, material indexer.DependencyMaterialization) error {
+	var resolutionTx, receiptTx, receiptBlock, receiptHash, dependencyKey, homeRoot []byte
+	var receiptTxIndex int64
+	if err := tx.QueryRowContext(ctx, `SELECT resolution.tx_hash,receipt.tx_hash,receipt.block_number,receipt.block_hash,receipt.tx_index,resolution.dependency_key,resolution.home_trust_root
+		FROM request_resolutions resolution JOIN verification_receipts receipt
+		ON receipt.chain_id=resolution.chain_id AND receipt.tx_hash=resolution.tx_hash AND receipt.request_id=resolution.request_id
+		WHERE resolution.request_id=? AND resolution.chain_id=? AND resolution.new_dependency=1`, material.Dependency.RequestID[:], block.ChainID[:]).Scan(&resolutionTx, &receiptTx, &receiptBlock, &receiptHash, &receiptTxIndex, &dependencyKey, &homeRoot); err != nil {
+		return ErrEvidenceBinding
+	}
+	blockHeight, _ := domain.NewBlockHeight(block.Number)
+	locator := material.Evidence.Locator
+	if !equalBytes(resolutionTx, locator.TxHash[:]) || !equalBytes(receiptTx, locator.TxHash[:]) || !equalBytes(receiptBlock, blockHeight[:]) || !equalBytes(receiptHash, block.Hash[:]) || receiptTxIndex != int64(locator.TxIndex) || !equalBytes(dependencyKey, material.Dependency.DependencyKey[:]) || !equalBytes(homeRoot, material.From.Root.Hash[:]) {
+		return ErrEvidenceBinding
+	}
+	return nil
+}
+
 func verifyActiveNodeContent(ctx context.Context, tx *sql.Tx, node trustview.TrustNode) error {
 	persisted, err := loadActiveTrustNode(ctx, tx, node.ID)
 	if err != nil {
@@ -406,8 +482,14 @@ func verifyActiveNodeContent(ctx context.Context, tx *sql.Tx, node trustview.Tru
 }
 
 func verifyDependencyIndexedLog(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock, material indexer.DependencyMaterialization) error {
-	var topicsRaw, data []byte
-	if err := tx.QueryRowContext(ctx, `SELECT topics,data FROM indexed_gateway_logs WHERE chain_id=? AND block_hash=? AND tx_hash=? AND tx_index=? AND log_index=? AND event_topic=?`, block.ChainID[:], block.Hash[:], material.Evidence.Locator.TxHash[:], int64(material.Evidence.Locator.TxIndex), int64(material.Evidence.Locator.LogIndex), chainabi.DependencyRecordedTopic[:]).Scan(&topicsRaw, &data); err != nil {
+	var indexedBlock, indexedHash, indexedTx, topicsRaw, data []byte
+	var indexedTxIndex, indexedLogIndex int64
+	if err := tx.QueryRowContext(ctx, `SELECT block_number,block_hash,tx_hash,tx_index,log_index,topics,data FROM indexed_gateway_logs WHERE chain_id=? AND block_hash=? AND tx_hash=? AND tx_index=? AND log_index=? AND event_topic=?`, block.ChainID[:], block.Hash[:], material.Evidence.Locator.TxHash[:], int64(material.Evidence.Locator.TxIndex), int64(material.Evidence.Locator.LogIndex), chainabi.DependencyRecordedTopic[:]).Scan(&indexedBlock, &indexedHash, &indexedTx, &indexedTxIndex, &indexedLogIndex, &topicsRaw, &data); err != nil {
+		return ErrEvidenceBinding
+	}
+	blockHeight, _ := domain.NewBlockHeight(block.Number)
+	locator := material.Evidence.Locator
+	if !equalBytes(indexedBlock, blockHeight[:]) || !equalBytes(indexedHash, block.Hash[:]) || !equalBytes(indexedTx, locator.TxHash[:]) || indexedTxIndex != int64(locator.TxIndex) || indexedLogIndex != int64(locator.LogIndex) {
 		return ErrEvidenceBinding
 	}
 	if len(topicsRaw)%32 != 0 {

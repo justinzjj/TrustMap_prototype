@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,7 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
@@ -132,6 +135,67 @@ func TestIndexerApplyRemainsAvailableBeforeProcessValidation(t *testing.T) {
 	}
 	if blocks.calls.Load() != 1 || application.Ready() {
 		t.Fatalf("worker calls=%d ready=%t", blocks.calls.Load(), application.Ready())
+	}
+}
+
+func TestDegradeIndexerCursorLatchesProcessFailureBeforePersistence(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "degrade-latch.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	injected := errors.New("degraded row write failed")
+	blocks := &countingIndexerStore{degradeErr: injected}
+	processor := &countingProcessor{}
+	application := &App{database: database, canonicalCursors: store.NewCanonicalCursorRepository(database), indexerRepository: blocks, coordinator: processor}
+	application.ready.Store(true)
+	application.indexerValidated = true
+	chainID, _ := domain.NewChainID(10002)
+
+	if err := application.DegradeIndexerCursor(context.Background(), chainID, "deterministic failure"); !errors.Is(err, injected) {
+		t.Fatalf("degrade error=%v", err)
+	}
+	if application.Ready() {
+		t.Fatal("failed degradation persistence left App ready")
+	}
+	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
+		t.Fatalf("Process after failed degradation persistence error=%v", err)
+	}
+	if calls := processor.calls.Load(); calls != 0 {
+		t.Fatalf("failed degradation persistence entered coordinator %d times", calls)
+	}
+}
+
+func TestConfirmedIndexerFailClosedKeepsGateClosedWhenDegradationPersistenceFails(t *testing.T) {
+	database, err := store.Open(filepath.Join(t.TempDir(), "fail-closed-latch.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	injected := errors.New("degraded row write failed")
+	blocks := &countingIndexerStore{degradeErr: injected}
+	processor := &countingProcessor{}
+	application := &App{database: database, canonicalCursors: store.NewCanonicalCursorRepository(database), indexerRepository: blocks, coordinator: processor}
+	application.ready.Store(true)
+	application.indexerValidated = true
+	chainID, _ := domain.NewChainID(10002)
+	deployment, _ := domain.NewBlockHeight(5)
+	rpc := &invalidDeploymentRPC{chainID: chainID.BigInt(), head: 7, code: []byte{1}}
+	confirmed, err := indexer.NewConfirmedEventIndexer(indexer.ConfirmedEventIndexerConfig{ChainID: chainID, Gateway: common.HexToAddress("0x1"), GatewayCodeHash: crypto.Keccak256Hash([]byte{2}), DeploymentBlock: deployment, Confirmations: 2, MaxBlockRange: 10, MerkleDepth: 8, PathStepCostGas: 30713}, rpc, application, application)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := confirmed.Step(context.Background()); !errors.Is(err, indexer.ErrDeterministicIndexing) || !errors.Is(err, injected) {
+		t.Fatalf("failClosed error=%v", err)
+	}
+	if application.Ready() {
+		t.Fatal("joined failClosed error left App ready")
+	}
+	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
+		t.Fatalf("Process after joined failClosed error=%v", err)
+	}
+	if calls := processor.calls.Load(); calls != 0 {
+		t.Fatalf("joined failClosed error entered coordinator %d times", calls)
 	}
 }
 
@@ -299,15 +363,43 @@ func (store *blockingIndexerStore) ApplyConfirmedBlock(context.Context, indexer.
 func (*blockingIndexerStore) Degrade(context.Context, domain.ChainID, string) error { return nil }
 func (*blockingIndexerStore) HasDegraded(context.Context) (bool, error)             { return false, nil }
 
-type countingIndexerStore struct{ calls atomic.Int32 }
+type countingIndexerStore struct {
+	calls      atomic.Int32
+	degradeErr error
+}
 
 func (*countingIndexerStore) Configure(context.Context, store.IndexerConfig) error { return nil }
 func (store *countingIndexerStore) ApplyConfirmedBlock(context.Context, indexer.ConfirmedBlock) (bool, error) {
 	store.calls.Add(1)
 	return true, nil
 }
-func (*countingIndexerStore) Degrade(context.Context, domain.ChainID, string) error { return nil }
-func (*countingIndexerStore) HasDegraded(context.Context) (bool, error)             { return false, nil }
+func (store *countingIndexerStore) Degrade(context.Context, domain.ChainID, string) error {
+	return store.degradeErr
+}
+func (*countingIndexerStore) HasDegraded(context.Context) (bool, error) { return false, nil }
+
+type invalidDeploymentRPC struct {
+	chainID *big.Int
+	head    uint64
+	code    []byte
+}
+
+func (rpc *invalidDeploymentRPC) BlockNumber(context.Context) (uint64, error) { return rpc.head, nil }
+func (rpc *invalidDeploymentRPC) ChainID(context.Context) (*big.Int, error) {
+	return new(big.Int).Set(rpc.chainID), nil
+}
+func (*invalidDeploymentRPC) HeaderByNumber(_ context.Context, number *big.Int) (*types.Header, error) {
+	return &types.Header{Number: new(big.Int).Set(number), GasLimit: 30_000_000}, nil
+}
+func (rpc *invalidDeploymentRPC) CodeAtHash(context.Context, common.Address, common.Hash) ([]byte, error) {
+	return append([]byte(nil), rpc.code...), nil
+}
+func (*invalidDeploymentRPC) FilterLogs(context.Context, ethereum.FilterQuery) ([]types.Log, error) {
+	return nil, nil
+}
+func (*invalidDeploymentRPC) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
+	return nil, nil
+}
 
 type countingProcessor struct{ calls atomic.Int32 }
 

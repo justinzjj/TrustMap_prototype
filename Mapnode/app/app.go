@@ -49,6 +49,7 @@ type App struct {
 	ready             atomic.Bool
 	operationalMu     sync.RWMutex
 	indexerValidated  bool
+	indexerFailed     bool
 	canonicalCursors  *store.CanonicalCursorRepository
 	planner           *planner.Planner
 	coordinator       requestProcessor
@@ -220,6 +221,9 @@ func (application *App) indexerWorkerGate(ctx context.Context) error {
 	if !application.ready.Load() || application.canonicalCursors == nil || application.coordinator == nil {
 		return ErrOperationalUnavailable
 	}
+	if application.indexerFailed {
+		return ErrOperationalDegraded
+	}
 	degraded, err := application.canonicalCursors.HasDegradedCanonicalCursor(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrOperationalUnavailable, err)
@@ -384,6 +388,7 @@ func (application *App) DegradeIndexerCursor(ctx context.Context, chainID domain
 	if !application.ready.Load() || application.canonicalCursors == nil {
 		return ErrOperationalUnavailable
 	}
+	application.indexerFailed = true
 	if application.indexerRepository == nil {
 		return ErrOperationalUnavailable
 	}
