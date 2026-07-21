@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/app"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 )
 
@@ -58,21 +59,22 @@ func run(arguments []string, stderr io.Writer) int {
 		return 1
 	}
 	runtimeContext, cancelRuntimeValidation := context.WithTimeout(context.Background(), 10*time.Second)
-	err = bootstrap.ValidateRuntime(runtimeContext, config, manifest)
+	application, err := app.Open(runtimeContext, config, manifest)
 	cancelRuntimeValidation()
 	if err != nil {
-		fmt.Fprintf(stderr, "mapnode runtime validation failed: %v\n", err)
+		fmt.Fprintf(stderr, "mapnode runtime validation failed during Phase 3 startup: %v\n", err)
 		return 1
 	}
+	defer application.Close()
 
 	logger := log.New(stderr, "", log.LstdFlags|log.LUTC)
-	logger.Printf("mapnode=%s chain_id=%s phase2 bootstrap; chain indexing/p2p enabled in later phases", config.Name, config.HomeChain.ChainID)
+	logger.Printf("mapnode=%s chain_id=%s Phase 3 durable core ready; live indexing/p2p/transaction execution remain Phase 4", config.Name, config.HomeChain.ChainID)
 	if config.DirectVerifier.Profile.MeasuredDirectCostGas == nil {
 		logger.Printf("mapnode=%s chain_id=%s direct verifier profile=%s is uncalibrated; measured_direct_cost_gas is null", config.Name, config.HomeChain.ChainID, config.DirectVerifier.Profile.ProfileID)
 	}
 	server := &http.Server{
 		Addr:              config.API.Listen,
-		Handler:           bootstrap.NewHealthHandler(true),
+		Handler:           bootstrap.NewHealthHandler(application.Ready()),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	stop := make(chan os.Signal, 1)

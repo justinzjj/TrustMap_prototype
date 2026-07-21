@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
@@ -17,6 +18,27 @@ import (
 type TrustViewRepository struct{ db *DB }
 
 func NewTrustViewRepository(db *DB) *TrustViewRepository { return &TrustViewRepository{db: db} }
+
+// RequireEvidenceReady implements coordinator.EvidenceGate. A request is
+// evidence-ready only when its exact source tuple is represented by a
+// TrustView node backed by active evidence.
+func (repository *TrustViewRepository) RequireEvidenceReady(ctx context.Context, request coordinator.Request) error {
+	if repository == nil || repository.db == nil {
+		return errors.New("nil TrustView repository database")
+	}
+	var count int
+	err := repository.db.sql.QueryRowContext(ctx, `SELECT COUNT(*) FROM trust_nodes n
+		JOIN evidence e ON e.id=n.evidence_id
+		WHERE n.chain_id=? AND n.block_height=? AND n.block_hash=?
+		  AND n.evidence_state='active' AND e.state='active'`, request.SourceChainID[:], request.SourceHeight[:], request.SourceBlockHash[:]).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("load request TrustView evidence: %w", err)
+	}
+	if count != 1 {
+		return ErrInactiveEvidence
+	}
+	return nil
+}
 
 // MergeActiveTrustEdge atomically validates active evidence, merges both
 // TrustRoot-bearing nodes and activates their directed TrustEdge.

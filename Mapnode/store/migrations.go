@@ -494,4 +494,28 @@ CREATE TABLE proof_hops (
     FOREIGN KEY(snapshot_id,to_node_id,block_hash) REFERENCES snapshot_nodes(snapshot_id,node_id,block_hash),
     UNIQUE(proof_id,plan_hop_index)
 ) STRICT;
+
+CREATE TRIGGER prevent_proof_update
+BEFORE UPDATE ON proofs
+BEGIN
+    SELECT RAISE(ABORT,'PathProof is append-only');
+END;
+
+CREATE TRIGGER prevent_proof_delete
+BEFORE DELETE ON proofs
+BEGIN
+    SELECT RAISE(ABORT,'PathProof is append-only');
+END;
+
+CREATE TRIGGER prevent_proof_hop_update
+BEFORE UPDATE ON proof_hops
+BEGIN
+    SELECT RAISE(ABORT,'PathProof hop is append-only');
+END;
+
+CREATE TRIGGER prevent_proof_hop_delete
+BEFORE DELETE ON proof_hops
+BEGIN
+    SELECT RAISE(ABORT,'PathProof hop is append-only');
+END;
 `

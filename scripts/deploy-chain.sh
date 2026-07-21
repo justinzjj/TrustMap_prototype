@@ -163,11 +163,13 @@ jq -n \
     --argjson hash_rounds "$hash_rounds" \
     --argjson measured_direct_cost_gas "$measured_direct_cost_gas" \
     --argjson deployment_block "$deployment_block" \
+	--argjson merkle_depth "$MERKLE_DEPTH" \
     '{
       version: 1,
       status: "deployed",
       chainId: $chain_id,
       deploymentBlock: $deployment_block,
+	  merkleDepth: $merkle_depth,
       gateway: $gateway,
       directVerifier: $direct_verifier,
       profileId: $profile_id,

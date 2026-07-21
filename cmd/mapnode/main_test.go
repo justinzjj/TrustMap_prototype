@@ -116,6 +116,7 @@ func writeRuntimeMismatchFixture(t *testing.T, rpcURL, listen string) string {
   "status": "deployed",
   "chainId": "10001",
   "deploymentBlock": 1,
+  "merkleDepth": 8,
   "gateway": "0x1111111111111111111111111111111111111111",
   "directVerifier": "0x2222222222222222222222222222222222222222",
   "profileId": "runtime-test",

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +70,7 @@ func validFixture(t *testing.T) (string, string) {
   "status": "deployed",
   "chainId": "10001",
   "deploymentBlock": 3,
+  "merkleDepth": 8,
   "gateway": "0x1111111111111111111111111111111111111111",
   "directVerifier": "0x2222222222222222222222222222222222222222",
   "profileId": "local-2x3",
@@ -477,6 +479,23 @@ func TestLoadValidatedRejectsManifestChainMismatch(t *testing.T) {
 	}
 	if _, _, err := LoadValidated(configPath); err == nil || !strings.Contains(err.Error(), "chainId") {
 		t.Fatalf("expected chain mismatch error, got %v", err)
+	}
+}
+
+func TestLoadValidatedRequiresDeploymentFixedMerkleDepth(t *testing.T) {
+	configPath, manifestPath := validFixture(t)
+	body, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, replacement := range []string{`"merkleDepth": 0`, `"merkleDepth": 33`} {
+		changed := regexp.MustCompile(`"merkleDepth": 8`).ReplaceAll(body, []byte(replacement))
+		if err := os.WriteFile(manifestPath, changed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := LoadValidated(configPath); err == nil || !strings.Contains(err.Error(), "merkleDepth") {
+			t.Fatalf("LoadValidated accepted %s: %v", replacement, err)
+		}
 	}
 }
 

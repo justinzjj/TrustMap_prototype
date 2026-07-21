@@ -93,6 +93,7 @@ type DeploymentManifest struct {
 	Status                string     `json:"status"`
 	ChainID               string     `json:"chainId"`
 	DeploymentBlock       uint64     `json:"deploymentBlock"`
+	MerkleDepth           uint8      `json:"merkleDepth"`
 	Gateway               string     `json:"gateway"`
 	DirectVerifier        string     `json:"directVerifier"`
 	ProfileID             string     `json:"profileId"`
@@ -302,6 +303,9 @@ func validateManifest(chainID string, manifest DeploymentManifest) error {
 	}
 	if manifest.DeploymentBlock == 0 {
 		return errors.New("deploymentBlock must be positive")
+	}
+	if manifest.MerkleDepth == 0 || manifest.MerkleDepth > 32 {
+		return errors.New("merkleDepth must be between 1 and 32")
 	}
 	if !addressPattern.MatchString(manifest.Gateway) || !addressPattern.MatchString(manifest.DirectVerifier) {
 		return errors.New("gateway and directVerifier must be 20-byte hex addresses")

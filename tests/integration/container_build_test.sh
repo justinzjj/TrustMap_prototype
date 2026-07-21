@@ -74,6 +74,8 @@ assert_contains "$repo_root/docker/mapnode.Dockerfile" 'ARG DISTROLESS_IMAGE=gcr
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'CGO_ENABLED=0'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY Mapnode ./Mapnode'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY internal/directprofile ./internal/directprofile'
+assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY internal/domain ./internal/domain'
+assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY internal/proof ./internal/proof'
 assert_not_contains "$repo_root/docker/mapnode.Dockerfile" 'internal/mapnodebootstrap'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'USER nonroot:nonroot'
 assert_contains "$repo_root/docker/mapnode.Dockerfile" 'COPY --from=build --chown=nonroot:nonroot /out/runtime /runtime'
@@ -299,7 +301,7 @@ PATH="$fake_bin:$PATH" RPC_URL=http://geth:8545 CHAIN_ID=10001 MERKLE_DEPTH=8 \
     AUTHORIZED_SIGNERS_FILE="$deploy_case/profile.json" DEPLOYER_KEYSTORE="$deploy_case/deployer.json" \
     DEPLOYER_PASSWORD_FILE="$deploy_case/deployer-password" MANIFEST_PATH="$manifest" \
     sh "$repo_root/scripts/deploy-chain.sh" >"$test_tmp/deploy-success.out" 2>&1
-jq -e '.status == "deployed" and .chainId == "10001" and .profileId == "local-cost-2x3" and .signatureChecks == 2 and .hashRounds == 3 and .measuredDirectCostGas == null and (.authorizedSigners | length) == 2' "$manifest" >/dev/null || fail "deployment manifest content is invalid"
+jq -e '.status == "deployed" and .chainId == "10001" and .merkleDepth == 8 and .profileId == "local-cost-2x3" and .signatureChecks == 2 and .hashRounds == 3 and .measuredDirectCostGas == null and (.authorizedSigners | length) == 2' "$manifest" >/dev/null || fail "deployment manifest content is invalid"
 [ "$(stat -c '%a' "$manifest")" = 644 ] || fail "deployment manifest mode is not 0644"
 if grep -R -F 'test-only-deploy-secret' "$test_tmp" --exclude='deployer-password' --exclude='signer-password-*' --exclude='*.json' >/dev/null; then
     fail "deploy script exposed a secret"
