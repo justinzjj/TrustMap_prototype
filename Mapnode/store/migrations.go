@@ -152,13 +152,20 @@ CREATE TABLE requests (
 CREATE TABLE request_transitions (
     sequence INTEGER PRIMARY KEY,
     request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32),
-    from_state TEXT NOT NULL CHECK(length(from_state)>0),
-    to_state TEXT NOT NULL CHECK(length(to_state)>0),
+    from_state TEXT NOT NULL CHECK(from_state IN ('observed','evidence_ready','planned','proof_ready','rejected','retryable','replanned','direct_fallback')),
+    to_state TEXT NOT NULL CHECK(to_state IN ('observed','evidence_ready','planned','proof_ready','rejected','retryable','replanned','direct_fallback')),
     reason TEXT NOT NULL DEFAULT '',
     changed_at INTEGER NOT NULL CHECK(changed_at > 0),
     FOREIGN KEY(request_id) REFERENCES requests(id) ON DELETE CASCADE,
     UNIQUE(request_id,from_state,to_state)
 ) STRICT;
+
+CREATE TABLE graph_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    revision INTEGER NOT NULL CHECK(revision >= 0)
+) STRICT;
+
+INSERT INTO graph_state(singleton,revision) VALUES(1,0);
 
 CREATE TABLE trust_nodes (
     node_id BLOB PRIMARY KEY CHECK(typeof(node_id)='blob' AND length(node_id)=32),
@@ -189,9 +196,16 @@ CREATE TABLE trust_edges (
 
 CREATE TABLE trustview_snapshots (
     snapshot_id BLOB PRIMARY KEY CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
+    graph_revision INTEGER NOT NULL CHECK(graph_revision >= 0),
     home_chain_id BLOB NOT NULL CHECK(typeof(home_chain_id)='blob' AND length(home_chain_id)=32),
     home_trust_root BLOB NOT NULL CHECK(typeof(home_trust_root)='blob' AND length(home_trust_root)=32),
-    created_at INTEGER NOT NULL CHECK(created_at > 0)
+    start_node_id BLOB CHECK(start_node_id IS NULL OR (typeof(start_node_id)='blob' AND length(start_node_id)=32)),
+    target_node_id BLOB CHECK(target_node_id IS NULL OR (typeof(target_node_id)='blob' AND length(target_node_id)=32)),
+    sealed INTEGER NOT NULL DEFAULT 0 CHECK(sealed IN (0,1)),
+    created_at INTEGER NOT NULL CHECK(created_at > 0),
+    CHECK(sealed=0 OR (start_node_id IS NOT NULL AND target_node_id IS NOT NULL)),
+    FOREIGN KEY(snapshot_id,start_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(snapshot_id,target_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id) DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 
 CREATE TABLE snapshot_nodes (
@@ -211,10 +225,66 @@ CREATE TABLE snapshot_edges (
     from_node_id BLOB NOT NULL CHECK(typeof(from_node_id)='blob' AND length(from_node_id)=32),
     to_node_id BLOB NOT NULL CHECK(typeof(to_node_id)='blob' AND length(to_node_id)=32),
     evidence_id BLOB NOT NULL CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
+    witness_id BLOB NOT NULL CHECK(typeof(witness_id)='blob' AND length(witness_id)=32),
     path_step_cost INTEGER NOT NULL CHECK(path_step_cost >= 0),
     PRIMARY KEY(snapshot_id,edge_id),
-    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id) ON DELETE CASCADE
+    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id) ON DELETE CASCADE,
+    FOREIGN KEY(snapshot_id,from_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
+    FOREIGN KEY(snapshot_id,to_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
+    FOREIGN KEY(evidence_id) REFERENCES evidence(id),
+    FOREIGN KEY(witness_id) REFERENCES membership_witnesses(witness_id)
 ) STRICT;
+
+CREATE TRIGGER prevent_sealed_snapshot_update
+BEFORE UPDATE ON trustview_snapshots
+WHEN OLD.sealed=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot is immutable');
+END;
+
+CREATE TRIGGER prevent_sealed_snapshot_node_insert
+BEFORE INSERT ON snapshot_nodes
+WHEN (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=NEW.snapshot_id)=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot nodes are immutable');
+END;
+
+CREATE TRIGGER prevent_sealed_snapshot_node_update
+BEFORE UPDATE ON snapshot_nodes
+WHEN (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=OLD.snapshot_id)=1
+  OR (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=NEW.snapshot_id)=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot nodes are immutable');
+END;
+
+CREATE TRIGGER prevent_sealed_snapshot_node_delete
+BEFORE DELETE ON snapshot_nodes
+WHEN (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=OLD.snapshot_id)=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot nodes are immutable');
+END;
+
+CREATE TRIGGER prevent_sealed_snapshot_edge_insert
+BEFORE INSERT ON snapshot_edges
+WHEN (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=NEW.snapshot_id)=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot edges are immutable');
+END;
+
+CREATE TRIGGER prevent_sealed_snapshot_edge_update
+BEFORE UPDATE ON snapshot_edges
+WHEN (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=OLD.snapshot_id)=1
+  OR (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=NEW.snapshot_id)=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot edges are immutable');
+END;
+
+CREATE TRIGGER prevent_sealed_snapshot_edge_delete
+BEFORE DELETE ON snapshot_edges
+WHEN (SELECT sealed FROM trustview_snapshots WHERE snapshot_id=OLD.snapshot_id)=1
+BEGIN
+    SELECT RAISE(ABORT,'sealed snapshot edges are immutable');
+END;
 
 CREATE TABLE membership_witnesses (
     witness_id BLOB PRIMARY KEY CHECK(typeof(witness_id)='blob' AND length(witness_id)=32),
@@ -232,25 +302,76 @@ CREATE TABLE membership_witness_siblings (
     FOREIGN KEY(witness_id) REFERENCES membership_witnesses(witness_id) ON DELETE CASCADE
 ) STRICT;
 
+CREATE TRIGGER prevent_global_witness_update
+BEFORE UPDATE ON membership_witnesses
+BEGIN
+    SELECT RAISE(ABORT,'global witness is immutable');
+END;
+
+CREATE TRIGGER prevent_global_witness_delete
+BEFORE DELETE ON membership_witnesses
+BEGIN
+    SELECT RAISE(ABORT,'global witness is immutable');
+END;
+
+CREATE TRIGGER prevent_global_witness_sibling_update
+BEFORE UPDATE ON membership_witness_siblings
+BEGIN
+    SELECT RAISE(ABORT,'global witness sibling is immutable');
+END;
+
+CREATE TRIGGER prevent_global_witness_sibling_delete
+BEFORE DELETE ON membership_witness_siblings
+BEGIN
+    SELECT RAISE(ABORT,'global witness sibling is immutable');
+END;
+
+CREATE TRIGGER prevent_referenced_witness_sibling_insert
+BEFORE INSERT ON membership_witness_siblings
+WHEN EXISTS(SELECT 1 FROM snapshot_edges WHERE witness_id=NEW.witness_id)
+BEGIN
+    SELECT RAISE(ABORT,'snapshot-referenced witness is sealed');
+END;
+
 CREATE TABLE plans (
     plan_id BLOB PRIMARY KEY CHECK(typeof(plan_id)='blob' AND length(plan_id)=32),
     request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32),
     snapshot_id BLOB NOT NULL CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
+    profile_id TEXT NOT NULL CHECK(length(profile_id)>0),
+    profile_fingerprint BLOB NOT NULL CHECK(typeof(profile_fingerprint)='blob' AND length(profile_fingerprint)=32),
+    attempt INTEGER NOT NULL CHECK(attempt >= 0),
     plan_type TEXT NOT NULL CHECK(plan_type IN ('path','direct')),
+    home_node_id BLOB NOT NULL CHECK(typeof(home_node_id)='blob' AND length(home_node_id)=32),
+    target_node_id BLOB NOT NULL CHECK(typeof(target_node_id)='blob' AND length(target_node_id)=32),
+    hop_count INTEGER NOT NULL CHECK(hop_count >= 0),
+    path_step_cost INTEGER NOT NULL CHECK(path_step_cost >= 0),
     path_cost INTEGER CHECK(path_cost IS NULL OR path_cost >= 0),
     direct_cost INTEGER CHECK(direct_cost IS NULL OR direct_cost >= 0),
     fallback_reason TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL CHECK(created_at > 0),
     FOREIGN KEY(request_id) REFERENCES requests(id),
-    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id)
+    FOREIGN KEY(snapshot_id) REFERENCES trustview_snapshots(snapshot_id),
+    FOREIGN KEY(snapshot_id,home_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
+    FOREIGN KEY(snapshot_id,target_node_id) REFERENCES snapshot_nodes(snapshot_id,node_id),
+    UNIQUE(request_id,attempt),
+    UNIQUE(plan_id,snapshot_id)
 ) STRICT;
+
+CREATE TRIGGER require_sealed_snapshot_for_plan
+BEFORE INSERT ON plans
+WHEN COALESCE((SELECT sealed FROM trustview_snapshots WHERE snapshot_id=NEW.snapshot_id),0)<>1
+BEGIN
+    SELECT RAISE(ABORT,'plan requires a sealed snapshot');
+END;
 
 CREATE TABLE plan_hops (
     plan_id BLOB NOT NULL CHECK(typeof(plan_id)='blob' AND length(plan_id)=32),
+    snapshot_id BLOB NOT NULL CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
     hop_index INTEGER NOT NULL CHECK(hop_index >= 0),
     edge_id BLOB NOT NULL CHECK(typeof(edge_id)='blob' AND length(edge_id)=32),
     PRIMARY KEY(plan_id,hop_index),
-    FOREIGN KEY(plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE
+    FOREIGN KEY(plan_id,snapshot_id) REFERENCES plans(plan_id,snapshot_id) ON DELETE CASCADE,
+    FOREIGN KEY(snapshot_id,edge_id) REFERENCES snapshot_edges(snapshot_id,edge_id)
 ) STRICT;
 
 CREATE TABLE request_current_plan (

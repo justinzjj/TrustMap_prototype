@@ -32,8 +32,15 @@ func TestOpenEnablesWALForeignKeysAndCreatesCompleteV1Schema(t *testing.T) {
 	if foreignKeys != 1 {
 		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
 	}
+	var recursiveTriggers int
+	if err := db.sql.QueryRow("PRAGMA recursive_triggers").Scan(&recursiveTriggers); err != nil {
+		t.Fatal(err)
+	}
+	if recursiveTriggers != 1 {
+		t.Fatalf("recursive_triggers = %d, want 1", recursiveTriggers)
+	}
 	wantTables := []string{
-		"schema_migrations", "evidence", "evidence_transitions", "requests", "request_transitions",
+		"schema_migrations", "evidence", "evidence_transitions", "requests", "request_transitions", "graph_state",
 		"trust_nodes", "trust_edges", "trustview_snapshots", "snapshot_nodes", "snapshot_edges",
 		"membership_witnesses", "membership_witness_siblings", "plans", "plan_hops",
 		"request_current_plan", "proofs", "proof_hops",
@@ -53,6 +60,204 @@ func TestOpenEnablesWALForeignKeysAndCreatesCompleteV1Schema(t *testing.T) {
 	}
 	if version != 1 {
 		t.Fatalf("migration version = %d, want 1", version)
+	}
+}
+
+func TestRequestTransitionHistoryUsesPhase3StateEnum(t *testing.T) {
+	db := openTestDB(t)
+	request := testRequest(t)
+	if _, _, err := NewRequestRepository(db).Observe(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{"submitted", "confirmed", "arbitrary"} {
+		_, err := db.sql.Exec(`INSERT INTO request_transitions(
+			request_id,from_state,to_state,reason,changed_at
+		) VALUES(?,?,?,'',1)`, request.ID[:], invalid, coordinator.Observed)
+		if err == nil {
+			t.Fatalf("request transition from_state %q accepted", invalid)
+		}
+		_, err = db.sql.Exec(`INSERT INTO request_transitions(
+			request_id,from_state,to_state,reason,changed_at
+		) VALUES(?,?,?,'',1)`, request.ID[:], coordinator.Observed, invalid)
+		if err == nil {
+			t.Fatalf("request transition to_state %q accepted", invalid)
+		}
+	}
+}
+
+func TestSnapshotAndPlanSchemaEnforcesFrozenSameSnapshotReferences(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	evidenceRecord := testEvidenceRecord(t, false)
+	if _, _, err := NewEvidenceRepository(db).Observe(ctx, evidenceRecord); err != nil {
+		t.Fatal(err)
+	}
+	request := testRequest(t)
+	if _, _, err := NewRequestRepository(db).Observe(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+
+	var revision int64
+	if err := db.sql.QueryRow("SELECT revision FROM graph_state WHERE singleton=1").Scan(&revision); err != nil {
+		t.Fatalf("load graph_state singleton: %v", err)
+	}
+	if revision != 0 {
+		t.Fatalf("initial graph revision = %d, want 0", revision)
+	}
+
+	witnessID := blob32(0x71)
+	if _, err := db.sql.Exec(`INSERT INTO membership_witnesses(
+		witness_id,evidence_id,leaf_index,created_at
+	) VALUES(?,?,0,1)`, witnessID, evidenceRecord.ID[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.Exec("UPDATE membership_witnesses SET leaf_index=1 WHERE witness_id=?", witnessID); err == nil {
+		t.Fatal("global witness core fields remained overwritable")
+	}
+	if _, err := db.sql.Exec(`INSERT OR REPLACE INTO membership_witnesses(
+		witness_id,evidence_id,leaf_index,created_at
+	) VALUES(?,?,1,1)`, witnessID, evidenceRecord.ID[:]); err == nil {
+		t.Fatal("global witness was overwritten with INSERT OR REPLACE")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO membership_witness_siblings(
+		witness_id,sibling_index,sibling_hash
+	) VALUES(?,0,zeroblob(32))`, witnessID); err != nil {
+		t.Fatalf("insert witness sibling before snapshot use: %v", err)
+	}
+
+	snapshotA, snapshotB := blob32(0xa1), blob32(0xb1)
+	homeA, targetA := blob32(0xa2), blob32(0xa3)
+	homeB, targetB := blob32(0xb2), blob32(0xb3)
+	chainID, _ := domain.NewChainID(99)
+	height, _ := domain.NewBlockHeight(100)
+	for _, snapshot := range [][]byte{snapshotA, snapshotB} {
+		if _, err := db.sql.Exec(`INSERT INTO trustview_snapshots(
+			snapshot_id,graph_revision,home_chain_id,home_trust_root,start_node_id,target_node_id,sealed,created_at
+		) VALUES(?,0,?,zeroblob(32),NULL,NULL,0,1)`, snapshot, chainID[:]); err != nil {
+			t.Fatalf("insert unsealed snapshot: %v", err)
+		}
+	}
+	for _, row := range []struct{ snapshot, node []byte }{
+		{snapshotA, homeA}, {snapshotA, targetA}, {snapshotB, homeB}, {snapshotB, targetB},
+	} {
+		if _, err := db.sql.Exec(`INSERT INTO snapshot_nodes(
+			snapshot_id,node_id,chain_id,block_height,block_hash,trust_root
+		) VALUES(?,?,?,?,zeroblob(32),zeroblob(32))`, row.snapshot, row.node, chainID[:], height[:]); err != nil {
+			t.Fatalf("insert snapshot node: %v", err)
+		}
+	}
+	if _, err := db.sql.Exec("UPDATE trustview_snapshots SET sealed=1 WHERE snapshot_id=?", snapshotA); err == nil {
+		t.Fatal("sealed snapshot without endpoints accepted")
+	}
+	if _, err := db.sql.Exec(`UPDATE trustview_snapshots
+		SET start_node_id=?,target_node_id=?,sealed=1 WHERE snapshot_id=?`, homeA, targetB, snapshotA); err == nil {
+		t.Fatal("snapshot accepted endpoint from another snapshot")
+	}
+
+	edgeA, edgeB := blob32(0xe1), blob32(0xe2)
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
+	) VALUES(?,?,?,?,?,?,1)`, snapshotA, edgeA, homeA, targetA, evidenceRecord.ID[:], witnessID); err != nil {
+		t.Fatalf("insert snapshot A edge: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO membership_witness_siblings(
+		witness_id,sibling_index,sibling_hash
+	) VALUES(?,1,zeroblob(32))`, witnessID); err == nil {
+		t.Fatal("snapshot-referenced witness accepted another sibling")
+	}
+	if _, err := db.sql.Exec(`INSERT OR REPLACE INTO membership_witness_siblings(
+		witness_id,sibling_index,sibling_hash
+	) VALUES(?,0,?)`, witnessID, blob32(0x72)); err == nil {
+		t.Fatal("snapshot-referenced witness sibling was overwritten")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
+	) VALUES(?,?,?,?,?,?,1)`, snapshotB, edgeB, homeB, targetB, evidenceRecord.ID[:], witnessID); err != nil {
+		t.Fatalf("insert snapshot B edge: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
+	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xe3), homeA, targetB, evidenceRecord.ID[:], witnessID); err == nil {
+		t.Fatal("snapshot edge accepted node from another snapshot")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_edges(
+		snapshot_id,edge_id,from_node_id,to_node_id,evidence_id,witness_id,path_step_cost
+	) VALUES(?,?,?,?,?,?,1)`, snapshotA, blob32(0xe4), homeA, targetA, evidenceRecord.ID[:], blob32(0xff)); err == nil {
+		t.Fatal("snapshot edge accepted missing witness")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plans(
+		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at
+	) VALUES(?,?,?,?,?,99,'path',?,?,1,1,1,3000096,'',1)`,
+		blob32(0xca), request.ID[:], snapshotA, "pow-spv-3m", blob32(0xcb), homeA, targetA,
+	); err == nil {
+		t.Fatal("plan accepted an unsealed snapshot")
+	}
+	if _, err := db.sql.Exec(`UPDATE trustview_snapshots
+		SET start_node_id=?,target_node_id=?,sealed=1 WHERE snapshot_id=?`, homeA, targetA, snapshotA); err != nil {
+		t.Fatalf("seal snapshot A: %v", err)
+	}
+	if _, err := db.sql.Exec(`UPDATE trustview_snapshots
+		SET start_node_id=?,target_node_id=?,sealed=1 WHERE snapshot_id=?`, homeB, targetB, snapshotB); err != nil {
+		t.Fatalf("seal snapshot B: %v", err)
+	}
+	if _, err := db.sql.Exec("UPDATE trustview_snapshots SET graph_revision=1 WHERE snapshot_id=?", snapshotA); err == nil {
+		t.Fatal("sealed snapshot remained mutable")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO snapshot_nodes(
+		snapshot_id,node_id,chain_id,block_height,block_hash,trust_root
+	) VALUES(?,?,?,?,zeroblob(32),zeroblob(32))`, snapshotA, blob32(0xa4), chainID[:], height[:]); err == nil {
+		t.Fatal("sealed snapshot accepted another node")
+	}
+
+	if _, err := db.sql.Exec(`INSERT INTO plans(
+		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at
+	) VALUES(?,?,?,?,?,1,'path',?,?,1,1,1,3000096,'',1)`,
+		blob32(0xc0), request.ID[:], snapshotA, "pow-spv-3m", blob32(0xc2), homeB, targetA,
+	); err == nil {
+		t.Fatal("plan accepted home node from another snapshot")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plans(
+		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at
+	) VALUES(?,?,?,?,?,2,'path',?,?,1,1,1,3000096,'',1)`,
+		blob32(0xcf), request.ID[:], snapshotA, "pow-spv-3m", make([]byte, 31), homeA, targetA,
+	); err == nil {
+		t.Fatal("plan accepted non-32-byte profile fingerprint")
+	}
+
+	planID := blob32(0xc1)
+	if _, err := db.sql.Exec(`INSERT INTO plans(
+		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at
+	) VALUES(?,?,?,?,?,0,'path',?,?,1,1,1,3000096,'',1)`,
+		planID, request.ID[:], snapshotA, "pow-spv-3m", blob32(0xc2), homeA, targetA,
+	); err != nil {
+		t.Fatalf("insert plan: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plan_hops(
+		plan_id,snapshot_id,hop_index,edge_id
+	) VALUES(?,?,0,?)`, planID, snapshotB, edgeB); err == nil {
+		t.Fatal("plan hop accepted edge from another snapshot")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plan_hops(
+		plan_id,snapshot_id,hop_index,edge_id
+	) VALUES(?,?,0,?)`, planID, snapshotA, edgeB); err == nil {
+		t.Fatal("plan hop accepted nonexistent edge in plan snapshot")
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plan_hops(
+		plan_id,snapshot_id,hop_index,edge_id
+	) VALUES(?,?,0,?)`, planID, snapshotA, edgeA); err != nil {
+		t.Fatalf("insert same-snapshot plan hop: %v", err)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO plans(
+		plan_id,request_id,snapshot_id,profile_id,profile_fingerprint,attempt,plan_type,
+		home_node_id,target_node_id,hop_count,path_step_cost,path_cost,direct_cost,fallback_reason,created_at
+	) VALUES(?,?,?,?,?,0,'direct',?,?,0,1,NULL,3000096,'no_path',1)`,
+		blob32(0xce), request.ID[:], snapshotA, "pow-spv-3m", blob32(0xcd), homeA, targetA,
+	); err == nil {
+		t.Fatal("duplicate request planning attempt accepted")
 	}
 }
 
@@ -345,4 +550,12 @@ func countRows(t *testing.T, db *sql.DB, table string) int {
 
 func maxUint256() *big.Int {
 	return new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 256), big.NewInt(1))
+}
+
+func blob32(fill byte) []byte {
+	value := make([]byte, 32)
+	for index := range value {
+		value[index] = fill
+	}
+	return value
 }

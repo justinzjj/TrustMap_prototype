@@ -36,6 +36,7 @@ func Open(path string) (*DB, error) {
 	query.Add("_pragma", "foreign_keys(1)")
 	query.Add("_pragma", "busy_timeout(5000)")
 	query.Add("_pragma", "journal_mode(WAL)")
+	query.Add("_pragma", "recursive_triggers(1)")
 	query.Set("_txlock", "immediate")
 	dsnURL.RawQuery = query.Encode()
 
