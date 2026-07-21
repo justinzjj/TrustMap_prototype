@@ -712,16 +712,22 @@ TrustMap_prototype/
 ├── cmd/
 │   ├── mapnode/
 │   └── trustmapctl/
-├── internal/
-│   ├── api/
-│   ├── chain/
-│   ├── config/
+├── Mapnode/
+│   ├── bootstrap/
+│   ├── registry/
+│   ├── store/
 │   ├── evidence/
-│   ├── executor/
-│   ├── p2p/
+│   ├── trustview/
 │   ├── planner/
 │   ├── proof/
-│   └── trustview/
+│   ├── coordinator/
+│   ├── app/
+│   └── chain, indexer, reorg, p2p, executor, api (Phase 4)
+├── internal/
+│   ├── config/
+│   ├── domain/
+│   ├── proof/
+│   └── topology/
 ├── contracts/
 │   ├── script/
 │   ├── src/
@@ -746,7 +752,9 @@ TrustMap_prototype/
 └── runtime/
 ```
 
-现有空目录不会决定最终包结构。Go 入口采用 `cmd/`，内部实现采用职责清晰的 `internal/` 包。
+`cmd/mapnode` 只保留薄进程入口；真实 MapNode 服务实现位于 `Mapnode/`。
+`internal/` 只保留 topology/config 和可被多层复用的 domain/Merkle 原语。
+详细迁移边界见 `2026-07-21-mapnode-source-layout-design.md`。
 
 ## 15. 论文可追踪性
 

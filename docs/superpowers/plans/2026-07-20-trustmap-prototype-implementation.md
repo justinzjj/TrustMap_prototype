@@ -10,6 +10,23 @@
 
 ---
 
+## Execution status audited on 2026-07-21
+
+- Phase 1 is complete.
+- Phase 2 is complete as a topology, Docker and MapNode bootstrap skeleton.
+  It does not contain the functional MapNode described in later phases.
+- The `pow-spv-3m` DirectVerifier calibration is a cross-phase strengthening
+  task: it completes the cost input needed by the Phase 3 Planner, but it is not
+  itself Phase 3.
+- Phase 3 is the current phase and had not started at the time of this audit.
+- Phases 4, 5 and 6 have not started, apart from reusable prerequisites produced
+  by earlier phases.
+
+The functional MapNode source root is `Mapnode/`; `cmd/mapnode` is a thin entry
+point. See `../specs/2026-07-21-mapnode-source-layout-design.md`.
+
+---
+
 ## Phase 1: Repository foundation and public contracts
 
 ### Deliverables
@@ -84,6 +101,9 @@ Review generated three-chain and 21-chain Compose models, especially block times
 - Immutable graph snapshots and cost-bounded shortest-path planner.
 - Go Merkle mirror and recursive PathProof builder matching Solidity.
 - Persistent request state machine and DirectPlan fallback reasons.
+- Functional source packages under `Mapnode/`; migrate the Phase 2 bootstrap
+  from `internal/mapnodebootstrap` to `Mapnode/bootstrap` without retaining a
+  duplicate implementation.
 
 ### Parallel allocation
 
@@ -95,7 +115,7 @@ Review generated three-chain and 21-chain Compose models, especially block times
 ### Verification
 
 ```bash
-go test ./internal/domain ./internal/store/... ./internal/trustview ./internal/planner ./internal/proof ./internal/coordinator -race
+go test ./internal/domain ./internal/proof ./Mapnode/... -race
 go vet ./...
 git diff --check
 ```
