@@ -1,0 +1,32 @@
+.git
+.gitignore
+.dockerignore
+
+# Generated runtime contains local keystores, passwords, databases, and chain state.
+runtime
+
+# Local research/project-management material is not part of container builds.
+0-记录
+98-材料
+99-项目记忆
+
+# Generated build and test output.
+bin
+build
+coverage
+dist
+contracts/broadcast
+contracts/cache
+contracts/out
+internal/contracts/generated
+
+# Editor and local environment files.
+.env
+.env.*
+.idea
+.vscode
+*.db
+*.db-*
+*.prof
+*.test
+coverage.*

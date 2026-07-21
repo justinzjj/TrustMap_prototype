@@ -4,6 +4,7 @@
 
 - 状态：已确认设计
 - 日期：2026-07-20
+- 最近更新：2026-07-21（固定实验 DirectVerifier 的可校准成本 profile）
 - 目标仓库：`TrustMap_prototype`
 - 规范来源：TrustMap 论文中的 Overview、TrustMap、Security Analysis 与 Implementation and Evaluation
 - 实现参考：`TrustMap-ETH`
@@ -160,6 +161,11 @@ defaults:
   block_period_seconds: 3
   confirmations: 2
   merkle_depth: 8
+  direct_verifier:
+    profile_id: committee-3
+    authorized_signer_count: 3
+    signature_checks: 3
+    hash_rounds: 4
 chains:
   - name: chain-a
     chain_id: 10001
@@ -299,9 +305,21 @@ interface IDirectVerifier {
 }
 ```
 
-首版实验 verifier 可以复用旧代码的签名开销模拟思想，但必须：
+首版实验实现命名为 `ExperimentalCostedDirectVerifier`。它采用“真实签名闭环 + 可校准开销模拟”，部署时固定：
+
+- `authorizedSigners[]`；
+- `signatureChecks`；
+- `hashRounds`；
+- topology 中稳定的 `profileId`。
+
+DirectProof 编码 `sourceTrustRoot + signatures[]`。合约先对完整验证上下文执行 `hashRounds` 轮链式 Keccak，再验证部署 profile 指定数量的真实签名。`signatureChecks` 与 `hashRounds` 不从 proof 读取，提交者不能降低开销。首版 topology 为每个被检查签名生成独立的本地实验 signer，且要求 `signatureChecks <= authorizedSigners.length`。
+
+该 verifier 可以复用旧代码的签名开销模拟思想，但必须：
 
 - 明确命名为开发/实验 verifier；
+- 保留 source chain、height、block hash、source TrustRoot、home chain、verifier 和 Gateway 的完整签名上下文绑定；
+- 只接受部署时授权 signer 的有效真实签名，不使用空签名或无效签名模拟 Gas；
+- 通过 Gas 校准测试把 profile 映射到论文使用的 SPV、委员会验证等成本区间；
 - 不能直接写 TrustRoot；
 - 不能提供任意设置当前 TrustRoot 的生产接口；
 - 通过相同 Gateway 流程发出完整事件；
@@ -409,11 +427,13 @@ Planner 在数据库一致性快照上运行：
 2. 只遍历 active edges。
 3. 运行带 cost cutoff 的 Dijkstra。
 4. 计算 `pathCost = hopCount * pathStepCost`，或使用配置中的等价逐边成本。
-5. 查询目标链对应 DirectVerifier 的 `directCost`。
+5. 读取目标链部署清单中同一 DirectVerifier profile 的实测 `directCost`；未校准或 profile 不匹配时不得猜测成本。
 6. 当且仅当路径存在、证明材料可获得且 `pathCost <= directCost` 时输出 PathPlan。
 7. 其他情况输出 DirectPlan，并记录 fallback reason。
 
 首版不加入论文 Discussion 中的链风险权重、allowlist 或 minimum assurance 扩展；这些属于后续兼容扩展，不能改变首版论文成本模型。
+
+`directCost` 必须来自与链上 `profileId`、`signatureChecks`、`hashRounds` 和授权 signer 数量一致的 Gas 校准结果。MapNode 不接受请求提交者提供的成本值，也不把实验 profile 的签名数量解释为真实轻客户端安全等级。
 
 ### 8.8 Proof Builder
 
@@ -601,6 +621,10 @@ Foundry 单元、fuzz 和 invariant 测试覆盖：
 - 重复 dependency 幂等；
 - request 不能被重复解决；
 - DirectVerifier 失败不更新 TrustRoot；
+- Costed DirectVerifier 的 profile 在部署后不可降低；
+- 每个被检查签名都真实有效，并绑定完整请求、链和 Gateway 上下文；
+- 错误 signer、签名数量、hash rounds/profile、跨链或跨 Gateway replay 均失败；
+- Gas 校准 profile 覆盖论文采用的 DirectPlan 成本区间；
 - PathVerifier 失败不更新 TrustRoot；
 - 无任意管理员 TrustRoot setter；
 - tree capacity 与部署 depth 一致。

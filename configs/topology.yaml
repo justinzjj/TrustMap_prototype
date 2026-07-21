@@ -1,0 +1,27 @@
+version: 1
+network_name: trustmap-dev
+defaults:
+  geth_image: ethereum/client-go:v1.17.3
+  foundry_image: ghcr.io/foundry-rs/foundry:v1.4.4
+  block_period_seconds: 3
+  confirmations: 2
+  merkle_depth: 8
+  direct_verifier:
+    profile_id: committee-3
+    authorized_signer_count: 3
+    signature_checks: 3
+    hash_rounds: 4
+  host_ports:
+    base: 18545
+    stride: 100
+chains:
+  - name: chain-a
+    chain_id: 31337
+  - name: chain-b
+    chain_id: 31338
+  - name: chain-c
+    chain_id: 31339
+    block_period_seconds: 5
+mapnodes:
+  p2p_enabled: true
+  database: sqlite
