@@ -55,3 +55,8 @@ Thumbs.db
 # Fixtures are source-controlled test inputs, even when they resemble artifacts.
 !/tests/fixtures/
 !/tests/fixtures/**
+
+# 项目管理文件
+0-记录/**
+98-材料/**
+99-项目记忆/**
