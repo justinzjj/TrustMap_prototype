@@ -63,6 +63,7 @@ assert_contains "$repo_root/docker/geth-entrypoint.sh" '--ws.api eth,net,web3'
 assert_contains "$repo_root/docker/geth-entrypoint.sh" '--ipcdisable'
 assert_contains "$repo_root/docker/geth-entrypoint.sh" '--nodiscover'
 assert_contains "$repo_root/docker/geth-healthcheck.sh" 'String(net.version)'
+assert_contains "$repo_root/docker/geth-healthcheck.sh" 'eth.chainId()'
 assert_contains "$repo_root/docker/geth-healthcheck.sh" 'ws://127.0.0.1:8546'
 if grep -E -- '--unlock|--allow-insecure-unlock' "$repo_root/docker/geth-entrypoint.sh" >/dev/null; then
     fail "geth entrypoint must rely on dev-mode account handling"

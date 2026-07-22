@@ -18,6 +18,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	mapapi "github.com/justinzjj/TrustMap_prototype/Mapnode/api"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/chain"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
@@ -320,6 +321,49 @@ func (application *App) Ready() bool {
 	application.operationalMu.RLock()
 	defer application.operationalMu.RUnlock()
 	return application.operationalGate(context.Background()) == nil
+}
+
+func (application *App) OperationalStatus(ctx context.Context) mapapi.OperationalStatus {
+	if application == nil {
+		return mapapi.OperationalStatus{Reason: ErrOperationalUnavailable.Error()}
+	}
+	application.operationalMu.RLock()
+	defer application.operationalMu.RUnlock()
+	err := application.operationalGate(ctx)
+	status := mapapi.OperationalStatus{Ready: err == nil, Degraded: errors.Is(err, ErrOperationalDegraded)}
+	if err != nil {
+		status.Reason = err.Error()
+	}
+	return status
+}
+
+func (application *App) RequestStatus(ctx context.Context, id domain.RequestID) (mapapi.RequestStatus, bool, error) {
+	request, err := application.Requests.Load(ctx, id)
+	if errors.Is(err, store.ErrRecordNotFound) {
+		return mapapi.RequestStatus{}, false, nil
+	}
+	if err != nil {
+		return mapapi.RequestStatus{}, false, err
+	}
+	status := mapapi.RequestStatus{RequestID: id, PhaseState: request.State, Reason: request.Reason}
+	if plan, planErr := application.Plans.LoadCurrentPlan(ctx, id); planErr == nil {
+		status.Attempt, status.PlanType, status.HopCount, status.FallbackReason = plan.Attempt, plan.Type, len(plan.Hops), plan.FallbackReason
+	} else if !errors.Is(planErr, planner.ErrPlanNotFound) {
+		return mapapi.RequestStatus{}, false, planErr
+	}
+	if submission, submissionErr := application.TransactionSubmissions.LoadLatestForRequest(ctx, id); submissionErr == nil {
+		status.Attempt, status.PlanType, status.ExecutionState, status.TxHash = submission.Attempt, submission.PlanType, submission.State, submission.TxHash
+		if submission.Reason != "" {
+			status.Reason = submission.Reason
+		}
+	} else if !errors.Is(submissionErr, store.ErrRecordNotFound) {
+		return mapapi.RequestStatus{}, false, submissionErr
+	}
+	return status, true, nil
+}
+
+func (application *App) CurrentTrustView(ctx context.Context) (trustview.TrustView, error) {
+	return application.TrustView.CurrentTrustView(ctx)
 }
 
 func (application *App) Process(ctx context.Context, work coordinator.Work) (coordinator.Result, error) {

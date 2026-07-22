@@ -76,6 +76,13 @@ func (repository *TransactionRepository) LoadActive(ctx context.Context, request
 	return scanTransactionSubmission(repository.db.sql.QueryRowContext(ctx, transactionSubmissionSelect+` WHERE request_id=? AND state IN ('prepared','submitted','retryable') ORDER BY attempt DESC LIMIT 1`, requestID[:]))
 }
 
+func (repository *TransactionRepository) LoadLatestForRequest(ctx context.Context, requestID domain.RequestID) (executor.TransactionSubmission, error) {
+	if repository == nil || repository.db == nil {
+		return executor.TransactionSubmission{}, errors.New("nil transaction repository database")
+	}
+	return scanTransactionSubmission(repository.db.sql.QueryRowContext(ctx, transactionSubmissionSelect+` WHERE request_id=? ORDER BY attempt DESC LIMIT 1`, requestID[:]))
+}
+
 func (repository *TransactionRepository) ListRecoverable(ctx context.Context) ([]executor.TransactionSubmission, error) {
 	if repository == nil || repository.db == nil {
 		return nil, errors.New("nil transaction repository database")

@@ -19,6 +19,83 @@ type TrustViewRepository struct{ db *DB }
 
 func NewTrustViewRepository(db *DB) *TrustViewRepository { return &TrustViewRepository{db: db} }
 
+func (repository *TrustViewRepository) CurrentTrustView(ctx context.Context) (trustview.TrustView, error) {
+	if repository == nil || repository.db == nil {
+		return trustview.TrustView{}, errors.New("nil TrustView repository database")
+	}
+	var revision int64
+	if err := repository.db.sql.QueryRowContext(ctx, `SELECT revision FROM graph_state WHERE singleton=1`).Scan(&revision); err != nil {
+		return trustview.TrustView{}, err
+	}
+	nodeRows, err := repository.db.sql.QueryContext(ctx, `SELECT n.node_id,n.chain_id,n.block_height,n.block_hash,n.trust_root,n.evidence_id FROM trust_nodes n JOIN evidence e ON e.id=n.evidence_id WHERE n.evidence_state='active' AND e.state='active' ORDER BY n.node_id`)
+	if err != nil {
+		return trustview.TrustView{}, err
+	}
+	var nodes []trustview.TrustNode
+	for nodeRows.Next() {
+		var node trustview.TrustNode
+		var id, chainID, height, blockHash, root, evidenceID []byte
+		if err := nodeRows.Scan(&id, &chainID, &height, &blockHash, &root, &evidenceID); err != nil {
+			_ = nodeRows.Close()
+			return trustview.TrustView{}, err
+		}
+		for _, item := range []struct {
+			to, from []byte
+			label    string
+		}{{node.ID[:], id, "node"}, {node.Key.ChainID[:], chainID, "chain"}, {node.Key.Height[:], height, "height"}, {node.Key.BlockHash[:], blockHash, "block hash"}, {node.Root.Hash[:], root, "root"}, {node.EvidenceID[:], evidenceID, "evidence"}} {
+			if err := copyExact(item.to, item.from, item.label); err != nil {
+				_ = nodeRows.Close()
+				return trustview.TrustView{}, err
+			}
+		}
+		nodes = append(nodes, node)
+	}
+	if err := nodeRows.Err(); err != nil {
+		_ = nodeRows.Close()
+		return trustview.TrustView{}, err
+	}
+	_ = nodeRows.Close()
+	edgeRows, err := repository.db.sql.QueryContext(ctx, `SELECT edge_id,from_node_id,to_node_id,evidence_id,dependency_leaf_index,path_step_cost,(SELECT witness_id FROM membership_witnesses w WHERE w.evidence_id=g.evidence_id) FROM trust_edges g JOIN evidence e ON e.id=g.evidence_id WHERE g.active=1 AND e.state='active' ORDER BY edge_id`)
+	if err != nil {
+		return trustview.TrustView{}, err
+	}
+	var edges []trustview.TrustEdge
+	for edgeRows.Next() {
+		var edge trustview.TrustEdge
+		var id, from, to, evidenceID, witness []byte
+		var leaf, cost int64
+		if err := edgeRows.Scan(&id, &from, &to, &evidenceID, &leaf, &cost, &witness); err != nil {
+			_ = edgeRows.Close()
+			return trustview.TrustView{}, err
+		}
+		for _, item := range []struct {
+			to, from []byte
+			label    string
+		}{{edge.ID[:], id, "edge"}, {edge.From[:], from, "from"}, {edge.To[:], to, "to"}, {edge.EvidenceID[:], evidenceID, "evidence"}} {
+			if err := copyExact(item.to, item.from, item.label); err != nil {
+				_ = edgeRows.Close()
+				return trustview.TrustView{}, err
+			}
+		}
+		edge.LeafIndex, edge.PathStepCost = uint32(leaf), uint64(cost)
+		if witness != nil {
+			var value trustview.WitnessID
+			if err := copyExact(value[:], witness, "witness"); err != nil {
+				_ = edgeRows.Close()
+				return trustview.TrustView{}, err
+			}
+			edge.WitnessID = &value
+		}
+		edges = append(edges, edge)
+	}
+	if err := edgeRows.Err(); err != nil {
+		_ = edgeRows.Close()
+		return trustview.TrustView{}, err
+	}
+	_ = edgeRows.Close()
+	return trustview.NewTrustView(uint64(revision), nodes, edges)
+}
+
 // RequireEvidenceReady implements coordinator.EvidenceGate. A request is
 // evidence-ready only when its exact source tuple is represented by a
 // TrustView node backed by active evidence.

@@ -16,6 +16,7 @@ func TestExampleTopologiesRenderOneToOne(t *testing.T) {
 		chainCount int
 	}{
 		{"topology.yaml", 3},
+		{"topology-2.yaml", 2},
 		{"topology-21.yaml", 21},
 	}
 	for _, tc := range tests {

@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	mapapi "github.com/justinzjj/TrustMap_prototype/Mapnode/api"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/app"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 )
@@ -69,34 +70,37 @@ func run(arguments []string, stderr io.Writer) int {
 	defer application.Close()
 
 	logger := log.New(stderr, "", log.LstdFlags|log.LUTC)
-	logger.Printf("mapnode=%s chain_id=%s confirmed Gateway indexer and dependency evidence gossip configured; transaction execution remains deferred", config.Name, config.HomeChain.ChainID)
+	logger.Printf("mapnode=%s chain_id=%s confirmed Gateway indexer, dependency evidence gossip, and serialized transaction executor configured", config.Name, config.HomeChain.ChainID)
 	if config.DirectVerifier.Profile.MeasuredDirectCostGas == nil {
 		logger.Printf("mapnode=%s chain_id=%s direct verifier profile=%s is uncalibrated; measured_direct_cost_gas is null", config.Name, config.HomeChain.ChainID, config.DirectVerifier.Profile.ProfileID)
 	}
 	server := &http.Server{
 		Addr:              config.API.Listen,
-		Handler:           bootstrap.NewDynamicHealthHandler(application.Ready),
+		Handler:           mapapi.NewHandler(application),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	workerContext, cancelWorker := context.WithCancel(context.Background())
-	workerCount := 1
-	workerDone := make(chan error, 2)
-	go func() {
-		err := application.RunConfirmedIndexer(workerContext)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			logger.Printf("confirmed Gateway indexer stopped: %v", err)
-		}
-		workerDone <- err
-	}()
-	if config.P2P.Enabled {
-		workerCount++
+	workerCount := 2
+	workerDone := make(chan error, 3)
+	criticalExit := make(chan error, 1)
+	runWorker := func(name string, worker func(context.Context) error) {
 		go func() {
-			err := application.RunDependencyEvidenceWorkers(workerContext)
+			err := worker(workerContext)
 			if err != nil && !errors.Is(err, context.Canceled) {
-				logger.Printf("dependency evidence workers stopped: %v", err)
+				logger.Printf("%s stopped: %v", name, err)
 			}
 			workerDone <- err
+			select {
+			case criticalExit <- err:
+			default:
+			}
 		}()
+	}
+	runWorker("confirmed Gateway indexer", application.RunConfirmedIndexer)
+	runWorker("serialized request executor", application.RunRequestWorker)
+	if config.P2P.Enabled {
+		workerCount++
+		runWorker("dependency evidence workers", application.RunDependencyEvidenceWorkers)
 	}
 	defer func() {
 		cancelWorker()
@@ -112,6 +116,17 @@ func run(arguments []string, stderr io.Writer) int {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
+	}()
+	go func() {
+		select {
+		case <-workerContext.Done():
+			return
+		case <-criticalExit:
+			cancelWorker()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(ctx)
+		}
 	}()
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Printf("HTTP server failed: %v", err)
