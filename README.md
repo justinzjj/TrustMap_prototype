@@ -229,17 +229,16 @@ PROFILE=prototype-calibrated \
 
 ### Full 245,000-message replay
 
-The complete historical trace is **not currently stored in this repository**. The repository contains only small test fixtures. For local compatibility, `scripts/replay-full.sh` looks for the read-only sibling path `../TrustMap-ETH/Dune/output_202512/msg.csv` by default. Open-source users must provide the trace explicitly:
+The repository includes the canonical 245,000-row trace at `data/dune/2025-12/processed/msg.csv`. `scripts/replay-full.sh` uses that file and its published SHA-256 digest by default, so the exact replay can be started directly:
 
 ```sh
-TRACE_PATH=/absolute/path/to/msg.csv \
 RUN_ROOT=/absolute/path/to/replay-runs \
 SETTINGS='B0 B1 B2 B3' \
 PROFILE=legacy-v4.1 \
 ./scripts/replay-full.sh
 ```
 
-Equivalent flags are available:
+Use `TRACE_PATH` or `--trace` only for an intentional custom input. Equivalent flags are available:
 
 ```sh
 ./scripts/replay-full.sh \
@@ -249,7 +248,14 @@ Equivalent flags are available:
   --profile legacy-v4.1
 ```
 
-The project provides the Dune query used to obtain the experimental data. Because of repository size constraints, the complete raw dataset and the prepared full trace are not included; users can run the query to obtain the data or supply an existing prepared trace through `TRACE_PATH`.
+The [replay dataset workflow](data/README.md) documents provenance, the manifest, local raw-page acquisition, and byte-for-byte reproduction. Verify the tracked canonical publication with the standard-library checker:
+
+```sh
+python3 data/dune/scripts/verify_dataset.py \
+  --manifest data/dune/manifests/bridge-flows-2025-12.json
+```
+
+Raw Dune pages remain ignored local acquisition material. When they are present, append `--raw-dir data/dune/2025-12/raw` to verify their manifest inventory too.
 
 For the canonical prepared trace, the checker expects:
 

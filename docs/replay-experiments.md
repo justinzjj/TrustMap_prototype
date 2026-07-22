@@ -46,10 +46,10 @@ PROFILE=prototype-calibrated ./scripts/replay-smoke.sh
 
 ## Full 245,000-message replay
 
-By default the full script reads the local, read-only legacy trace from the
-sibling path `../TrustMap-ETH/Dune/output_202512/msg.csv`. It never writes to
-`TrustMap-ETH`. Override it with `TRACE_PATH` or `--trace` when the dataset is
-stored elsewhere.
+By default the full script reads the repository-owned canonical trace at
+`data/dune/2025-12/processed/msg.csv` and requires its published digest.
+Override it with `TRACE_PATH` or `--trace` only for an intentional custom
+dataset.
 
 ```sh
 ./scripts/replay-full.sh --profile legacy-v4.1
@@ -58,6 +58,20 @@ stored elsewhere.
 TRACE_PATH=/data/msg.csv RUN_ROOT=/data/runs \
 SETTINGS='B0 B1 B2 B3' PROFILE=legacy-v4.1 \
 ./scripts/replay-full.sh
+```
+
+Dataset provenance, manifest semantics, safe local acquisition, and exact
+preparation instructions are in the [replay dataset workflow](../data/README.md).
+The tracked trace can be checked without third-party Python packages:
+
+```sh
+python3 data/dune/scripts/verify_dataset.py \
+  --manifest data/dune/manifests/bridge-flows-2025-12.json
+
+# Also authenticate ignored local raw pages when available
+python3 data/dune/scripts/verify_dataset.py \
+  --manifest data/dune/manifests/bridge-flows-2025-12.json \
+  --raw-dir data/dune/2025-12/raw
 ```
 
 The exact default run verifies the input SHA-256 digest, 245,000 prepared rows,
@@ -111,10 +125,12 @@ container paths.
 docker build -f docker/mapnode.Dockerfile -t trustmap-mapnode .
 docker run --rm --entrypoint /mapnode \
   -v "$PWD/runtime/replay.yaml:/config/replay.yaml:ro" \
-  -v "/data/traces:/input:ro" \
+  -v "$PWD/data/dune/2025-12/processed/msg.csv:/input/msg.csv:ro" \
   -v "$PWD/runtime/replay-output:/output" \
   trustmap-mapnode replay --config /config/replay.yaml
 ```
 
-In that example, the config must use `/input/...` for `input_trace` and
-`/output` for `run_root`.
+In that example, the config must use `/input/msg.csv` for `input_trace` and
+`/output` for `run_root`. The input mount is the repository-owned canonical
+file and is read-only; all writable replay state remains under ignored
+`runtime/`.

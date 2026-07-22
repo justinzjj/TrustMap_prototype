@@ -12,7 +12,7 @@ yaml_quote() {
     yaml_value=$(printf '%s' "$yaml_value" | sed "s/'/''/g")
     printf "'%s'" "$yaml_value"
 }
-default_trace=$repo_root/../TrustMap-ETH/Dune/output_202512/msg.csv
+default_trace=$repo_root/data/dune/2025-12/processed/msg.csv
 legacy_digest=ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175
 trace_was_overridden=0
 if [ "${TRACE_PATH+x}" = x ]; then trace_was_overridden=1; fi

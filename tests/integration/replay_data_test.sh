@@ -1080,4 +1080,82 @@ expect_downloader_failure "curl failure" run_downloader fail_partial \
 [ "$(cat "$failure_dir.sha256")" = "preexisting inventory" ]
 [ "$(find "$failure_dir" -type f | wc -l)" -eq 1 ]
 
+fake_mapnode=$fixture_root/fake-mapnode
+cat >"$fake_mapnode" <<'SH'
+#!/bin/sh
+set -eu
+
+[ "$#" -eq 3 ]
+[ "$1" = replay ]
+[ "$2" = --config ]
+cp "$3" "$FAKE_CONFIG_CAPTURE"
+SH
+chmod +x "$fake_mapnode"
+
+default_replay_config=$fixture_root/default-replay.yaml
+env -u TRACE_PATH -u EXPECTED_DIGEST -u CHECK_GOLDEN \
+  MAPNODE_BIN=$fake_mapnode FAKE_CONFIG_CAPTURE=$default_replay_config \
+  RUN_ROOT=$fixture_root/default-replay-run SETTINGS=B0 \
+  sh "$repo_root/scripts/replay-full.sh" >/dev/null
+grep -Fqx "input_trace: '$repo_root/data/dune/2025-12/processed/msg.csv'" \
+  "$default_replay_config" || {
+    echo "replay-full default trace is not the repository canonical dataset" >&2
+    grep '^input_trace:' "$default_replay_config" >&2
+    exit 1
+  }
+grep -Fqx 'expected_digest: ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175' \
+  "$default_replay_config" || {
+    echo "replay-full default trace is missing the canonical digest" >&2
+    exit 1
+  }
+
+custom_trace=$repo_root/tests/fixtures/replay/planner-smoke-3chain.csv
+custom_replay_config=$fixture_root/custom-replay.yaml
+env -u TRACE_PATH -u EXPECTED_DIGEST -u CHECK_GOLDEN \
+  MAPNODE_BIN=$fake_mapnode FAKE_CONFIG_CAPTURE=$custom_replay_config \
+  RUN_ROOT=$fixture_root/custom-replay-run SETTINGS=B0 \
+  sh "$repo_root/scripts/replay-full.sh" --trace "$custom_trace" >/dev/null
+grep -Fqx "input_trace: '$custom_trace'" "$custom_replay_config" || {
+  echo "replay-full trace override did not reach the generated config" >&2
+  exit 1
+}
+if grep -q '^expected_digest:' "$custom_replay_config"; then
+  echo "custom replay trace silently inherited the canonical digest" >&2
+  exit 1
+fi
+
+custom_digest=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+custom_digest_config=$fixture_root/custom-digest-replay.yaml
+env -u CHECK_GOLDEN \
+  TRACE_PATH=$custom_trace EXPECTED_DIGEST=$custom_digest \
+  MAPNODE_BIN=$fake_mapnode FAKE_CONFIG_CAPTURE=$custom_digest_config \
+  RUN_ROOT=$fixture_root/custom-digest-replay-run SETTINGS=B0 \
+  sh "$repo_root/scripts/replay-full.sh" >/dev/null
+grep -Fqx "input_trace: '$custom_trace'" "$custom_digest_config" || {
+  echo "replay-full TRACE_PATH override did not reach the generated config" >&2
+  exit 1
+}
+grep -Fqx "expected_digest: $custom_digest" "$custom_digest_config" || {
+  echo "replay-full custom digest did not reach the generated config" >&2
+  exit 1
+}
+
+active_replay_files="
+$repo_root/scripts/replay-full.sh
+$repo_root/README.md
+$repo_root/README.zh-CN.md
+$repo_root/docs/replay-experiments.md
+$repo_root/data/README.md
+"
+for active_file in $active_replay_files; do
+  if grep -Fq -- '../TrustMap-ETH' "$active_file"; then
+    echo "active replay file retains a sibling-repository fallback: $active_file" >&2
+    exit 1
+  fi
+  if grep -Eiq -- 'full trace (is )?(absent|not stored|not included)|complete historical trace is .*not .*stored|prepared full trace (is|are) not included|full trace.*尚未存|完整历史轨迹.*尚未存|预处理后的全量轨迹.*不.*提供' "$active_file"; then
+    echo "active replay file says the canonical full trace is absent: $active_file" >&2
+    exit 1
+  fi
+done
+
 echo "replay dataset verification integration test passed"

@@ -229,17 +229,16 @@ PROFILE=prototype-calibrated \
 
 ### 245,000 条消息的全量回放
 
-完整历史轨迹目前**尚未存入本仓库**，仓库仅包含小规模测试 fixture。为兼容当前本地实验，`scripts/replay-full.sh` 默认以只读方式查找相邻路径 `../TrustMap-ETH/Dune/output_202512/msg.csv`。开源使用者需要显式提供轨迹：
+仓库已包含规范的 245,000 行轨迹 `data/dune/2025-12/processed/msg.csv`。`scripts/replay-full.sh` 默认使用该文件及其已发布的 SHA-256，因此可以直接启动精确回放：
 
 ```sh
-TRACE_PATH=/absolute/path/to/msg.csv \
 RUN_ROOT=/absolute/path/to/replay-runs \
 SETTINGS='B0 B1 B2 B3' \
 PROFILE=legacy-v4.1 \
 ./scripts/replay-full.sh
 ```
 
-也可使用等价参数：
+仅在有意使用自定义输入时才设置 `TRACE_PATH` 或 `--trace`。也可使用等价参数：
 
 ```sh
 ./scripts/replay-full.sh \
@@ -249,7 +248,14 @@ PROFILE=legacy-v4.1 \
   --profile legacy-v4.1
 ```
 
-项目提供了用于获取实验数据的 Dune Query 脚本。受仓库体积限制，不直接提供完整原始数据和预处理后的全量轨迹；使用者可以运行 Query 获取数据，或通过 `TRACE_PATH` 指定已有的预处理轨迹。
+[回放数据工作流](data/README.md)说明了数据来源、manifest、本地原始页获取方法以及逐字节重建步骤。可用仅依赖 Python 标准库的校验器验证仓库中的规范数据：
+
+```sh
+python3 data/dune/scripts/verify_dataset.py \
+  --manifest data/dune/manifests/bridge-flows-2025-12.json
+```
+
+Dune 原始页仍是被忽略的本地获取材料；本地存在原始页时，可追加 `--raw-dir data/dune/2025-12/raw` 校验其 manifest 清单。
 
 对于规范的预处理轨迹，校验器期望：
 
