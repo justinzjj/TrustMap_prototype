@@ -656,21 +656,35 @@ func (application *App) RunDependencyEvidenceWorkers(ctx context.Context) error 
 	if application == nil || application.DependencyEvidenceGossip == nil {
 		return ErrOperationalUnavailable
 	}
+	workers := []func(context.Context) error{
+		application.DependencyEvidenceGossip.Run,
+		application.RunRemoteDependencyEvidence,
+	}
+	if application.staticBootstrap != nil {
+		workers = append(workers, application.staticBootstrap.Run)
+	}
+	return application.runDependencyEvidenceSupervisor(ctx, workers...)
+}
+
+func (application *App) runDependencyEvidenceSupervisor(ctx context.Context, workers ...func(context.Context) error) error {
+	if application == nil || len(workers) == 0 {
+		return ErrOperationalUnavailable
+	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	workerCount := 2
-	if application.staticBootstrap != nil {
-		workerCount++
-	}
-	done := make(chan error, workerCount)
-	go func() { done <- application.DependencyEvidenceGossip.Run(workerCtx) }()
-	go func() { done <- application.RunRemoteDependencyEvidence(workerCtx) }()
-	if application.staticBootstrap != nil {
-		go func() { done <- application.staticBootstrap.Run(workerCtx) }()
+	done := make(chan error, len(workers))
+	for _, worker := range workers {
+		worker := worker
+		go func() { done <- worker(workerCtx) }()
 	}
 	err := <-done
+	if ctx.Err() == nil {
+		application.operationalMu.Lock()
+		application.p2pFailed = true
+		application.operationalMu.Unlock()
+	}
 	cancel()
-	for range workerCount - 1 {
+	for range len(workers) - 1 {
 		otherErr := <-done
 		if errors.Is(err, context.Canceled) && !errors.Is(otherErr, context.Canceled) {
 			err = otherErr
@@ -679,12 +693,6 @@ func (application *App) RunDependencyEvidenceWorkers(ctx context.Context) error 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if errors.Is(err, context.Canceled) {
-		return err
-	}
-	application.operationalMu.Lock()
-	application.p2pFailed = true
-	application.operationalMu.Unlock()
 	return err
 }
 

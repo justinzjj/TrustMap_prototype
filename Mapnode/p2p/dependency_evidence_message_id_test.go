@@ -10,7 +10,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-func TestDependencyEnvelopeMessageIDBindsCanonicalIDToSignedSender(t *testing.T) {
+func TestDependencyEnvelopeMessageIDBindsCanonicalEnvelopeToSignedSenderAndPublication(t *testing.T) {
 	envelope := testEnvelope(t)
 	encoded, err := envelope.MarshalBinary()
 	if err != nil {
@@ -24,10 +24,15 @@ func TestDependencyEnvelopeMessageIDBindsCanonicalIDToSignedSender(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	genuine := dependencyEnvelopeMessageID(&pb.Message{From: []byte(envelope.OriginPeer), Data: encoded})
-	copied := dependencyEnvelopeMessageID(&pb.Message{From: []byte(copyPeer), Data: encoded})
-	if genuine != string(envelope.MessageID[:]) {
-		t.Fatalf("genuine message ID=%x want canonical=%x", genuine, envelope.MessageID)
+	genuine := dependencyEnvelopeMessageID(&pb.Message{From: []byte(envelope.OriginPeer), Seqno: []byte{1}, Data: encoded})
+	samePublication := dependencyEnvelopeMessageID(&pb.Message{From: []byte(envelope.OriginPeer), Seqno: []byte{1}, Data: encoded})
+	republished := dependencyEnvelopeMessageID(&pb.Message{From: []byte(envelope.OriginPeer), Seqno: []byte{2}, Data: encoded})
+	copied := dependencyEnvelopeMessageID(&pb.Message{From: []byte(copyPeer), Seqno: []byte{1}, Data: encoded})
+	if genuine != samePublication {
+		t.Fatal("the same signed publication produced different GossipSub message IDs")
+	}
+	if republished == genuine {
+		t.Fatal("periodic canonical republish was suppressed as the original GossipSub publication")
 	}
 	if copied == genuine {
 		t.Fatal("copied envelope occupied the genuine sender's canonical message ID")

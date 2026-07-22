@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -227,6 +228,50 @@ func TestIndexerPublishesOnlyActiveDependencyThroughAtomicOutboxHook(t *testing.
 	}
 }
 
+func TestEvidenceOutboxPublishedRowsBecomeEligibleForDurableRepair(t *testing.T) {
+	ctx := context.Background()
+	fixture := newDependencyApplyFixture(t)
+	origin := tmp2pTestEnvelope(t).OriginPeer
+	outbox := NewEvidenceOutboxRepository(fixture.db)
+	fixture.repository.ConfigureEvidenceOutbox(outbox, origin)
+	if _, err := fixture.repository.ApplyConfirmedBlock(ctx, fixture.block); err != nil {
+		t.Fatal(err)
+	}
+	items, err := outbox.Pending(ctx, 1, time.Now().Add(time.Second))
+	if err != nil || len(items) != 1 {
+		t.Fatalf("initial pending=%+v err=%v", items, err)
+	}
+	repairAt := time.Now().UTC().Add(time.Hour)
+	if err := outbox.MarkPublished(ctx, items[0].Envelope.MessageID, repairAt); err != nil {
+		t.Fatal(err)
+	}
+	if early, err := outbox.Pending(ctx, 1, repairAt.Add(-time.Nanosecond)); err != nil || len(early) != 0 {
+		t.Fatalf("published row repaired early=%+v err=%v", early, err)
+	}
+	due, err := outbox.Pending(ctx, 1, repairAt.Add(time.Nanosecond))
+	if err != nil || len(due) != 1 || due[0].Envelope.MessageID != items[0].Envelope.MessageID {
+		t.Fatalf("due published repair=%+v err=%v", due, err)
+	}
+	var state string
+	if err := fixture.db.sql.QueryRow("SELECT state FROM evidence_outbox WHERE message_id=?", items[0].Envelope.MessageID[:]).Scan(&state); err != nil || state != "published" {
+		t.Fatalf("published repair state=%q err=%v", state, err)
+	}
+	retryAt := repairAt.Add(time.Hour)
+	if err := outbox.MarkRetryable(ctx, items[0].Envelope.MessageID, "router unavailable", retryAt); err != nil {
+		t.Fatal(err)
+	}
+	var publishedAt any
+	if err := fixture.db.sql.QueryRow("SELECT state,published_at FROM evidence_outbox WHERE message_id=?", items[0].Envelope.MessageID[:]).Scan(&state, &publishedAt); err != nil || state != "pending" || publishedAt != nil {
+		t.Fatalf("retryable repair state=%q published_at=%v err=%v", state, publishedAt, err)
+	}
+	if early, err := outbox.Pending(ctx, 1, retryAt.Add(-time.Nanosecond)); err != nil || len(early) != 0 {
+		t.Fatalf("retryable repair ran early=%+v err=%v", early, err)
+	}
+	if due, err := outbox.Pending(ctx, 1, retryAt.Add(time.Nanosecond)); err != nil || len(due) != 1 {
+		t.Fatalf("retryable repair due=%+v err=%v", due, err)
+	}
+}
+
 func TestIndexerNeverPublishesEvidenceActivatedOutsideItsConfirmedBlockTransaction(t *testing.T) {
 	ctx := context.Background()
 	fixture := newDependencyApplyFixture(t)
@@ -338,11 +383,12 @@ func TestRestartedPendingOutboxWaitsForLateStaticPeerAndTopicRouterBeforePublish
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		received, receiveErr := receiverInbox.Pending(ctx, 10, time.Now().Add(time.Hour))
-		pending, pendingErr := outbox.Pending(ctx, 10, time.Now().Add(time.Hour))
-		if receiveErr == nil && pendingErr == nil && len(received) == 1 && len(pending) == 0 {
+		dueNow, pendingErr := outbox.Pending(ctx, 10, time.Now().UTC())
+		if receiveErr == nil && pendingErr == nil && len(received) == 1 && len(dueNow) == 0 {
 			var state string
-			if err := restarted.sql.QueryRow("SELECT state FROM evidence_outbox").Scan(&state); err != nil || state != "published" || !bootstrapReady.Load() {
-				t.Fatalf("published state=%q ready=%t err=%v", state, bootstrapReady.Load(), err)
+			var nextAttemptAt int64
+			if err := restarted.sql.QueryRow("SELECT state,next_attempt_at FROM evidence_outbox").Scan(&state, &nextAttemptAt); err != nil || state != "published" || nextAttemptAt <= time.Now().UTC().UnixNano() || !bootstrapReady.Load() {
+				t.Fatalf("published state=%q next_attempt_at=%d ready=%t err=%v", state, nextAttemptAt, bootstrapReady.Load(), err)
 			}
 			cancel()
 			for range 3 {
@@ -357,6 +403,147 @@ func TestRestartedPendingOutboxWaitsForLateStaticPeerAndTopicRouterBeforePublish
 	var state string
 	_ = restarted.sql.QueryRow("SELECT state FROM evidence_outbox").Scan(&state)
 	t.Fatalf("late static peer did not receive restarted pending outbox message: bootstrap_ready=%t connectedness=%s outbox_state=%s", bootstrapReady.Load(), publisherHost.Network().Connectedness(receiverID), state)
+}
+
+func TestPublishedOutboxCrashWindowRepublishesCanonicalEnvelopeAfterRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture := newDependencyApplyFixture(t)
+	publisherKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisherID, _ := peer.IDFromPrivateKey(publisherKey)
+	outbox := NewEvidenceOutboxRepository(fixture.db)
+	fixture.repository.ConfigureEvidenceOutbox(outbox, publisherID)
+	if _, err := fixture.repository.ApplyConfirmedBlock(ctx, fixture.block); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := outbox.PendingEnvelopes(ctx, 1, time.Now().Add(time.Second))
+	if err != nil || len(initial) != 1 {
+		t.Fatalf("initial outbox=%+v err=%v", initial, err)
+	}
+	canonical, err := initial[0].MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preCrashHost, err := libp2p.New(libp2p.Identity(publisherKey), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outbox.MarkPublished(ctx, initial[0].MessageID, time.Now().UTC().Add(100*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := preCrashHost.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var sequence int
+	var databaseName, databasePath string
+	if err := fixture.db.sql.QueryRow("PRAGMA database_list").Scan(&sequence, &databaseName, &databasePath); err != nil || databasePath == "" {
+		t.Fatalf("database path=%q err=%v", databasePath, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	restartedOutbox := NewEvidenceOutboxRepository(restarted)
+	var restartedCanonical []byte
+	if err := restarted.sql.QueryRow("SELECT envelope FROM evidence_outbox WHERE message_id=?", initial[0].MessageID[:]).Scan(&restartedCanonical); err != nil || !bytes.Equal(restartedCanonical, canonical) {
+		t.Fatalf("restarted canonical envelope changed=%t err=%v", !bytes.Equal(restartedCanonical, canonical), err)
+	}
+	publisherHost, err := libp2p.New(libp2p.Identity(publisherKey), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisherHost.Close()
+	receiverKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverID, _ := peer.IDFromPrivateKey(receiverKey)
+	receiverHost, err := libp2p.New(libp2p.Identity(receiverKey), libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverHost.Close()
+	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reservation.Addr().(*net.TCPAddr).Port
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listenAddress, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverDatabase, err := Open(filepath.Join(t.TempDir(), "receiver.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverDatabase.Close()
+	receiverInbox := NewEvidenceInboxRepository(receiverDatabase)
+	var bootstrapReady atomic.Bool
+	publisher, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisherHost, NewEvidenceInboxRepository(restarted), restartedOutbox, tmp2p.GossipConfig{PublishInterval: 10 * time.Millisecond, PublishTimeout: 250 * time.Millisecond, RepublishInterval: 50 * time.Millisecond, PublishReady: bootstrapReady.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := tmp2p.NewDependencyEvidenceGossip(ctx, receiverHost, receiverInbox, nil, tmp2p.GossipConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = publisher.Close()
+		_ = receiver.Close()
+	}()
+	bootstrapper, err := tmp2p.NewStaticBootstrapper(publisherHost, []peer.AddrInfo{{ID: receiverID, Addrs: []ma.Multiaddr{listenAddress}}}, tmp2p.StaticBootstrapConfig{RetryInterval: 25 * time.Millisecond, DialTimeout: 2 * time.Second}, bootstrapReady.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runErrors := make(chan error, 3)
+	go func() { runErrors <- publisher.Run(ctx) }()
+	go func() { runErrors <- receiver.Run(ctx) }()
+	go func() { runErrors <- bootstrapper.Run(ctx) }()
+	time.Sleep(300 * time.Millisecond)
+	if countTable(t, receiverDatabase, "evidence_inbox") != 0 {
+		t.Fatal("crash-window envelope reached receiver before its static peer was available")
+	}
+	if err := receiverHost.Network().Listen(listenAddress); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		received, receiveErr := receiverInbox.Pending(ctx, 10, time.Now().Add(time.Hour))
+		if receiveErr == nil && len(received) == 1 && received[0].Envelope.MessageID == initial[0].MessageID {
+			var state string
+			var attempts int
+			var stored []byte
+			if err := restarted.sql.QueryRow("SELECT state,attempts,envelope FROM evidence_outbox WHERE message_id=?", initial[0].MessageID[:]).Scan(&state, &attempts, &stored); err != nil {
+				t.Fatal(err)
+			}
+			if state != "published" || attempts < 2 || !bytes.Equal(stored, canonical) {
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+			if countTable(t, receiverDatabase, "evidence_inbox") != 1 {
+				t.Fatal("periodic redelivery created duplicate receiver inbox rows")
+			}
+			cancel()
+			for range 3 {
+				if err := <-runErrors; !errors.Is(err, context.Canceled) {
+					t.Fatalf("worker shutdown=%v", err)
+				}
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("published crash-window envelope was not durably repaired after restart")
 }
 
 func testStoreEnvelope(t *testing.T) tmp2p.DependencyEvidenceEnvelope {

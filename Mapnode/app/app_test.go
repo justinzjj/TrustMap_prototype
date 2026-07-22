@@ -90,6 +90,52 @@ func TestOpenComposesPersistentP2PAndP2PFailureClosesOperationalGate(t *testing.
 	}
 }
 
+func TestDependencyEvidenceSupervisorLatchesFailureBeforeBlockedSiblingReturns(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	application, err := Open(context.Background(), config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer application.Close()
+	application.indexerValidated = true
+	if !application.Ready() {
+		t.Fatal("fixture app is not initially ready")
+	}
+	injected := errors.New("gossip worker failed")
+	releaseSibling := make(chan struct{})
+	siblingStarted := make(chan struct{})
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- application.runDependencyEvidenceSupervisor(context.Background(),
+			func(context.Context) error { return injected },
+			func(context.Context) error {
+				close(siblingStarted)
+				<-releaseSibling
+				return context.Canceled
+			},
+		)
+	}()
+	<-siblingStarted
+	deadline := time.Now().Add(time.Second)
+	for application.Ready() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if application.Ready() {
+		close(releaseSibling)
+		t.Fatal("worker failure was not latched while sibling join was blocked")
+	}
+	select {
+	case err := <-runDone:
+		t.Fatalf("supervisor returned before blocked sibling was released: %v", err)
+	default:
+	}
+	close(releaseSibling)
+	if err := <-runDone; !errors.Is(err, injected) {
+		t.Fatalf("supervisor error=%v", err)
+	}
+}
+
 func TestP2PColdStartReturnsBeforePeerListensThenBecomesReadyAfterOneStaticPeerConnects(t *testing.T) {
 	config, manifest, closeRPC := appFixture(t, "0x2711")
 	defer closeRPC()

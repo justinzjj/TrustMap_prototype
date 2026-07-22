@@ -14,6 +14,12 @@ import (
 	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+)
+
+const (
+	DependencyEvidenceMaxWireMessageSize = 4 << 10
+	DependencyEvidenceGossipProtocol     = protocol.ID("/trustmap/dependency-evidence/meshsub/1.0.0")
 )
 
 type GossipInbox interface {
@@ -23,25 +29,27 @@ type GossipInbox interface {
 
 type GossipOutbox interface {
 	PendingEnvelopes(context.Context, int, time.Time) ([]DependencyEvidenceEnvelope, error)
-	MarkPublished(context.Context, common.Hash) error
+	MarkPublished(context.Context, common.Hash, time.Time) error
 	MarkRetryable(context.Context, common.Hash, string, time.Time) error
 }
 
 type GossipConfig struct {
-	PublishInterval time.Duration
-	PublishTimeout  time.Duration
-	RetryBackoff    time.Duration
-	BatchSize       int
-	PublishReady    func() bool
+	PublishInterval   time.Duration
+	PublishTimeout    time.Duration
+	RepublishInterval time.Duration
+	RetryBackoff      time.Duration
+	BatchSize         int
+	PublishReady      func() bool
 }
 
 type DependencyEvidenceGossip struct {
-	host         host.Host
-	topic        *pubsub.Topic
-	subscription *pubsub.Subscription
-	inbox        GossipInbox
-	outbox       GossipOutbox
-	config       GossipConfig
+	host             host.Host
+	topic            *pubsub.Topic
+	subscription     *pubsub.Subscription
+	inbox            GossipInbox
+	outbox           GossipOutbox
+	config           GossipConfig
+	validationErrors chan error
 }
 
 func NewDependencyEvidenceGossip(ctx context.Context, h host.Host, inbox GossipInbox, outbox GossipOutbox, config GossipConfig) (*DependencyEvidenceGossip, error) {
@@ -57,21 +65,34 @@ func NewDependencyEvidenceGossip(ctx context.Context, h host.Host, inbox GossipI
 	if config.PublishTimeout <= 0 {
 		config.PublishTimeout = 2 * time.Second
 	}
+	if config.RepublishInterval <= 0 {
+		config.RepublishInterval = 30 * time.Second
+	}
 	if config.BatchSize == 0 {
 		config.BatchSize = 64
 	}
 	if config.BatchSize < 1 || config.BatchSize > 1000 {
 		return nil, errors.New("invalid dependency evidence gossip batch size")
 	}
-	ps, err := pubsub.NewGossipSub(ctx, h, pubsub.WithMessageSigning(true), pubsub.WithStrictSignatureVerification(true), pubsub.WithMessageIdFn(dependencyEnvelopeMessageID))
+	ps, err := pubsub.NewGossipSub(ctx, h,
+		pubsub.WithMessageSigning(true),
+		pubsub.WithStrictSignatureVerification(true),
+		pubsub.WithMessageIdFn(dependencyEnvelopeMessageID),
+		pubsub.WithMaxMessageSize(DependencyEvidenceMaxWireMessageSize),
+		pubsub.WithGossipSubProtocols([]protocol.ID{DependencyEvidenceGossipProtocol}, dependencyEvidenceGossipFeatures),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("create dependency evidence GossipSub: %w", err)
+	}
+	gossip := &DependencyEvidenceGossip{host: h, inbox: inbox, outbox: outbox, config: config, validationErrors: make(chan error, 1)}
+	if err := ps.RegisterTopicValidator(DependencyEvidenceTopic, gossip.validateMessage, pubsub.WithValidatorTimeout(2*time.Second), pubsub.WithValidatorConcurrency(64)); err != nil {
+		return nil, fmt.Errorf("register dependency evidence topic validator: %w", err)
 	}
 	topic, err := ps.Join(DependencyEvidenceTopic)
 	if err != nil {
 		return nil, fmt.Errorf("join dependency evidence topic: %w", err)
 	}
-	gossip := &DependencyEvidenceGossip{host: h, topic: topic, inbox: inbox, outbox: outbox, config: config}
+	gossip.topic = topic
 	if inbox != nil {
 		sub, err := topic.Subscribe()
 		if err != nil {
@@ -83,24 +104,31 @@ func NewDependencyEvidenceGossip(ctx context.Context, h host.Host, inbox GossipI
 	return gossip, nil
 }
 
+func dependencyEvidenceGossipFeatures(feature pubsub.GossipSubFeature, _ protocol.ID) bool {
+	return pubsub.GossipSubDefaultFeatures(feature, pubsub.GossipSubID_v13)
+}
+
 func dependencyEnvelopeMessageID(message *pb.Message) string {
-	if message != nil {
-		senderBytes := message.GetFrom()
-		if envelope, err := ParseDependencyEvidenceEnvelope(message.GetData()); err == nil {
-			if sender, senderErr := peer.IDFromBytes(senderBytes); senderErr == nil && sender == envelope.OriginPeer {
-				return string(envelope.MessageID[:])
-			}
-		}
-		hash := sha256.New()
-		_, _ = hash.Write([]byte("TrustMap/DependencyEvidenceEnvelope/FallbackMessageID/v1\x00"))
-		var length [4]byte
-		binary.BigEndian.PutUint32(length[:], uint32(len(senderBytes)))
-		_, _ = hash.Write(length[:])
-		_, _ = hash.Write(senderBytes)
-		_, _ = hash.Write(message.GetData())
-		return string(hash.Sum(nil))
+	if message == nil {
+		return ""
 	}
-	return ""
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("TrustMap/DependencyEvidenceEnvelope/GossipMessageID/v2\x00"))
+	writeMessageIDField := func(value []byte) {
+		var length [4]byte
+		binary.BigEndian.PutUint32(length[:], uint32(len(value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write(value)
+	}
+	writeMessageIDField(message.GetFrom())
+	writeMessageIDField(message.GetSeqno())
+	writeMessageIDField([]byte(message.GetTopic()))
+	if envelope, err := ParseDependencyEvidenceEnvelope(message.GetData()); err == nil {
+		writeMessageIDField(envelope.MessageID[:])
+	} else {
+		writeMessageIDField(message.GetData())
+	}
+	return string(hash.Sum(nil))
 }
 
 func (gossip *DependencyEvidenceGossip) Run(ctx context.Context) error {
@@ -123,6 +151,8 @@ func (gossip *DependencyEvidenceGossip) Run(ctx context.Context) error {
 			return ctx.Err()
 		case err := <-receiveErrors:
 			return err
+		case err := <-gossip.validationErrors:
+			return err
 		case now := <-ticker.C:
 			if gossip.outbox != nil {
 				if gossip.config.PublishReady != nil && !gossip.config.PublishReady() {
@@ -136,6 +166,34 @@ func (gossip *DependencyEvidenceGossip) Run(ctx context.Context) error {
 				}
 			}
 		}
+	}
+}
+
+func (gossip *DependencyEvidenceGossip) validateMessage(ctx context.Context, _ peer.ID, message *pubsub.Message) pubsub.ValidationResult {
+	if message == nil || len(message.GetData()) > MaxDependencyEvidenceEnvelopeSize {
+		return pubsub.ValidationReject
+	}
+	envelope, err := ParseDependencyEvidenceEnvelope(message.GetData())
+	if err != nil {
+		return pubsub.ValidationReject
+	}
+	author := message.GetFrom()
+	if err := envelope.ValidateFrom(author); err == nil {
+		return pubsub.ValidationAccept
+	} else if gossip.inbox == nil {
+		return pubsub.ValidationReject
+	} else {
+		rejection, rejectionErr := NewIngressRejection(author, envelope, message.GetData(), err.Error(), time.Now().UTC())
+		if rejectionErr == nil {
+			_, rejectionErr = gossip.inbox.RejectProvenance(ctx, rejection)
+		}
+		if rejectionErr != nil {
+			select {
+			case gossip.validationErrors <- fmt.Errorf("persist dependency evidence provenance rejection: %w", rejectionErr):
+			default:
+			}
+		}
+		return pubsub.ValidationReject
 	}
 }
 
@@ -195,7 +253,7 @@ func (gossip *DependencyEvidenceGossip) publishPending(ctx context.Context, now 
 			}
 			continue
 		}
-		if err := gossip.outbox.MarkPublished(ctx, envelope.MessageID); err != nil {
+		if err := gossip.outbox.MarkPublished(ctx, envelope.MessageID, time.Now().UTC().Add(gossip.config.RepublishInterval)); err != nil {
 			return err
 		}
 	}

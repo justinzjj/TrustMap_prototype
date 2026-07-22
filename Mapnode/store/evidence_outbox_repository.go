@@ -35,7 +35,7 @@ func (repository *EvidenceOutboxRepository) Pending(ctx context.Context, limit i
 	if repository == nil || repository.db == nil || limit < 1 || limit > 1000 {
 		return nil, errors.New("invalid evidence outbox pending request")
 	}
-	rows, err := repository.db.sql.QueryContext(ctx, `SELECT envelope,evidence_id,attempts,next_attempt_at,last_error FROM evidence_outbox WHERE state='pending' AND next_attempt_at<=? ORDER BY created_at,message_id LIMIT ?`, toUnix(now), limit)
+	rows, err := repository.db.sql.QueryContext(ctx, `SELECT envelope,evidence_id,attempts,next_attempt_at,last_error FROM evidence_outbox WHERE state IN ('pending','published') AND next_attempt_at<=? ORDER BY created_at,message_id LIMIT ?`, toUnix(now), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -80,9 +80,12 @@ func scanOutboxItem(row rowScanner) (OutboxItem, error) {
 	copy(evidenceID[:], eid)
 	return OutboxItem{Envelope: envelope, EvidenceID: evidenceID, Attempts: uint64(attempts), NextAttemptAt: time.Unix(0, next).UTC(), LastError: last}, nil
 }
-func (repository *EvidenceOutboxRepository) MarkPublished(ctx context.Context, id common.Hash) error {
+func (repository *EvidenceOutboxRepository) MarkPublished(ctx context.Context, id common.Hash, next time.Time) error {
+	if next.IsZero() {
+		return errors.New("published outbox repair requires next attempt time")
+	}
 	now := time.Now().UTC().UnixNano()
-	result, err := repository.db.sql.ExecContext(ctx, `UPDATE evidence_outbox SET state='published',attempts=attempts+1,last_error='',updated_at=?,published_at=? WHERE message_id=? AND state='pending'`, now, now, id[:])
+	result, err := repository.db.sql.ExecContext(ctx, `UPDATE evidence_outbox SET state='published',attempts=attempts+1,next_attempt_at=?,last_error='',updated_at=?,published_at=? WHERE message_id=? AND state IN ('pending','published')`, toUnix(next), now, now, id[:])
 	if err != nil {
 		return err
 	}
@@ -96,7 +99,7 @@ func (repository *EvidenceOutboxRepository) MarkRetryable(ctx context.Context, i
 	if reason == "" || next.IsZero() {
 		return errors.New("outbox retry requires reason and time")
 	}
-	result, err := repository.db.sql.ExecContext(ctx, `UPDATE evidence_outbox SET attempts=attempts+1,last_error=?,next_attempt_at=?,updated_at=? WHERE message_id=? AND state='pending'`, reason, toUnix(next), time.Now().UTC().UnixNano(), id[:])
+	result, err := repository.db.sql.ExecContext(ctx, `UPDATE evidence_outbox SET state='pending',attempts=attempts+1,last_error=?,next_attempt_at=?,updated_at=?,published_at=NULL WHERE message_id=? AND state IN ('pending','published')`, reason, toUnix(next), time.Now().UTC().UnixNano(), id[:])
 	if err != nil {
 		return err
 	}
