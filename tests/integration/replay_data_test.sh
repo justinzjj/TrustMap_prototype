@@ -6,6 +6,7 @@ verifier=$repo_root/data/dune/scripts/verify_dataset.py
 query=$repo_root/data/dune/queries/bridge-flows-2025-12.sql
 downloader=$repo_root/data/dune/scripts/download_pages.sh
 preparer=$repo_root/data/dune/scripts/prepare_trace.py
+requirements=$repo_root/data/requirements.txt
 fixture_root=$(mktemp -d)
 trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
 
@@ -21,6 +22,42 @@ fi
 if [ "$missing_acquisition" -ne 0 ]; then
   exit 1
 fi
+
+python3 - "$requirements" <<'PY'
+import pathlib
+import sys
+
+import dateutil
+import numpy
+import pandas
+import pytz
+import six
+import tzdata
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+expected = {
+    "numpy==2.3.5",
+    "pandas==2.3.3",
+    "python-dateutil==2.9.0.post0",
+    "pytz==2025.2",
+    "six==1.17.0",
+    "tzdata==2025.3",
+}
+if "# Requires Python==3.13.x" not in lines or set(lines) - {"# Requires Python==3.13.x"} != expected:
+    raise SystemExit("data requirements are not fully locked")
+actual = {
+    "numpy": numpy.__version__,
+    "pandas": pandas.__version__,
+    "python-dateutil": dateutil.__version__,
+    "pytz": pytz.__version__,
+    "six": six.__version__,
+    "tzdata": tzdata.__version__,
+}
+for requirement in expected:
+    name, version = requirement.split("==", 1)
+    if actual[name] != version:
+        raise SystemExit(f"locked environment mismatch for {name}: {actual[name]}")
+PY
 
 manifest_dir=$fixture_root/manifest
 trace_dir=$fixture_root/2025-12/processed
@@ -60,6 +97,11 @@ expect_prepare_failure() {
     echo "trace preparation replaced existing output while rejecting $label" >&2
     exit 1
   }
+  if grep -Fq 'Traceback' "$fixture_root/prepare-failure.out"; then
+    echo "trace preparation exposed a traceback while rejecting $label" >&2
+    cat "$fixture_root/prepare-failure.out" >&2
+    exit 1
+  fi
   if find "$fixture_root" -maxdepth 1 -name '.prepared-msg.csv.*.tmp' -print | grep -q .; then
     echo "trace preparation left a temporary file while rejecting $label" >&2
     exit 1
@@ -69,6 +111,10 @@ expect_prepare_failure() {
 write_prepare_pages
 python3 "$preparer" --raw-dir "$prepare_raw" --query-id 42 \
   --output "$prepare_output" --expected-rows 4
+[ "$(stat -c '%a' "$prepare_output")" = 644 ] || {
+  echo "prepared trace mode is not 0644" >&2
+  exit 1
+}
 cat >"$fixture_root/expected-prepared.csv" <<'CSV'
 src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
 arbitrum,base,Early A,125,2,0,0.0,2025-12-01 00:00:00+00:00,2025-12-01 00:00:10.000 UTC
@@ -80,6 +126,43 @@ cmp "$fixture_root/expected-prepared.csv" "$prepare_output"
 prepare_digest=$(sha256sum "$prepare_output" | awk '{print $1}')
 python3 "$preparer" --raw-dir "$prepare_raw" --query-id 42 \
   --output "$prepare_output" --expected-rows 4 --expected-sha256 "$prepare_digest"
+
+precision_raw=$fixture_root/precision-raw
+precision_output=$fixture_root/precision-msg.csv
+mkdir -p "$precision_raw"
+cat >"$precision_raw/44_0000.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+ethereum,base,max,18446744073709551615,0,1,1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:01.000 UTC
+ethereum,base,beyond-float,9.007199254740993e15,2.5000000000000001,1,1,2025-12-01 00:00:01.000 UTC,2025-12-01 00:00:02.000 UTC
+ethereum,base,above-half,2.5000000000000001,9007199254740993,1,1,2025-12-01 00:00:02.000 UTC,2025-12-01 00:00:03.000 UTC
+ethereum,base,half-even,2.5,18446744073709551615,1,1,2025-12-01 00:00:03.000 UTC,2025-12-01 00:00:04.000 UTC
+CSV
+python3 "$preparer" --raw-dir "$precision_raw" --query-id 44 \
+  --output "$precision_output" --expected-rows 4
+cat >"$fixture_root/expected-precision.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+ethereum,base,max,18446744073709551615,0,1,1,2025-12-01 00:00:00+00:00,2025-12-01 00:00:01.000 UTC
+ethereum,base,beyond-float,9007199254740993,3,1,1,2025-12-01 00:00:01+00:00,2025-12-01 00:00:02.000 UTC
+ethereum,base,above-half,3,9007199254740993,1,1,2025-12-01 00:00:02+00:00,2025-12-01 00:00:03.000 UTC
+ethereum,base,half-even,2,18446744073709551615,1,1,2025-12-01 00:00:03+00:00,2025-12-01 00:00:04.000 UTC
+CSV
+cmp "$fixture_root/expected-precision.csv" "$precision_output"
+
+sed '2s/18446744073709551615/18446744073709551616/' \
+  "$precision_raw/44_0000.csv" >"$fixture_root/overflow-page"
+mv "$fixture_root/overflow-page" "$precision_raw/44_0000.csv"
+prepare_output=$precision_output
+expect_prepare_failure "uint64 height overflow" python3 "$preparer" \
+  --raw-dir "$precision_raw" --query-id 44 --output "$precision_output"
+for invalid_height in NaN Inf 1_0 1e99999; do
+  cat >"$precision_raw/44_0000.csv" <<CSV
+$prepare_header
+ethereum,base,invalid,$invalid_height,1,1,1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:01.000 UTC
+CSV
+  expect_prepare_failure "invalid height $invalid_height" python3 "$preparer" \
+    --raw-dir "$precision_raw" --query-id 44 --output "$precision_output"
+done
+prepare_output=$fixture_root/prepared-msg.csv
 
 expect_prepare_failure "zero query id" python3 "$preparer" \
   --raw-dir "$prepare_raw" --query-id 0 --output "$prepare_output"
@@ -113,6 +196,35 @@ expect_prepare_failure "duplicate page copy" python3 "$preparer" \
   --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
 unlink "$prepare_raw/42_0000-copy.csv"
 
+symlink_raw=$fixture_root/symlink-raw
+mkdir -p "$symlink_raw"
+cp "$prepare_raw/42_0000.csv" "$fixture_root/symlink-target"
+ln -s "$fixture_root/symlink-target" "$symlink_raw/45_0000.csv"
+expect_prepare_failure "symlink raw page" python3 "$preparer" \
+  --raw-dir "$symlink_raw" --query-id 45 --output "$prepare_output"
+unlink "$symlink_raw/45_0000.csv"
+printf '%s\n' "$prepare_header" >"$symlink_raw/45_0000.csv"
+printf '\377\n' >>"$symlink_raw/45_0000.csv"
+expect_prepare_failure "invalid UTF-8 raw page" python3 "$preparer" \
+  --raw-dir "$symlink_raw" --query-id 45 --output "$prepare_output"
+
+string_raw=$fixture_root/string-raw
+string_output=$fixture_root/string-msg.csv
+mkdir -p "$string_raw"
+cat >"$string_raw/46_0000.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+001,NA,001,1,2,1,1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:01.000 UTC
+NA,001,NA,3,4,1,1,2025-12-01 00:00:01.000 UTC,2025-12-01 00:00:02.000 UTC
+CSV
+python3 "$preparer" --raw-dir "$string_raw" --query-id 46 \
+  --output "$string_output" --expected-rows 2
+cat >"$fixture_root/expected-string.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+001,na,001,1,2,1,1,2025-12-01 00:00:00+00:00,2025-12-01 00:00:01.000 UTC
+na,001,NA,3,4,1,1,2025-12-01 00:00:01+00:00,2025-12-01 00:00:02.000 UTC
+CSV
+cmp "$fixture_root/expected-string.csv" "$string_output"
+
 sed '1s/tx_count/transaction_count/' "$prepare_raw/42_0001.csv" \
   >"$fixture_root/bad-prepare-page"
 mv "$fixture_root/bad-prepare-page" "$prepare_raw/42_0001.csv"
@@ -142,6 +254,20 @@ for invalid_case in blank-src-chain blank-dst-chain bad-src-height negative-src-
     negative-src-height) sed '3s/,1.25e2,/,-1,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
     bad-dst-height) sed '3s/,2.5,bad,/,not-a-height,bad,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
     bad-src-time) sed '3s/2025-12-01 00:00:00.000 UTC/not-a-time/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+  esac
+  mv "$fixture_root/invalid-page" "$prepare_raw/42_0000.csv"
+  expect_prepare_failure "$invalid_case" python3 "$preparer" \
+    --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+done
+write_prepare_pages
+
+for invalid_case in tx-infinity tx-out-of-range volume-infinity volume-nan; do
+  write_prepare_pages
+  case $invalid_case in
+    tx-infinity) sed '3s/,2.5,bad,bad,/,2.5,inf,bad,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    tx-out-of-range) sed '3s/,2.5,bad,bad,/,2.5,1e999,bad,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    volume-infinity) sed '3s/,2.5,bad,bad,/,2.5,bad,inf,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    volume-nan) sed '3s/,2.5,bad,bad,/,2.5,bad,NaN,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
   esac
   mv "$fixture_root/invalid-page" "$prepare_raw/42_0000.csv"
   expect_prepare_failure "$invalid_case" python3 "$preparer" \
