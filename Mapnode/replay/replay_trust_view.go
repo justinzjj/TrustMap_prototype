@@ -1,7 +1,6 @@
 package replay
 
 import (
-	"container/heap"
 	"fmt"
 	"math"
 	"sync"
@@ -19,6 +18,7 @@ type ReplayTrustView struct {
 	nodes           map[ReplayBlockKey]struct{}
 	nodeIDs         map[ReplayBlockKey]replayNodeID
 	nodeKeys        []ReplayBlockKey
+	searchPool      sync.Pool
 	edgeCount       uint64
 	crossEdgesAdded uint64
 }
@@ -27,13 +27,15 @@ func NewReplayTrustView(profile CostProfile) (*ReplayTrustView, error) {
 	if err := profile.Validate(); err != nil {
 		return nil, err
 	}
-	return &ReplayTrustView{
+	view := &ReplayTrustView{
 		profile:   profile,
 		heights:   make(map[string]*orderedHeightIndex),
 		adjacency: make(map[ReplayBlockKey]map[ReplayBlockKey]ReplayEdge),
 		nodes:     make(map[ReplayBlockKey]struct{}),
 		nodeIDs:   make(map[ReplayBlockKey]replayNodeID),
-	}, nil
+	}
+	view.searchPool.New = func() any { return &replaySearchScratch{} }
+	return view, nil
 }
 
 func (view *ReplayTrustView) Activate(block ReplayBlock) (ReplayBlockKey, error) {
@@ -266,112 +268,4 @@ func mixHeight(value uint64) uint64 {
 	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
 	value = (value ^ (value >> 27)) * 0x94d049bb133111eb
 	return value ^ (value >> 31)
-}
-
-type replayQueueItem struct {
-	cost uint64
-	key  ReplayBlockKey
-}
-
-type replayPriorityQueue []replayQueueItem
-
-func (queue replayPriorityQueue) Len() int { return len(queue) }
-func (queue replayPriorityQueue) Less(i, j int) bool {
-	if queue[i].cost != queue[j].cost {
-		return queue[i].cost < queue[j].cost
-	}
-	if queue[i].key.Chain != queue[j].key.Chain {
-		return queue[i].key.Chain < queue[j].key.Chain
-	}
-	return queue[i].key.Height < queue[j].key.Height
-}
-func (queue replayPriorityQueue) Swap(i, j int) { queue[i], queue[j] = queue[j], queue[i] }
-func (queue *replayPriorityQueue) Push(value any) {
-	*queue = append(*queue, value.(replayQueueItem))
-}
-func (queue *replayPriorityQueue) Pop() any {
-	old := *queue
-	last := old[len(old)-1]
-	*queue = old[:len(old)-1]
-	return last
-}
-
-func (view *ReplayTrustView) ShortestPath(start, goal ReplayBlockKey, cutoff uint64, targetChain string, targetHeight uint64) (ReplayPath, bool, error) {
-	view.mu.RLock()
-	defer view.mu.RUnlock()
-	start, goal = canonicalKey(start), canonicalKey(goal)
-	if start == goal {
-		return ReplayPath{Cost: 0, Nodes: []ReplayBlockKey{start}}, true, nil
-	}
-	minTargetHeight := uint64(0)
-	steps := cutoff / view.profile.DirectStepCost
-	if targetHeight > steps {
-		minTargetHeight = targetHeight - steps
-	}
-	targetChain = canonicalChain(targetChain)
-	nodeOK := func(key ReplayBlockKey) bool {
-		return key.Chain != targetChain || key.Height >= minTargetHeight
-	}
-
-	distances := map[ReplayBlockKey]uint64{start: 0}
-	previous := make(map[ReplayBlockKey]ReplayBlockKey)
-	queue := replayPriorityQueue{{key: start}}
-	heap.Init(&queue)
-	for queue.Len() > 0 {
-		item := heap.Pop(&queue).(replayQueueItem)
-		known, ok := distances[item.key]
-		if !ok || known != item.cost {
-			continue
-		}
-		if item.cost > cutoff {
-			return ReplayPath{}, false, nil
-		}
-		if !nodeOK(item.key) {
-			continue
-		}
-		if item.key == goal {
-			return view.reconstructPathLocked(start, goal, item.cost, previous)
-		}
-		for neighbour, edge := range view.adjacency[item.key] {
-			candidate, err := CheckedAdd(item.cost, edge.Weight)
-			if err != nil {
-				return ReplayPath{}, false, fmt.Errorf("dijkstra edge %v -> %v: %w", item.key, neighbour, err)
-			}
-			if candidate > cutoff || !nodeOK(neighbour) {
-				continue
-			}
-			known, exists := distances[neighbour]
-			if exists && candidate >= known {
-				continue
-			}
-			distances[neighbour] = candidate
-			previous[neighbour] = item.key
-			heap.Push(&queue, replayQueueItem{cost: candidate, key: neighbour})
-		}
-	}
-	return ReplayPath{}, false, nil
-}
-
-func (view *ReplayTrustView) reconstructPathLocked(start, goal ReplayBlockKey, cost uint64, previous map[ReplayBlockKey]ReplayBlockKey) (ReplayPath, bool, error) {
-	nodes := []ReplayBlockKey{goal}
-	for current := goal; current != start; {
-		prior, ok := previous[current]
-		if !ok {
-			return ReplayPath{}, false, fmt.Errorf("replay path predecessor missing for %v", current)
-		}
-		nodes = append(nodes, prior)
-		current = prior
-	}
-	for left, right := 0, len(nodes)-1; left < right; left, right = left+1, right-1 {
-		nodes[left], nodes[right] = nodes[right], nodes[left]
-	}
-	segments := make([]ReplayPathSegment, 0, len(nodes)-1)
-	for index := 0; index+1 < len(nodes); index++ {
-		edge, ok := view.adjacency[nodes[index]][nodes[index+1]]
-		if !ok {
-			return ReplayPath{}, false, fmt.Errorf("replay path edge disappeared")
-		}
-		segments = append(segments, ReplayPathSegment{From: nodes[index], To: nodes[index+1], Kind: edge.Kind, Weight: edge.Weight})
-	}
-	return ReplayPath{Cost: cost, Nodes: nodes, Segments: segments}, true, nil
 }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -162,8 +164,13 @@ func TestReplayDijkstraReferenceHeightTieBreak(t *testing.T) {
 	high := ReplayBlockKey{Chain: "x", Height: 2}
 	goal := ReplayBlockKey{Chain: "g", Height: 1}
 
-	// Build adjacency directly so no intra-chain x:1 <-> x:2 edge can create a
-	// shorter route than the two deliberately equal-cost alternatives.
+	for _, key := range []ReplayBlockKey{start, low, high, goal} {
+		activateReplayDijkstraKey(t, view, key)
+	}
+	// Remove the activation-created pair so the fixture contains only the two
+	// deliberately equal-cost alternatives while retaining production node IDs.
+	view.deleteEdgeLocked(low, high)
+	view.deleteEdgeLocked(high, low)
 	view.setEdge(start, low, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
 	view.setEdge(start, high, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
 	view.setEdge(low, goal, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
@@ -416,6 +423,252 @@ func TestReplayDijkstraReferenceGeneratedMixedGraphs(t *testing.T) {
 				assertReplayDijkstraReferenceMatches(t, view, query.start, query.goal, query.cutoff, targetChain, query.goal.Height)
 			})
 		}
+	}
+}
+
+func TestReplaySearchScratchTracksCurrentGenerationState(t *testing.T) {
+	var scratch replaySearchScratch
+	scratch.begin(3)
+	scratch.setDistance(2, 41)
+	scratch.setPredecessor(2, 1)
+
+	if got, ok := scratch.getDistance(2); !ok || got != 41 {
+		t.Fatalf("distance = %d, found=%t; want 41, true", got, ok)
+	}
+	if got, ok := scratch.getPredecessor(2); !ok || got != 1 {
+		t.Fatalf("predecessor = %d, found=%t; want 1, true", got, ok)
+	}
+	if _, ok := scratch.getDistance(1); ok {
+		t.Fatal("unset distance appeared in current generation")
+	}
+	if _, ok := scratch.getPredecessor(1); ok {
+		t.Fatal("unset predecessor appeared in current generation")
+	}
+}
+
+func TestReplaySearchScratchHidesPriorGenerationState(t *testing.T) {
+	var scratch replaySearchScratch
+	scratch.begin(2)
+	scratch.setDistance(1, 9)
+	scratch.setPredecessor(1, 0)
+	scratch.begin(2)
+
+	if _, ok := scratch.getDistance(1); ok {
+		t.Fatal("prior-generation distance remained visible")
+	}
+	if _, ok := scratch.getPredecessor(1); ok {
+		t.Fatal("prior-generation predecessor remained visible")
+	}
+}
+
+func TestReplaySearchScratchGrowsAllNodeState(t *testing.T) {
+	var scratch replaySearchScratch
+	scratch.begin(1)
+	scratch.begin(17)
+
+	if len(scratch.distances) < 17 || len(scratch.distanceGenerations) < 17 ||
+		len(scratch.predecessors) < 17 || len(scratch.predecessorGenerations) < 17 {
+		t.Fatalf("scratch lengths = distances:%d distance-generations:%d predecessors:%d predecessor-generations:%d, want each >= 17",
+			len(scratch.distances), len(scratch.distanceGenerations), len(scratch.predecessors), len(scratch.predecessorGenerations))
+	}
+	scratch.setDistance(16, 99)
+	scratch.setPredecessor(16, 15)
+	if got, ok := scratch.getDistance(16); !ok || got != 99 {
+		t.Fatalf("grown distance = %d, found=%t; want 99, true", got, ok)
+	}
+	if got, ok := scratch.getPredecessor(16); !ok || got != 15 {
+		t.Fatalf("grown predecessor = %d, found=%t; want 15, true", got, ok)
+	}
+
+	distanceCapacity := cap(scratch.distances)
+	distanceGenerationCapacity := cap(scratch.distanceGenerations)
+	predecessorCapacity := cap(scratch.predecessors)
+	predecessorGenerationCapacity := cap(scratch.predecessorGenerations)
+	scratch.begin(2)
+	if len(scratch.distances) < 17 || len(scratch.distanceGenerations) < 17 ||
+		len(scratch.predecessors) < 17 || len(scratch.predecessorGenerations) < 17 {
+		t.Fatal("begin with a smaller graph shrank reusable node state")
+	}
+	if cap(scratch.distances) != distanceCapacity || cap(scratch.distanceGenerations) != distanceGenerationCapacity ||
+		cap(scratch.predecessors) != predecessorCapacity || cap(scratch.predecessorGenerations) != predecessorGenerationCapacity {
+		t.Fatal("begin with a smaller graph replaced reusable node-state capacity")
+	}
+}
+
+func TestReplaySearchScratchClearsMarkersAtGenerationWrap(t *testing.T) {
+	scratch := replaySearchScratch{
+		generation:             math.MaxUint64,
+		distanceGenerations:    []uint64{7, math.MaxUint64},
+		predecessorGenerations: []uint64{math.MaxUint64, 8},
+	}
+	scratch.begin(2)
+
+	if scratch.generation != 1 {
+		t.Fatalf("generation after wrap = %d, want 1", scratch.generation)
+	}
+	for index, marker := range scratch.distanceGenerations {
+		if marker != 0 {
+			t.Fatalf("distance marker[%d] = %d, want 0", index, marker)
+		}
+	}
+	for index, marker := range scratch.predecessorGenerations {
+		if marker != 0 {
+			t.Fatalf("predecessor marker[%d] = %d, want 0", index, marker)
+		}
+	}
+}
+
+func TestReplaySearchScratchBeginReusesQueueBacking(t *testing.T) {
+	var scratch replaySearchScratch
+	scratch.queue = append(scratch.queue, replayQueueItem{id: 1, key: ReplayBlockKey{Chain: "a", Height: 1}, cost: 3})
+	backing := &scratch.queue[0]
+	capacity := cap(scratch.queue)
+
+	scratch.begin(1)
+	if len(scratch.queue) != 0 {
+		t.Fatalf("queue length after begin = %d, want 0", len(scratch.queue))
+	}
+	if cap(scratch.queue) != capacity {
+		t.Fatalf("queue capacity after begin = %d, want %d", cap(scratch.queue), capacity)
+	}
+	scratch.queue = append(scratch.queue, replayQueueItem{id: 0, key: ReplayBlockKey{Chain: "b", Height: 2}, cost: 4})
+	if &scratch.queue[0] != backing {
+		t.Fatal("begin replaced queue backing storage")
+	}
+}
+
+func TestReplayTrustViewSearchPoolDoesNotAliasActiveScratch(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	first := view.searchPool.Get().(*replaySearchScratch)
+	second := view.searchPool.Get().(*replaySearchScratch)
+	defer view.searchPool.Put(first)
+	defer view.searchPool.Put(second)
+
+	if first == second {
+		t.Fatal("two active pool gets returned the same search scratch")
+	}
+}
+
+func TestReplayDijkstraMissingNodeIDIsInvariantError(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	start := ReplayBlockKey{Chain: "missing-start", Height: 1}
+	goal := ReplayBlockKey{Chain: "goal", Height: 1}
+	activateReplayDijkstraKey(t, view, goal)
+
+	_, found, err := view.ShortestPath(start, goal, 10, goal.Chain, goal.Height)
+	if err == nil || found {
+		t.Fatalf("missing start result: found=%t error=%v; want invariant error", found, err)
+	}
+	if !strings.Contains(err.Error(), "node ID missing") {
+		t.Fatalf("missing start error = %q, want explicit node ID invariant", err)
+	}
+}
+
+func TestReplayDijkstraStartEqualsGoalBeforeNodeIDLookup(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	key := ReplayBlockKey{Chain: " absent ", Height: 8}
+
+	path, found, err := view.ShortestPath(key, ReplayBlockKey{Chain: "absent", Height: 8}, 0, "absent", math.MaxUint64)
+	if err != nil || !found {
+		t.Fatalf("equal absent keys: found=%t error=%v", found, err)
+	}
+	want := ReplayBlockKey{Chain: "absent", Height: 8}
+	if path.Cost != 0 || len(path.Nodes) != 1 || path.Nodes[0] != want {
+		t.Fatalf("equal absent path = %#v, want canonical singleton %v", path, want)
+	}
+}
+
+func TestReplayDijkstraMissingNeighbourNodeIDIsInvariantError(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	start := ReplayBlockKey{Chain: "start", Height: 1}
+	middle := ReplayBlockKey{Chain: "middle", Height: 1}
+	goal := ReplayBlockKey{Chain: "goal", Height: 1}
+	activateReplayDijkstraKey(t, view, start)
+	activateReplayDijkstraKey(t, view, middle)
+	activateReplayDijkstraKey(t, view, goal)
+	view.setEdge(start, middle, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 1})
+	view.setEdge(middle, goal, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 1})
+	delete(view.nodeIDs, middle)
+
+	_, found, err := view.ShortestPath(start, goal, 2, goal.Chain, goal.Height)
+	if err == nil || found {
+		t.Fatalf("missing neighbour ID result: found=%t error=%v; want invariant error", found, err)
+	}
+	if !strings.Contains(err.Error(), "neighbour node ID missing") {
+		t.Fatalf("missing neighbour error = %q, want explicit invariant", err)
+	}
+}
+
+func TestReplayDijkstraConcurrentShortestPathMatchesFrozenReference(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	start := ReplayBlockKey{Chain: "a", Height: 1}
+	goal := ReplayBlockKey{Chain: "c", Height: 4}
+	for _, chain := range []string{"a", "b", "c"} {
+		for height := uint64(1); height <= 4; height++ {
+			activateReplayDijkstraKey(t, view, ReplayBlockKey{Chain: chain, Height: height})
+		}
+	}
+	view.setEdge(ReplayBlockKey{Chain: "a", Height: 4}, ReplayBlockKey{Chain: "b", Height: 1}, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 3})
+	view.setEdge(ReplayBlockKey{Chain: "b", Height: 4}, ReplayBlockKey{Chain: "c", Height: 1}, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 3})
+	wantPath, wantFound, wantErr := referenceReplayShortestPath(view, start, goal, 100, goal.Chain, goal.Height)
+	if wantErr != nil || !wantFound {
+		t.Fatalf("reference setup: found=%t error=%v", wantFound, wantErr)
+	}
+
+	const workers = 32
+	const searchesPerWorker = 40
+	errors := make(chan error, workers)
+	var wait sync.WaitGroup
+	for range workers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			for range searchesPerWorker {
+				gotPath, gotFound, gotErr := view.ShortestPath(start, goal, 100, goal.Chain, goal.Height)
+				if gotErr != nil || gotFound != wantFound || fmt.Sprintf("%#v", gotPath) != fmt.Sprintf("%#v", wantPath) {
+					errors <- fmt.Errorf("path=%#v found=%t error=%v; want path=%#v found=%t", gotPath, gotFound, gotErr, wantPath, wantFound)
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
+}
+
+func TestReplayDijkstraReusesSearchStateWithFewerAllocationsThanReference(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	start := ReplayBlockKey{Chain: "allocation", Height: 1}
+	goal := ReplayBlockKey{Chain: "allocation", Height: 64}
+	for height := uint64(1); height <= goal.Height; height++ {
+		activateReplayDijkstraKey(t, view, ReplayBlockKey{Chain: start.Chain, Height: height})
+	}
+	const cutoff = uint64(630)
+
+	for range 8 {
+		if _, found, err := view.ShortestPath(start, goal, cutoff, goal.Chain, goal.Height); err != nil || !found {
+			t.Fatalf("production warmup: found=%t error=%v", found, err)
+		}
+		if _, found, err := referenceReplayShortestPath(view, start, goal, cutoff, goal.Chain, goal.Height); err != nil || !found {
+			t.Fatalf("reference warmup: found=%t error=%v", found, err)
+		}
+	}
+	productionAllocs := testing.AllocsPerRun(100, func() {
+		if _, found, err := view.ShortestPath(start, goal, cutoff, goal.Chain, goal.Height); err != nil || !found {
+			panic(fmt.Sprintf("production allocation run: found=%t error=%v", found, err))
+		}
+	})
+	referenceAllocs := testing.AllocsPerRun(100, func() {
+		if _, found, err := referenceReplayShortestPath(view, start, goal, cutoff, goal.Chain, goal.Height); err != nil || !found {
+			panic(fmt.Sprintf("reference allocation run: found=%t error=%v", found, err))
+		}
+	})
+	t.Logf("allocations per shortest path: production=%.2f reference=%.2f", productionAllocs, referenceAllocs)
+	if productionAllocs >= referenceAllocs {
+		t.Fatalf("production allocations %.2f, want fewer than reference %.2f", productionAllocs, referenceAllocs)
 	}
 }
 
