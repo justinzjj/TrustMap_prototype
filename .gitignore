@@ -56,6 +56,14 @@ Thumbs.db
 !/tests/fixtures/
 !/tests/fixtures/**
 
+# Dune exports: keep only the canonical dated processed trace.
+/data/dune/*/raw/**
+/data/dune/*/raw*.sha256
+/data/dune/*/raw*inventory*
+/data/dune/*/processed/**
+!/data/dune/*/processed/
+!/data/dune/*/processed/msg.csv
+
 # 项目管理文件
 0-记录/**
 98-材料/**
