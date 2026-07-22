@@ -52,8 +52,14 @@ def require_digest(value: Any, label: str) -> str:
 
 def parse_utc(value: Any, label: str) -> datetime:
     text = require_string(value, label)
+    if text.endswith(" UTC"):
+        iso_text = text[:-4] + "+00:00"
+    elif text.endswith("Z"):
+        iso_text = text[:-1] + "+00:00"
+    else:
+        iso_text = text
     try:
-        parsed = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+        parsed = datetime.fromisoformat(iso_text)
     except ValueError as error:
         raise VerificationError(f"{label} is not a valid timestamp") from error
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):

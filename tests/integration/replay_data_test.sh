@@ -16,8 +16,8 @@ mkdir -p "$manifest_dir" "$trace_dir" "$raw_dir"
 valid_trace() {
   cat <<'CSV'
 src_chain,dst_chain,src_block_number,dst_block_number,src_block_time,dst_block_time,bridge_name
-ethereum,arbitrum,100,200,2025-12-01T00:00:00Z,2025-12-01T00:01:00Z,alpha
-arbitrum,optimism,201.0,300e0,2025-12-31T23:59:59Z,2026-01-01T00:01:00Z,beta
+ethereum,arbitrum,100,200,2025-12-01T00:00:00+00:00,2025-12-01 00:01:00.000 UTC,alpha
+arbitrum,optimism,201.0,300e0,2025-12-31T23:59:59+00:00,2026-01-01 00:01:00.000 UTC,beta
 CSV
 }
 
@@ -67,8 +67,8 @@ document = {
         "time_bounds": {
             "src_min": "2025-12-01T00:00:00Z",
             "src_max": "2025-12-31T23:59:59Z",
-            "dst_min": "2025-12-01T00:01:00Z",
-            "dst_max": "2026-01-01T00:01:00Z",
+            "dst_min": "2025-12-01 00:01:00.000 UTC",
+            "dst_max": "2026-01-01 00:01:00.000 UTC",
         },
     },
     "raw_pages": {
