@@ -71,6 +71,42 @@ func TestReplayTrustViewCrossEdgeOverwritesAdjacencyButCountsEveryRow(t *testing
 	}
 }
 
+func TestReplayTrustViewMaintainsCachedEdgeCountAcrossSplitsAndOverwrites(t *testing.T) {
+	view, err := NewReplayTrustView(CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, height := range []uint64{100, 200} {
+		if _, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: height}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertCachedReplayEdgeCountInvariant(t, view, 2)
+
+	if _, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: 150}); err != nil {
+		t.Fatal(err)
+	}
+	assertCachedReplayEdgeCountInvariant(t, view, 4)
+
+	from := ReplayBlock{Chain: "b", OriginalHeight: 1}
+	to := ReplayBlock{Chain: "a", OriginalHeight: 10}
+	if _, err := view.AddVerifiedDependency(from, to); err != nil {
+		t.Fatal(err)
+	}
+	assertCachedReplayEdgeCountInvariant(t, view, 5)
+	if got := view.CrossEdgesAdded(); got != 1 {
+		t.Fatalf("cross additions = %d, want 1", got)
+	}
+
+	if _, err := view.AddVerifiedDependency(from, to); err != nil {
+		t.Fatal(err)
+	}
+	assertCachedReplayEdgeCountInvariant(t, view, 5)
+	if got := view.CrossEdgesAdded(); got != 2 {
+		t.Fatalf("cross additions = %d, want 2", got)
+	}
+}
+
 func TestReplayTrustViewShortestPathUsesDeterministicTieBreakAndStrictRelaxation(t *testing.T) {
 	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
 	view, err := NewReplayTrustView(profile)
@@ -105,5 +141,19 @@ func assertReplayEdge(t *testing.T, view *ReplayTrustView, from, to ReplayBlockK
 	edge, ok := view.Edge(from, to)
 	if !ok || edge.Kind != kind || edge.Weight != weight {
 		t.Fatalf("edge %v -> %v = %#v, found=%t; want %s/%d", from, to, edge, ok, kind, weight)
+	}
+}
+
+func assertCachedReplayEdgeCountInvariant(t *testing.T, view *ReplayTrustView, want uint64) {
+	t.Helper()
+	var actual uint64
+	for _, neighbours := range view.adjacency {
+		actual += uint64(len(neighbours))
+	}
+	if view.edgeCount != actual {
+		t.Fatalf("cached edge count = %d, adjacency contains %d edges", view.edgeCount, actual)
+	}
+	if got := view.EdgeCount(); got != want {
+		t.Fatalf("edge count = %d, want %d", got, want)
 	}
 }

@@ -15,6 +15,7 @@ type ReplayTrustView struct {
 	heights         map[string]*orderedHeightIndex
 	adjacency       map[ReplayBlockKey]map[ReplayBlockKey]ReplayEdge
 	nodes           map[ReplayBlockKey]struct{}
+	edgeCount       uint64
 	crossEdgesAdded uint64
 }
 
@@ -91,7 +92,9 @@ func (view *ReplayTrustView) activateLocked(block ReplayBlock) (ReplayBlockKey, 
 		view.deleteEdgeLocked(ReplayBlockKey{Chain: key.Chain, Height: successor}, ReplayBlockKey{Chain: key.Chain, Height: predecessor})
 	}
 	for _, item := range pending {
-		view.setEdgeLocked(item.from, item.to, item.edge)
+		if err := view.setEdgeLocked(item.from, item.to, item.edge); err != nil {
+			return ReplayBlockKey{}, fmt.Errorf("store replay edge: %w", err)
+		}
 	}
 	return key, nil
 }
@@ -111,7 +114,9 @@ func (view *ReplayTrustView) AddVerifiedDependency(fromBlock, toBlock ReplayBloc
 		return ReplayVerifiedDependencyEdge{}, fmt.Errorf("cross edge addition counter overflow")
 	}
 	edge := ReplayVerifiedDependencyEdge{From: from, To: to, Weight: view.profile.PathStepCost}
-	view.setEdgeLocked(from, to, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: edge.Weight})
+	if err := view.setEdgeLocked(from, to, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: edge.Weight}); err != nil {
+		return ReplayVerifiedDependencyEdge{}, err
+	}
 	view.crossEdgesAdded++
 	return edge, nil
 }
@@ -132,11 +137,7 @@ func (view *ReplayTrustView) NodeCount() uint64 {
 func (view *ReplayTrustView) EdgeCount() uint64 {
 	view.mu.RLock()
 	defer view.mu.RUnlock()
-	var count uint64
-	for _, neighbours := range view.adjacency {
-		count += uint64(len(neighbours))
-	}
-	return count
+	return view.edgeCount
 }
 
 func (view *ReplayTrustView) CrossEdgesAdded() uint64 {
@@ -145,24 +146,34 @@ func (view *ReplayTrustView) CrossEdgesAdded() uint64 {
 	return view.crossEdgesAdded
 }
 
-func (view *ReplayTrustView) setEdge(from, to ReplayBlockKey, edge ReplayEdge) {
+func (view *ReplayTrustView) setEdge(from, to ReplayBlockKey, edge ReplayEdge) error {
 	view.mu.Lock()
 	defer view.mu.Unlock()
-	view.setEdgeLocked(canonicalKey(from), canonicalKey(to), edge)
+	return view.setEdgeLocked(canonicalKey(from), canonicalKey(to), edge)
 }
 
-func (view *ReplayTrustView) setEdgeLocked(from, to ReplayBlockKey, edge ReplayEdge) {
+func (view *ReplayTrustView) setEdgeLocked(from, to ReplayBlockKey, edge ReplayEdge) error {
 	neighbours := view.adjacency[from]
 	if neighbours == nil {
 		neighbours = make(map[ReplayBlockKey]ReplayEdge)
 		view.adjacency[from] = neighbours
 	}
+	if _, exists := neighbours[to]; !exists {
+		if view.edgeCount == math.MaxUint64 {
+			return fmt.Errorf("replay edge counter overflow")
+		}
+		view.edgeCount++
+	}
 	neighbours[to] = edge
+	return nil
 }
 
 func (view *ReplayTrustView) deleteEdgeLocked(from, to ReplayBlockKey) {
 	if neighbours := view.adjacency[from]; neighbours != nil {
-		delete(neighbours, to)
+		if _, exists := neighbours[to]; exists {
+			delete(neighbours, to)
+			view.edgeCount--
+		}
 	}
 }
 
