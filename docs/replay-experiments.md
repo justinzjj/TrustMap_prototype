@@ -129,7 +129,9 @@ sed \
   configs/replay/full-21chain.yaml >runtime/replay.yaml
 
 docker build -f docker/mapnode.Dockerfile -t trustmap-mapnode .
-docker run --rm --entrypoint /mapnode \
+docker run --rm \
+  --user "$(id -u):$(id -g)" \
+  --entrypoint /mapnode \
   -v "$PWD/runtime/replay.yaml:/config/replay.yaml:ro" \
   -v "$PWD/data/dune/2025-12/processed/msg.csv:/input/msg.csv:ro" \
   -v "$PWD/runtime/replay-output:/output" \
@@ -137,6 +139,8 @@ docker run --rm --entrypoint /mapnode \
 ```
 
 In that example, the config must use `/input/msg.csv` for `input_trace` and
-`/output` for `run_root`. The input mount is the repository-owned canonical
-file and is read-only; all writable replay state remains under ignored
-`runtime/`.
+`/output` for `run_root`. The current host user creates the output directory,
+and the container uses the same numeric UID/GID when writing through that bind
+mount, so replay artifacts remain owned by the invoking user. The repository
+input and generated config mounts stay read-only; all writable replay state
+remains under ignored `runtime/`.

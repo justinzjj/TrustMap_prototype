@@ -1181,6 +1181,12 @@ grep -Fqx "expected_digest: $custom_digest" "$custom_digest_config" || {
   exit 1
 }
 
+if ! grep -Fq -- '--user "$(id -u):$(id -g)"' \
+  "$repo_root/docs/replay-experiments.md"; then
+  echo "replay Docker example does not map the current numeric UID/GID" >&2
+  exit 1
+fi
+
 active_replay_files="
 $repo_root/scripts/replay-full.sh
 $repo_root/README.md
