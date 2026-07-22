@@ -490,12 +490,24 @@ case ${FAKE_CURL_SCENARIO:-} in
       *) exit 98 ;;
     esac
     ;;
+  data_then_empty)
+    case $url in
+      *offset=0) printf 'column_a,column_b\nvalue-0,ok\n' >"$output" ;;
+      *offset=5000) : >"$output" ;;
+      *) exit 98 ;;
+    esac
+    ;;
   always_data)
     offset=${url##*offset=}
     printf 'column_a,column_b\nvalue-%s,ok\n' "$offset" >"$output"
     ;;
-  resume_same)
-    printf 'column_a,column_b\nvalue-same,ok\n' >"$output"
+  resume_sequence)
+    case $url in
+      *offset=0) printf 'column_a,column_b\nvalue-same,ok\n' >"$output" ;;
+      *offset=5000) printf 'column_a,column_b\nvalue-next,ok\n' >"$output" ;;
+      *offset=10000) printf 'column_a,column_b\n' >"$output" ;;
+      *) exit 98 ;;
+    esac
     ;;
   resume_different)
     printf 'column_a,column_b\nvalue-different,ok\n' >"$output"
@@ -574,6 +586,18 @@ printf '%s  %s\n' "$page_digest" 6515125_0000.csv >"$fixture_root/expected-inven
 cmp "$fixture_root/expected-inventory" "$download_dir.sha256"
 
 : >"$fake_log"
+empty_dir=$fixture_root/empty-response
+run_downloader data_then_empty --query-id 66 --output-dir "$empty_dir"
+[ -f "$empty_dir/66_0000.csv" ]
+[ ! -e "$empty_dir/66_0001.csv" ]
+[ "$(find "$empty_dir" -type f | wc -l)" -eq 1 ]
+cat >"$fixture_root/expected-empty-urls" <<'EOF'
+https://api.dune.com/api/v1/query/66/results/csv?limit=5000&offset=0
+https://api.dune.com/api/v1/query/66/results/csv?limit=5000&offset=5000
+EOF
+cmp "$fixture_root/expected-empty-urls" "$fake_log"
+
+: >"$fake_log"
 max_dir=$fixture_root/max-pages
 run_downloader always_data --query-id 77 --output-dir "$max_dir" \
   --limit 7 --start-page 3 --max-pages 2
@@ -585,7 +609,13 @@ https://api.dune.com/api/v1/query/77/results/csv?limit=7&offset=21
 https://api.dune.com/api/v1/query/77/results/csv?limit=7&offset=28
 EOF
 cmp "$fixture_root/expected-max-urls" "$fake_log"
-[ "$(wc -l <"$max_dir.sha256")" -eq 2 ]
+max_digest_0003=$(sha256sum "$max_dir/77_0003.csv" | awk '{print $1}')
+max_digest_0004=$(sha256sum "$max_dir/77_0004.csv" | awk '{print $1}')
+cat >"$fixture_root/expected-max-inventory" <<EOF
+$max_digest_0003  77_0003.csv
+$max_digest_0004  77_0004.csv
+EOF
+cmp "$fixture_root/expected-max-inventory" "$max_dir.sha256"
 
 existing_dir=$fixture_root/existing
 mkdir -p "$existing_dir"
@@ -595,12 +625,38 @@ expect_downloader_failure "existing page without resume" run_downloader always_d
   --query-id 91 --output-dir "$existing_dir" --max-pages 1
 [ "$(sha256sum "$existing_dir/91_0000.csv" | awk '{print $1}')" = "$existing_digest" ]
 
+zero_existing_dir=$fixture_root/zero-existing
+mkdir -p "$zero_existing_dir"
+: >"$zero_existing_dir/94_0000.csv"
+expect_downloader_failure "zero-byte existing page without resume" run_downloader always_data \
+  --query-id 94 --output-dir "$zero_existing_dir" --max-pages 1
+[ -e "$zero_existing_dir/94_0000.csv" ]
+[ ! -s "$zero_existing_dir/94_0000.csv" ]
+expect_downloader_failure "zero-byte resume content mismatch" run_downloader always_data \
+  --query-id 94 --output-dir "$zero_existing_dir" --max-pages 1 --resume
+[ -e "$zero_existing_dir/94_0000.csv" ]
+[ ! -s "$zero_existing_dir/94_0000.csv" ]
+
 resume_dir=$fixture_root/resume
 mkdir -p "$resume_dir"
 printf 'column_a,column_b\nvalue-same,ok\n' >"$resume_dir/92_0000.csv"
-run_downloader resume_same --query-id 92 --output-dir "$resume_dir" --max-pages 1 --resume
+: >"$fake_log"
+run_downloader resume_sequence --query-id 92 --output-dir "$resume_dir" --resume
 resume_digest=$(sha256sum "$resume_dir/92_0000.csv" | awk '{print $1}')
-grep -Fq -- "$resume_digest  92_0000.csv" "$resume_dir.sha256"
+[ -f "$resume_dir/92_0001.csv" ]
+[ ! -e "$resume_dir/92_0002.csv" ]
+cat >"$fixture_root/expected-resume-urls" <<'EOF'
+https://api.dune.com/api/v1/query/92/results/csv?limit=5000&offset=0
+https://api.dune.com/api/v1/query/92/results/csv?limit=5000&offset=5000
+https://api.dune.com/api/v1/query/92/results/csv?limit=5000&offset=10000
+EOF
+cmp "$fixture_root/expected-resume-urls" "$fake_log"
+resume_next_digest=$(sha256sum "$resume_dir/92_0001.csv" | awk '{print $1}')
+cat >"$fixture_root/expected-resume-inventory" <<EOF
+$resume_digest  92_0000.csv
+$resume_next_digest  92_0001.csv
+EOF
+cmp "$fixture_root/expected-resume-inventory" "$resume_dir.sha256"
 expect_downloader_failure "resume content mismatch" run_downloader resume_different \
   --query-id 92 --output-dir "$resume_dir" --max-pages 1 --resume
 [ "$(sha256sum "$resume_dir/92_0000.csv" | awk '{print $1}')" = "$resume_digest" ]

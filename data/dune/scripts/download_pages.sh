@@ -112,7 +112,7 @@ while [ "$max_pages" -eq 0 ] || [ "$attempted" -lt "$max_pages" ]; do
   page_name=$(printf '%s_%04d.csv' "$query_id" "$page")
   page_path=$output_dir/$page_name
   existing=0
-  if [ -s "$page_path" ]; then
+  if [ -e "$page_path" ]; then
     existing=1
     [ "$resume" -eq 1 ] || die "page already exists: $page_name"
   fi
