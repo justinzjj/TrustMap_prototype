@@ -141,6 +141,12 @@ func (submitter *TransactionSubmitter) broadcastPrepared(ctx context.Context, su
 	if !accepted {
 		return submission, fmt.Errorf("%w: %v", ErrBroadcastAmbiguous, sendErr)
 	}
+	if submission.State == Submitted {
+		return submission, nil
+	}
+	if submission.State != Prepared && submission.State != Retryable {
+		return submission, ErrInvalidTransition
+	}
 	updated, _, err := submitter.repository.Transition(ctx, submission.ID, submission.State, Submitted, "rpc accepted or hash visible", time.Now().UTC())
 	if err != nil {
 		return submission, err

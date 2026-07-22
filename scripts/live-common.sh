@@ -38,11 +38,33 @@ gateway_for() {
     djq "$1" -er '.gateway' /output/gateway-manifest.json
 }
 
+run_cleanup_bounded() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 5 30 "$@"
+        return
+    fi
+    "$@" &
+    cleanup_pid=$!
+    (
+        sleep 30
+        kill -TERM "$cleanup_pid" 2>/dev/null || exit 0
+        sleep 5
+        kill -KILL "$cleanup_pid" 2>/dev/null || true
+    ) &
+    watchdog_pid=$!
+    wait "$cleanup_pid"
+    command_status=$?
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    return "$command_status"
+}
+
 cleanup_live_topology() {
     status=$?
+    trap - EXIT HUP INT TERM
     if [ -n "$compose_file" ] && [ -f "$compose_file" ]; then
-        dc logs --no-color >"$runtime_dir/compose.log" 2>&1 || true
-        dc down --volumes --remove-orphans >/dev/null 2>&1 || true
+        run_cleanup_bounded docker compose -f "$compose_file" logs --no-color >"$runtime_dir/compose.log" 2>&1 || true
+        run_cleanup_bounded docker compose -f "$compose_file" down --volumes --remove-orphans >/dev/null 2>&1 || true
     fi
     if [ "$status" -ne 0 ]; then
         printf '%s\n' "live TrustMap: failed; compose logs retained at $runtime_dir/compose.log" >&2

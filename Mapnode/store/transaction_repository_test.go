@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/executor"
@@ -16,6 +18,44 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
+
+type acceptedRebroadcastRPC struct {
+	sentRaw [][]byte
+}
+
+func (*acceptedRebroadcastRPC) PendingNonceAt(context.Context, common.Address) (uint64, error) {
+	return 0, nil
+}
+func (*acceptedRebroadcastRPC) SuggestGasTipCap(context.Context) (*big.Int, error) {
+	return big.NewInt(1), nil
+}
+func (*acceptedRebroadcastRPC) HeaderByNumber(context.Context, *big.Int) (*types.Header, error) {
+	return &types.Header{Number: big.NewInt(1), BaseFee: big.NewInt(1)}, nil
+}
+func (*acceptedRebroadcastRPC) EstimateGas(context.Context, ethereum.CallMsg) (uint64, error) {
+	return 100000, nil
+}
+func (rpc *acceptedRebroadcastRPC) SendTransaction(_ context.Context, transaction *types.Transaction) error {
+	raw, err := transaction.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	rpc.sentRaw = append(rpc.sentRaw, raw)
+	return nil
+}
+func (*acceptedRebroadcastRPC) TransactionByHash(context.Context, common.Hash) (*types.Transaction, bool, error) {
+	return nil, false, ethereum.NotFound
+}
+func (*acceptedRebroadcastRPC) TransactionReceipt(context.Context, common.Hash) (*types.Receipt, error) {
+	return nil, ethereum.NotFound
+}
+func (*acceptedRebroadcastRPC) RequestResolvedAtHash(context.Context, common.Address, domain.RequestID, common.Hash) (bool, error) {
+	return false, nil
+}
+
+type unusedRootGuard struct{}
+
+func (unusedRootGuard) Validate(context.Context, trustview.TrustRoot) error { return nil }
 
 func TestTransactionSubmissionIdentityAndPersistBeforeBroadcastRecovery(t *testing.T) {
 	db := openTestDB(t)
@@ -50,6 +90,62 @@ func TestTransactionSubmissionIdentityAndPersistBeforeBroadcastRecovery(t *testi
 	other.ID = executor.ComputeSubmissionID(other)
 	if _, _, err := repository.SavePrepared(context.Background(), other); err == nil {
 		t.Fatal("second active submission reused the home sender nonce")
+	}
+}
+
+func TestRecoverAcceptedExactRawRebroadcastPreservesSubmittedState(t *testing.T) {
+	db := openTestDB(t)
+	request, planID, snapshotID := insertExecutionPlanFixture(t, db, planner.DirectPlan)
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, err := types.SignNewTx(key, types.NewLondonSigner(request.HomeChainID.BigInt()), &types.DynamicFeeTx{
+		ChainID: request.HomeChainID.BigInt(), Nonce: 7, GasTipCap: big.NewInt(1), GasFeeCap: big.NewInt(3),
+		Gas: 100000, To: &request.Gateway, Value: new(big.Int), Data: []byte{1, 2, 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := transaction.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := testSubmission(t, request, planID, snapshotID, nil, 7)
+	submission.Sender = crypto.PubkeyToAddress(key.PublicKey)
+	submission.RawSignedTx = raw
+	submission.TxHash = transaction.Hash()
+	submission.CalldataHash = crypto.Keccak256Hash(transaction.Data())
+	submission.MaxFeePerGas = transaction.GasFeeCap()
+	submission.MaxPriorityFeePerGas = transaction.GasTipCap()
+	submission.GasLimit = transaction.Gas()
+	submission.ID = executor.ComputeSubmissionID(submission)
+
+	repository := NewTransactionRepository(db)
+	if _, _, err := repository.SavePrepared(context.Background(), submission); err != nil {
+		t.Fatal(err)
+	}
+	submitted, _, err := repository.Transition(context.Background(), submission.ID, executor.Prepared, executor.Submitted, "rpc accepted", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpc := &acceptedRebroadcastRPC{}
+	submitter, err := executor.NewTransactionSubmitter(rpc, repository, request.HomeChainID, key, 2, unusedRootGuard{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := submitter.Recover(context.Background()); err != nil {
+		t.Fatalf("accepted exact-raw rebroadcast degraded recovery: %v", err)
+	}
+	loaded, err := repository.Load(context.Background(), submission.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.State != executor.Submitted || loaded.SubmittedAt == nil || submitted.SubmittedAt == nil || !loaded.SubmittedAt.Equal(*submitted.SubmittedAt) {
+		t.Fatalf("state=%s submitted_at=%v want=%v", loaded.State, loaded.SubmittedAt, submitted.SubmittedAt)
+	}
+	if len(rpc.sentRaw) != 1 || string(rpc.sentRaw[0]) != string(raw) {
+		t.Fatal("recovery did not rebroadcast the exact persisted raw transaction once")
 	}
 }
 
