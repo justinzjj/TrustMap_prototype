@@ -3,8 +3,23 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 verifier=$repo_root/data/dune/scripts/verify_dataset.py
+query=$repo_root/data/dune/queries/bridge-flows-2025-12.sql
+downloader=$repo_root/data/dune/scripts/download_pages.sh
 fixture_root=$(mktemp -d)
 trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
+
+missing_acquisition=0
+if [ ! -f "$query" ]; then
+  echo "missing Dune acquisition query: data/dune/queries/bridge-flows-2025-12.sql" >&2
+  missing_acquisition=1
+fi
+if [ ! -f "$downloader" ]; then
+  echo "missing Dune page downloader: data/dune/scripts/download_pages.sh" >&2
+  missing_acquisition=1
+fi
+if [ "$missing_acquisition" -ne 0 ]; then
+  exit 1
+fi
 
 manifest_dir=$fixture_root/manifest
 trace_dir=$fixture_root/2025-12/processed
@@ -375,5 +390,230 @@ if git -C "$repo_root" check-ignore -q data/dune/2025-12/rawness.sha256; then
   echo "unrelated dated sidecar is over-ignored" >&2
   exit 1
 fi
+
+python3 - "$query" <<'PY'
+import pathlib
+import re
+import sys
+
+sql = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+normalized = re.sub(r"\s+", " ", sql).strip().lower()
+
+select_match = re.search(r"\bselect\s+(.*?)\s+from\s+bridges_evms\.flows\b", normalized)
+if not select_match:
+    raise SystemExit("Dune query must select from bridges_evms.flows")
+expressions = [item.strip() for item in select_match.group(1).split(",")]
+expected = [
+    "deposit_chain as src_chain",
+    "withdrawal_chain as dst_chain",
+    "bridge_name as bridge_name",
+    "deposit_block_number as src_block_number",
+    "withdrawal_block_number as dst_block_number",
+    "count(*) as tx_count",
+    "sum(amount_usd) as volume_usd",
+    "deposit_block_time as src_block_time",
+    "withdrawal_block_time as dst_block_time",
+]
+if expressions != expected:
+    raise SystemExit(f"Dune query select list differs: {expressions!r}")
+
+required_fragments = [
+    "deposit_chain is not null",
+    "withdrawal_chain is not null",
+    "deposit_block_number is not null",
+    "withdrawal_block_number is not null",
+    "deposit_block_time is not null",
+    "deposit_block_time >= timestamp '2025-12-01 00:00:00 utc'",
+    "deposit_block_time < timestamp '2026-01-01 00:00:00 utc'",
+    "group by deposit_chain, withdrawal_chain, bridge_name, deposit_block_number, withdrawal_block_number, deposit_block_time, withdrawal_block_time",
+    "order by src_block_time, src_chain, src_block_number, dst_chain, dst_block_number, bridge_name, dst_block_time",
+]
+for fragment in required_fragments:
+    if fragment not in normalized:
+        raise SystemExit(f"Dune query missing required clause: {fragment}")
+PY
+
+sh -n "$downloader"
+
+fake_bin=$fixture_root/fake-bin
+fake_log=$fixture_root/fake-curl.log
+mkdir -p "$fake_bin"
+cat >"$fake_bin/curl" <<'SH'
+#!/bin/sh
+set -eu
+
+output=
+header=
+url=
+saw_fail=0
+saw_silent=0
+saw_show_error=0
+saw_location=0
+retry=
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --fail) saw_fail=1 ;;
+    --silent) saw_silent=1 ;;
+    --show-error) saw_show_error=1 ;;
+    --location) saw_location=1 ;;
+    --retry)
+      [ "$#" -ge 2 ] || exit 91
+      retry=$2
+      shift
+      ;;
+    --header)
+      [ "$#" -ge 2 ] || exit 92
+      header=$2
+      shift
+      ;;
+    --output|-o)
+      [ "$#" -ge 2 ] || exit 93
+      output=$2
+      shift
+      ;;
+    https://*) url=$1 ;;
+    *) exit 94 ;;
+  esac
+  shift
+done
+
+[ "$saw_fail:$saw_silent:$saw_show_error:$saw_location:$retry" = "1:1:1:1:5" ] || exit 95
+[ "$header" = "x-dune-api-key: $DUNE_API_KEY" ] || exit 96
+[ -n "$output" ] && [ -n "$url" ] || exit 97
+printf '%s\n' "$url" >>"$FAKE_CURL_LOG"
+
+case ${FAKE_CURL_SCENARIO:-} in
+  data_then_header)
+    case $url in
+      *offset=0) printf 'column_a,column_b\nvalue-0,ok\n' >"$output" ;;
+      *offset=5000) printf 'column_a,column_b\n' >"$output" ;;
+      *) exit 98 ;;
+    esac
+    ;;
+  always_data)
+    offset=${url##*offset=}
+    printf 'column_a,column_b\nvalue-%s,ok\n' "$offset" >"$output"
+    ;;
+  resume_same)
+    printf 'column_a,column_b\nvalue-same,ok\n' >"$output"
+    ;;
+  resume_different)
+    printf 'column_a,column_b\nvalue-different,ok\n' >"$output"
+    ;;
+  fail_partial)
+    printf 'partial download' >"$output"
+    exit 22
+    ;;
+  *) exit 99 ;;
+esac
+SH
+chmod +x "$fake_bin/curl"
+
+test_key='integration-key-not-for-output'
+run_downloader() {
+  scenario=$1
+  shift
+  FAKE_CURL_LOG=$fake_log FAKE_CURL_SCENARIO=$scenario DUNE_API_KEY=$test_key \
+    PATH=$fake_bin:$PATH sh "$downloader" "$@"
+}
+
+expect_downloader_failure() {
+  label=$1
+  shift
+  if "$@" >"$fixture_root/downloader-failure.out" 2>&1; then
+    echo "expected downloader failure: $label" >&2
+    exit 1
+  fi
+  if grep -Fq -- "$test_key" "$fixture_root/downloader-failure.out"; then
+    echo "downloader exposed its credential while rejecting $label" >&2
+    exit 1
+  fi
+}
+
+expect_downloader_failure "missing credential" env -u DUNE_API_KEY \
+  PATH=$fake_bin:$PATH sh "$downloader" --max-pages 1 --output-dir "$fixture_root/no-key"
+expect_downloader_failure "zero query id" run_downloader always_data \
+  --query-id 0 --output-dir "$fixture_root/bad-qid"
+expect_downloader_failure "non-numeric limit" run_downloader always_data \
+  --limit nope --output-dir "$fixture_root/bad-limit"
+expect_downloader_failure "negative start page" run_downloader always_data \
+  --start-page -1 --output-dir "$fixture_root/bad-start"
+expect_downloader_failure "negative max pages" run_downloader always_data \
+  --max-pages -1 --output-dir "$fixture_root/bad-max"
+expect_downloader_failure "unknown argument" run_downloader always_data \
+  --unknown --output-dir "$fixture_root/unknown"
+expect_downloader_failure "missing argument value" run_downloader always_data \
+  --output-dir "$fixture_root/missing-value" --limit
+expect_missing_output_value_failure() {
+  (
+    cd "$fixture_root"
+    run_downloader always_data --output-dir --resume --max-pages 1
+  )
+}
+expect_downloader_failure "option used as missing output value" \
+  expect_missing_output_value_failure
+[ ! -e "$fixture_root/--resume" ]
+
+: >"$fake_log"
+download_dir=$fixture_root/download
+run_downloader data_then_header --output-dir "$download_dir"
+[ -f "$download_dir/6515125_0000.csv" ]
+[ ! -e "$download_dir/6515125_0001.csv" ]
+[ "$(find "$download_dir" -type f | wc -l)" -eq 1 ]
+cat >"$fixture_root/expected-urls" <<'EOF'
+https://api.dune.com/api/v1/query/6515125/results/csv?limit=5000&offset=0
+https://api.dune.com/api/v1/query/6515125/results/csv?limit=5000&offset=5000
+EOF
+cmp "$fixture_root/expected-urls" "$fake_log"
+if grep -Fq -- "$test_key" "$fake_log"; then
+  echo "fake curl log contains downloader credential" >&2
+  exit 1
+fi
+page_digest=$(sha256sum "$download_dir/6515125_0000.csv" | awk '{print $1}')
+printf '%s  %s\n' "$page_digest" 6515125_0000.csv >"$fixture_root/expected-inventory"
+cmp "$fixture_root/expected-inventory" "$download_dir.sha256"
+
+: >"$fake_log"
+max_dir=$fixture_root/max-pages
+run_downloader always_data --query-id 77 --output-dir "$max_dir" \
+  --limit 7 --start-page 3 --max-pages 2
+[ -f "$max_dir/77_0003.csv" ]
+[ -f "$max_dir/77_0004.csv" ]
+[ "$(find "$max_dir" -type f | wc -l)" -eq 2 ]
+cat >"$fixture_root/expected-max-urls" <<'EOF'
+https://api.dune.com/api/v1/query/77/results/csv?limit=7&offset=21
+https://api.dune.com/api/v1/query/77/results/csv?limit=7&offset=28
+EOF
+cmp "$fixture_root/expected-max-urls" "$fake_log"
+[ "$(wc -l <"$max_dir.sha256")" -eq 2 ]
+
+existing_dir=$fixture_root/existing
+mkdir -p "$existing_dir"
+printf 'original\n' >"$existing_dir/91_0000.csv"
+existing_digest=$(sha256sum "$existing_dir/91_0000.csv" | awk '{print $1}')
+expect_downloader_failure "existing page without resume" run_downloader always_data \
+  --query-id 91 --output-dir "$existing_dir" --max-pages 1
+[ "$(sha256sum "$existing_dir/91_0000.csv" | awk '{print $1}')" = "$existing_digest" ]
+
+resume_dir=$fixture_root/resume
+mkdir -p "$resume_dir"
+printf 'column_a,column_b\nvalue-same,ok\n' >"$resume_dir/92_0000.csv"
+run_downloader resume_same --query-id 92 --output-dir "$resume_dir" --max-pages 1 --resume
+resume_digest=$(sha256sum "$resume_dir/92_0000.csv" | awk '{print $1}')
+grep -Fq -- "$resume_digest  92_0000.csv" "$resume_dir.sha256"
+expect_downloader_failure "resume content mismatch" run_downloader resume_different \
+  --query-id 92 --output-dir "$resume_dir" --max-pages 1 --resume
+[ "$(sha256sum "$resume_dir/92_0000.csv" | awk '{print $1}')" = "$resume_digest" ]
+
+failure_dir=$fixture_root/curl-failure
+mkdir -p "$failure_dir"
+printf 'column_a,column_b\nkept,safe\n' >"$failure_dir/93_0000.csv"
+failure_digest=$(sha256sum "$failure_dir/93_0000.csv" | awk '{print $1}')
+printf 'preexisting inventory\n' >"$failure_dir.sha256"
+expect_downloader_failure "curl failure" run_downloader fail_partial \
+  --query-id 93 --output-dir "$failure_dir" --max-pages 1 --resume
+[ "$(sha256sum "$failure_dir/93_0000.csv" | awk '{print $1}')" = "$failure_digest" ]
+[ "$(cat "$failure_dir.sha256")" = "preexisting inventory" ]
+[ "$(find "$failure_dir" -type f | wc -l)" -eq 1 ]
 
 echo "replay dataset verification integration test passed"
