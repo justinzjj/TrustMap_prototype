@@ -44,7 +44,8 @@ data/
 └── dune/
     ├── 2025-12/
     │   ├── processed/msg.csv       # tracked canonical replay input
-    │   └── raw/                    # ignored local acquisition pages
+    │   ├── raw/                    # ignored local acquisition pages
+    │   └── raw.sha256              # ignored downloader inventory sidecar
     ├── manifests/bridge-flows-2025-12.json
     ├── queries/bridge-flows-2025-12.sql
     └── scripts/
@@ -117,8 +118,9 @@ The downloader sends the key through a mode-`0600` temporary curl header file,
 does not follow redirects, accepts only a successful 2xx response, validates
 CSV structure, writes pages atomically, and fails rather than replacing an
 existing page. `--resume` re-downloads and compares existing pages before it
-continues; it does not silently accept changed content. The raw directory and
-its `.sha256` inventory remain local.
+continues; it does not silently accept changed content. The downloader writes
+the ignored inventory to `${output_dir}.sha256`; for the example above that is
+`data/dune/2025-12/raw.sha256`. The raw directory and sidecar remain local.
 
 General usage is:
 

@@ -81,11 +81,13 @@ fixed half-open interval to `deposit_block_time` (the exported
 
 The query provenance records Dune Query ID `6515125`. The downloader:
 
-- accepts the API key only through `DUNE_API_KEY` or a command option;
+- accepts the API key only through the `DUNE_API_KEY` environment variable and
+  has no command-line credential option;
 - never contains or prints a credential;
 - validates numeric query/page parameters;
 - writes deterministic numbered pages beneath an explicit output directory;
-- uses retry/fail-on-HTTP-error behavior;
+- uses retry/fail-on-HTTP-error behavior, never follows redirects and rejects
+  every non-2xx response;
 - refuses to overwrite a non-empty page unless an explicit resume mode finds
   the same content;
 - stops on an empty/header-only page and emits a page checksum inventory.
@@ -139,7 +141,8 @@ data/dune/2025-12/processed/msg.csv
 
 `TRACE_PATH` and `--trace` remain supported. Documentation and Docker examples
 use repository-owned data paths. The full golden trace digest is unchanged.
-No code or script may silently fall back to `../TrustMap-ETH` after migration.
+No code or script may silently fall back to a sibling repository after
+migration.
 
 The raw directory, downloaded page inventories and generated processed files
 other than the canonical tracked trace are ignored. The manifest and README

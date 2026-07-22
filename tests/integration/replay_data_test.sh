@@ -1092,22 +1092,63 @@ cp "$3" "$FAKE_CONFIG_CAPTURE"
 SH
 chmod +x "$fake_mapnode"
 
+fake_replay_bin=$fixture_root/fake-replay-bin
+mkdir -p "$fake_replay_bin"
+cat >"$fake_replay_bin/go" <<'SH'
+#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >"$FAKE_GO_LOG"
+SH
+chmod +x "$fake_replay_bin/go"
+
+assert_canonical_replay_config() {
+  replay_config=$1
+  grep -Fqx "input_trace: '$repo_root/data/dune/2025-12/processed/msg.csv'" \
+    "$replay_config" || {
+      echo "replay-full default trace is not the repository canonical dataset" >&2
+      grep '^input_trace:' "$replay_config" >&2
+      exit 1
+    }
+  grep -Fqx 'expected_digest: ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175' \
+    "$replay_config" || {
+      echo "replay-full default trace is missing the canonical digest" >&2
+      exit 1
+    }
+}
+
+assert_auto_golden_call() {
+  golden_log=$1
+  golden_run_root=$2
+  grep -Fqx "run ./cmd/replaycheck --run-root $golden_run_root --golden configs/replay/golden/legacy-v4.1-full.json" \
+    "$golden_log" || {
+      echo "replay-full default did not invoke the canonical auto golden check" >&2
+      if [ -f "$golden_log" ]; then cat "$golden_log" >&2; fi
+      exit 1
+    }
+}
+
 default_replay_config=$fixture_root/default-replay.yaml
+default_replay_run=$fixture_root/default-replay-run
+default_go_log=$fixture_root/default-go.log
 env -u TRACE_PATH -u EXPECTED_DIGEST -u CHECK_GOLDEN \
+  PATH=$fake_replay_bin:$PATH FAKE_GO_LOG=$default_go_log \
   MAPNODE_BIN=$fake_mapnode FAKE_CONFIG_CAPTURE=$default_replay_config \
-  RUN_ROOT=$fixture_root/default-replay-run SETTINGS=B0 \
+  RUN_ROOT=$default_replay_run SETTINGS='B0 B1 B2 B3' \
   sh "$repo_root/scripts/replay-full.sh" >/dev/null
-grep -Fqx "input_trace: '$repo_root/data/dune/2025-12/processed/msg.csv'" \
-  "$default_replay_config" || {
-    echo "replay-full default trace is not the repository canonical dataset" >&2
-    grep '^input_trace:' "$default_replay_config" >&2
-    exit 1
-  }
-grep -Fqx 'expected_digest: ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175' \
-  "$default_replay_config" || {
-    echo "replay-full default trace is missing the canonical digest" >&2
-    exit 1
-  }
+assert_canonical_replay_config "$default_replay_config"
+assert_auto_golden_call "$default_go_log" "$default_replay_run"
+
+empty_trace_config=$fixture_root/empty-trace-replay.yaml
+empty_trace_run=$fixture_root/empty-trace-replay-run
+empty_trace_go_log=$fixture_root/empty-trace-go.log
+env -u EXPECTED_DIGEST -u CHECK_GOLDEN \
+  TRACE_PATH= PATH=$fake_replay_bin:$PATH FAKE_GO_LOG=$empty_trace_go_log \
+  MAPNODE_BIN=$fake_mapnode FAKE_CONFIG_CAPTURE=$empty_trace_config \
+  RUN_ROOT=$empty_trace_run SETTINGS='B0 B1 B2 B3' \
+  sh "$repo_root/scripts/replay-full.sh" >/dev/null
+assert_canonical_replay_config "$empty_trace_config"
+assert_auto_golden_call "$empty_trace_go_log" "$empty_trace_run"
 
 custom_trace=$repo_root/tests/fixtures/replay/planner-smoke-3chain.csv
 custom_replay_config=$fixture_root/custom-replay.yaml
@@ -1146,6 +1187,8 @@ $repo_root/README.md
 $repo_root/README.zh-CN.md
 $repo_root/docs/replay-experiments.md
 $repo_root/data/README.md
+$repo_root/docs/superpowers/specs/2026-07-22-replay-compatible-mapnode-design.md
+$repo_root/docs/superpowers/specs/2026-07-22-replay-data-and-performance-design.md
 "
 for active_file in $active_replay_files; do
   if grep -Fq -- '../TrustMap-ETH' "$active_file"; then
@@ -1154,6 +1197,10 @@ for active_file in $active_replay_files; do
   fi
   if grep -Eiq -- 'full trace (is )?(absent|not stored|not included)|complete historical trace is .*not .*stored|prepared full trace (is|are) not included|full trace.*尚未存|完整历史轨迹.*尚未存|预处理后的全量轨迹.*不.*提供' "$active_file"; then
     echo "active replay file says the canonical full trace is absent: $active_file" >&2
+    exit 1
+  fi
+  if grep -Eiq -- 'not copied into|DUNE_API_KEY.*command option|--location' "$active_file"; then
+    echo "active replay specification conflicts with the published data workflow: $active_file" >&2
     exit 1
   fi
 done

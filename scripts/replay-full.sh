@@ -15,7 +15,7 @@ yaml_quote() {
 default_trace=$repo_root/data/dune/2025-12/processed/msg.csv
 legacy_digest=ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175
 trace_was_overridden=0
-if [ "${TRACE_PATH+x}" = x ]; then trace_was_overridden=1; fi
+if [ -n "${TRACE_PATH:-}" ]; then trace_was_overridden=1; fi
 trace_path=${TRACE_PATH:-$default_trace}
 profile=${PROFILE:-legacy-v4.1}
 settings=${SETTINGS:-B0 B1 B2 B3}

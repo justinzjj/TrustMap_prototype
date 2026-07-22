@@ -36,8 +36,9 @@ files are read-only evaluation references:
 - `TrustMap-ETH/Dune/result_202512_v4_1_gas/` for golden outputs.
 
 Neither the old repository nor the paper repository may be modified by this
-work. The full trace remains a local, configurable input and is not copied into
-Git unless the user separately decides its release policy.
+work. The later approved Replay Data and Performance Design supersedes only
+this document's storage decision: the canonical processed trace is tracked in
+Git, while raw Dune pages remain local and ignored.
 
 The full input currently has:
 

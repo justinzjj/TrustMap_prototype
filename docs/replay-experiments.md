@@ -122,6 +122,12 @@ output mount; no Geth network is needed. Paths inside the YAML must match the
 container paths.
 
 ```sh
+mkdir -p runtime/replay-output
+sed \
+  -e 's#^input_trace:.*#input_trace: /input/msg.csv#' \
+  -e 's#^run_root:.*#run_root: /output#' \
+  configs/replay/full-21chain.yaml >runtime/replay.yaml
+
 docker build -f docker/mapnode.Dockerfile -t trustmap-mapnode .
 docker run --rm --entrypoint /mapnode \
   -v "$PWD/runtime/replay.yaml:/config/replay.yaml:ro" \
