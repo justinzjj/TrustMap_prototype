@@ -5,6 +5,7 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 verifier=$repo_root/data/dune/scripts/verify_dataset.py
 query=$repo_root/data/dune/queries/bridge-flows-2025-12.sql
 downloader=$repo_root/data/dune/scripts/download_pages.sh
+preparer=$repo_root/data/dune/scripts/prepare_trace.py
 fixture_root=$(mktemp -d)
 trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
 
@@ -27,6 +28,126 @@ raw_dir=$fixture_root/2025-12/raw
 manifest=$manifest_dir/dataset.json
 trace=$trace_dir/msg.csv
 mkdir -p "$manifest_dir" "$trace_dir" "$raw_dir"
+
+prepare_raw=$fixture_root/prepare-raw
+prepare_output=$fixture_root/prepared-msg.csv
+mkdir -p "$prepare_raw"
+
+prepare_header='src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time'
+
+write_prepare_pages() {
+  cat >"$prepare_raw/42_0000.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+ Polygon , Ethereum , First ,2.5,4.5,3.9,10.25,2025-12-02 00:00:00.000 UTC,2025-12-02 00:00:10.000 UTC
+ ARBITRUM , Base , Early A ,1.25e2,2.5,bad,bad,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:10.000 UTC
+CSV
+  cat >"$prepare_raw/42_0001.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+arbitrum,base, Early B ,125.0,2.5,2,1e1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:20.000 UTC
+ optimism , Arbitrum , Last ,8.5e1,1.005e2,7,0.125,2025-12-03 00:00:00.000 UTC,2025-12-03 00:00:10.000 UTC
+CSV
+}
+
+expect_prepare_failure() {
+  label=$1
+  shift
+  printf 'existing output\n' >"$prepare_output"
+  if "$@" >"$fixture_root/prepare-failure.out" 2>&1; then
+    echo "expected trace preparation failure: $label" >&2
+    exit 1
+  fi
+  grep -Fqx 'existing output' "$prepare_output" || {
+    echo "trace preparation replaced existing output while rejecting $label" >&2
+    exit 1
+  }
+  if find "$fixture_root" -maxdepth 1 -name '.prepared-msg.csv.*.tmp' -print | grep -q .; then
+    echo "trace preparation left a temporary file while rejecting $label" >&2
+    exit 1
+  fi
+}
+
+write_prepare_pages
+python3 "$preparer" --raw-dir "$prepare_raw" --query-id 42 \
+  --output "$prepare_output" --expected-rows 4
+cat >"$fixture_root/expected-prepared.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+arbitrum,base,Early A,125,2,0,0.0,2025-12-01 00:00:00+00:00,2025-12-01 00:00:10.000 UTC
+arbitrum,base,Early B,125,2,2,10.0,2025-12-01 00:00:00+00:00,2025-12-01 00:00:20.000 UTC
+polygon,ethereum,First,2,4,3,10.25,2025-12-02 00:00:00+00:00,2025-12-02 00:00:10.000 UTC
+optimism,arbitrum,Last,85,100,7,0.125,2025-12-03 00:00:00+00:00,2025-12-03 00:00:10.000 UTC
+CSV
+cmp "$fixture_root/expected-prepared.csv" "$prepare_output"
+prepare_digest=$(sha256sum "$prepare_output" | awk '{print $1}')
+python3 "$preparer" --raw-dir "$prepare_raw" --query-id 42 \
+  --output "$prepare_output" --expected-rows 4 --expected-sha256 "$prepare_digest"
+
+expect_prepare_failure "zero query id" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 0 --output "$prepare_output"
+expect_prepare_failure "non-numeric query id" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 4x --output "$prepare_output"
+expect_prepare_failure "row count mismatch" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output" --expected-rows 3
+expect_prepare_failure "digest mismatch" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output" \
+  --expected-sha256 0000000000000000000000000000000000000000000000000000000000000000
+
+mv "$prepare_raw/42_0001.csv" "$prepare_raw/42_0002.csv"
+expect_prepare_failure "missing page" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+mv "$prepare_raw/42_0002.csv" "$prepare_raw/42_0001.csv"
+
+cp "$prepare_raw/42_0000.csv" "$prepare_raw/042_0000.csv"
+expect_prepare_failure "duplicate noncanonical query page" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+unlink "$prepare_raw/042_0000.csv"
+cp "$prepare_raw/42_0000.csv" "$prepare_raw/43_0000.csv"
+expect_prepare_failure "extra query page" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+unlink "$prepare_raw/43_0000.csv"
+cp "$prepare_raw/42_0000.csv" "$prepare_raw/42_00.csv"
+expect_prepare_failure "extra page-like filename" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+unlink "$prepare_raw/42_00.csv"
+cp "$prepare_raw/42_0000.csv" "$prepare_raw/42_0000-copy.csv"
+expect_prepare_failure "duplicate page copy" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+unlink "$prepare_raw/42_0000-copy.csv"
+
+sed '1s/tx_count/transaction_count/' "$prepare_raw/42_0001.csv" \
+  >"$fixture_root/bad-prepare-page"
+mv "$fixture_root/bad-prepare-page" "$prepare_raw/42_0001.csv"
+expect_prepare_failure "inconsistent header" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+write_prepare_pages
+
+cat >"$prepare_raw/42_0001.csv" <<'CSV'
+src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
+arbitrum,base,"unterminated,125,2,2,10,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:20.000 UTC
+CSV
+expect_prepare_failure "malformed CSV" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+write_prepare_pages
+
+printf '%s\n' "$prepare_header" >"$prepare_raw/42_0001.csv"
+expect_prepare_failure "empty page" python3 "$preparer" \
+  --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+write_prepare_pages
+
+for invalid_case in blank-src-chain blank-dst-chain bad-src-height negative-src-height bad-dst-height bad-src-time; do
+  write_prepare_pages
+  case $invalid_case in
+    blank-src-chain) sed '3s/^ ARBITRUM /   /' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    blank-dst-chain) sed '3s/, Base ,/,   ,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    bad-src-height) sed '3s/,1.25e2,/,not-a-height,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    negative-src-height) sed '3s/,1.25e2,/,-1,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    bad-dst-height) sed '3s/,2.5,bad,/,not-a-height,bad,/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+    bad-src-time) sed '3s/2025-12-01 00:00:00.000 UTC/not-a-time/' "$prepare_raw/42_0000.csv" >"$fixture_root/invalid-page" ;;
+  esac
+  mv "$fixture_root/invalid-page" "$prepare_raw/42_0000.csv"
+  expect_prepare_failure "$invalid_case" python3 "$preparer" \
+    --raw-dir "$prepare_raw" --query-id 42 --output "$prepare_output"
+done
+write_prepare_pages
 
 valid_trace() {
   cat <<'CSV'
