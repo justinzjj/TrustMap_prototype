@@ -23,6 +23,23 @@ func main() {
 }
 
 func run(arguments []string, stderr io.Writer) int {
+	if len(arguments) > 0 {
+		switch arguments[0] {
+		case "serve":
+			return runServe(arguments[1:], stderr)
+		case "replay":
+			return runReplay(arguments[1:], stderr)
+		default:
+			if arguments[0] != "" && arguments[0][0] != '-' {
+				fmt.Fprintf(stderr, "unknown command %q\n", arguments[0])
+				return 2
+			}
+		}
+	}
+	return runServe(arguments, stderr)
+}
+
+func runServe(arguments []string, stderr io.Writer) int {
 	flags := flag.NewFlagSet("mapnode", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configPath := flags.String("config", os.Getenv("MAPNODE_CONFIG"), "path to the MapNode JSON configuration")

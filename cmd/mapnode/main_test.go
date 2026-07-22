@@ -54,6 +54,54 @@ func TestRunRequiresConfig(t *testing.T) {
 	}
 }
 
+func TestRunServeSubcommandPreservesConfigValidation(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"serve", "--config", "/does/not/exist.json"}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "bootstrap failed") {
+		t.Fatalf("serve subcommand code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestRunReplaySubcommandRequiresConfig(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"replay"}, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "--config is required") {
+		t.Fatalf("replay without config code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestRunRejectsUnknownSubcommand(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run([]string{"unknown"}, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "unknown command") {
+		t.Fatalf("unknown subcommand code=%d stderr=%q", code, stderr.String())
+	}
+}
+
+func TestRunReplaySubcommandExecutesFiniteReplay(t *testing.T) {
+	directory := t.TempDir()
+	trace := filepath.Join(directory, "trace.csv")
+	if err := os.WriteFile(trace, []byte("src_chain,dst_chain,src_block_number,dst_block_number,src_block_time\na,b,10,1,2025-12-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRoot := filepath.Join(directory, "runs")
+	if err := os.Mkdir(runRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(directory, "replay.yaml")
+	body := "version: 1\ninput_trace: " + trace + "\nrun_root: " + runRoot + "\nsettings: [B0]\ncost_profile:\n  id: fixture\n  direct_step_cost: 100\n  path_step_cost: 10\n  trust_root_update_cost: 5\ndurability:\n  synchronous: full\n"
+	if err := os.WriteFile(config, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := run([]string{"replay", "--config", config}, &stderr); code != 0 {
+		t.Fatalf("finite replay code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(runRoot, "b0", "decisions.csv")); err != nil {
+		t.Fatalf("replay result missing: %v", err)
+	}
+}
+
 func TestRunRejectsRuntimeChainMismatchBeforeServingReady(t *testing.T) {
 	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

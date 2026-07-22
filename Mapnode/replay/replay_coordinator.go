@@ -126,5 +126,34 @@ func (coordinator *ReplayCoordinator) Process(event ReplayEvent) (ReplayDecision
 	return result, nil
 }
 
+// Restore applies only the state transition committed for an event. It does
+// not invoke the planner, so resuming a run cannot silently select a new path.
+func (coordinator *ReplayCoordinator) Restore(event ReplayEvent, decision ReplayDecision) error {
+	if decision.EventID != event.ID || decision.Sequence != event.Sequence || decision.Setting != coordinator.setting {
+		return fmt.Errorf("restore replay event identity mismatch at sequence %d", event.Sequence)
+	}
+	if _, err := coordinator.view.Activate(event.Destination); err != nil {
+		return fmt.Errorf("restore replay start: %w", err)
+	}
+	if _, err := coordinator.view.Activate(event.Source); err != nil {
+		return fmt.Errorf("restore replay goal: %w", err)
+	}
+	baseline := coordinator.baselines.Get(event.Destination.Chain, event.Source.Chain)
+	if baseline != decision.BaselineBefore {
+		return fmt.Errorf("restore replay baseline before mismatch at sequence %d: got %d want %d", event.Sequence, baseline, decision.BaselineBefore)
+	}
+	after := coordinator.baselines.Advance(event.Destination.Chain, event.Source.Chain, event.Source.OriginalHeight)
+	if after != decision.BaselineAfter {
+		return fmt.Errorf("restore replay baseline after mismatch at sequence %d: got %d want %d", event.Sequence, after, decision.BaselineAfter)
+	}
+	if _, err := coordinator.view.AddVerifiedDependency(event.Destination, event.Source); err != nil {
+		return fmt.Errorf("restore replay dependency: %w", err)
+	}
+	if coordinator.view.NodeCount() != decision.GraphNodes || coordinator.view.EdgeCount() != decision.GraphEdges || coordinator.view.CrossEdgesAdded() != decision.CrossEdgesAdded {
+		return fmt.Errorf("restore replay graph counter mismatch at sequence %d", event.Sequence)
+	}
+	return nil
+}
+
 func (coordinator *ReplayCoordinator) TrustView() *ReplayTrustView { return coordinator.view }
 func (coordinator *ReplayCoordinator) Baselines() *ReplayBaselines { return coordinator.baselines }

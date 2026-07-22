@@ -142,3 +142,31 @@ func TestConfigRejectsInputUnderRunRootAndAliasedSettingDirectories(t *testing.T
 		t.Fatal("aliased setting output directories accepted")
 	}
 }
+
+func TestConfigSupportsPerSettingCheckpointPoliciesWithFlatFallback(t *testing.T) {
+	directory := t.TempDir()
+	trace := filepath.Join(directory, "trace.csv")
+	if err := os.WriteFile(trace, []byte("src_chain,dst_chain,src_block_number,dst_block_number,src_block_time\na,b,1,2,2025-12-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRoot := filepath.Join(directory, "runs")
+	if err := os.Mkdir(runRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "replay.yaml")
+	body := "version: 1\ninput_trace: " + trace + "\nrun_root: " + runRoot + "\nsettings: [B1, B3]\ncost_profile:\n  id: x\n  direct_step_cost: 100\n  path_step_cost: 10\n  trust_root_update_cost: 5\ncheckpoint_periods:\n  a: 10\ncheckpoint_periods_by_setting:\n  B3:\n    a: 20\n    placeholder: 30\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if period, _ := config.CheckpointPolicyForSetting(SettingB1).Period("a"); period != 10 {
+		t.Fatalf("B1 fallback period = %d", period)
+	}
+	b3 := config.CheckpointPolicyForSetting(SettingB3)
+	if period, _ := b3.Period("a"); period != 20 || b3.ConfiguredChainCount() != 2 {
+		t.Fatalf("B3 policy period=%d count=%d", period, b3.ConfiguredChainCount())
+	}
+}

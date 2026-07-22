@@ -40,35 +40,37 @@ type DurabilityConfig struct {
 }
 
 type Config struct {
-	Version          uint64
-	InputTrace       string
-	ExpectedDigest   string
-	RunRoot          string
-	Settings         []Setting
-	InvalidRowPolicy InvalidRowPolicy
-	CostProfile      CostProfile
-	CheckpointPolicy CheckpointPolicy
-	ChainAllowlist   []string
-	MaxEvents        uint64
-	RecordEvery      uint64
-	LogEvery         uint64
-	Durability       DurabilityConfig
+	Version            uint64
+	InputTrace         string
+	ExpectedDigest     string
+	RunRoot            string
+	Settings           []Setting
+	InvalidRowPolicy   InvalidRowPolicy
+	CostProfile        CostProfile
+	CheckpointPolicy   CheckpointPolicy
+	CheckpointPolicies map[Setting]CheckpointPolicy
+	ChainAllowlist     []string
+	MaxEvents          uint64
+	RecordEvery        uint64
+	LogEvery           uint64
+	Durability         DurabilityConfig
 }
 
 type rawConfig struct {
-	Version           uint64            `yaml:"version"`
-	InputTrace        string            `yaml:"input_trace"`
-	ExpectedDigest    string            `yaml:"expected_digest"`
-	RunRoot           string            `yaml:"run_root"`
-	Settings          []string          `yaml:"settings"`
-	InvalidRowPolicy  InvalidRowPolicy  `yaml:"invalid_row_policy"`
-	CostProfile       CostProfile       `yaml:"cost_profile"`
-	CheckpointPeriods map[string]uint64 `yaml:"checkpoint_periods"`
-	ChainAllowlist    []string          `yaml:"chain_allowlist"`
-	MaxEvents         *uint64           `yaml:"max_events"`
-	RecordEvery       uint64            `yaml:"record_every"`
-	LogEvery          uint64            `yaml:"log_every"`
-	Durability        DurabilityConfig  `yaml:"durability"`
+	Version                    uint64                       `yaml:"version"`
+	InputTrace                 string                       `yaml:"input_trace"`
+	ExpectedDigest             string                       `yaml:"expected_digest"`
+	RunRoot                    string                       `yaml:"run_root"`
+	Settings                   []string                     `yaml:"settings"`
+	InvalidRowPolicy           InvalidRowPolicy             `yaml:"invalid_row_policy"`
+	CostProfile                CostProfile                  `yaml:"cost_profile"`
+	CheckpointPeriods          map[string]uint64            `yaml:"checkpoint_periods"`
+	CheckpointPeriodsBySetting map[string]map[string]uint64 `yaml:"checkpoint_periods_by_setting"`
+	ChainAllowlist             []string                     `yaml:"chain_allowlist"`
+	MaxEvents                  *uint64                      `yaml:"max_events"`
+	RecordEvery                uint64                       `yaml:"record_every"`
+	LogEvery                   uint64                       `yaml:"log_every"`
+	Durability                 DurabilityConfig             `yaml:"durability"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -173,6 +175,21 @@ func validateRawConfig(raw rawConfig) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	checkpointPolicies := make(map[Setting]CheckpointPolicy, len(raw.CheckpointPeriodsBySetting))
+	for rawSetting, periods := range raw.CheckpointPeriodsBySetting {
+		setting, parseErr := ParseSetting(rawSetting)
+		if parseErr != nil {
+			return Config{}, fmt.Errorf("checkpoint_periods_by_setting: %w", parseErr)
+		}
+		if _, exists := checkpointPolicies[setting]; exists {
+			return Config{}, fmt.Errorf("duplicate checkpoint policy for setting %s", setting)
+		}
+		settingPolicy, policyErr := NewCheckpointPolicy(periods)
+		if policyErr != nil {
+			return Config{}, fmt.Errorf("checkpoint policy for %s: %w", setting, policyErr)
+		}
+		checkpointPolicies[setting] = settingPolicy
+	}
 	allowlist := make([]string, 0, len(raw.ChainAllowlist))
 	seenChains := make(map[string]struct{}, len(raw.ChainAllowlist))
 	for _, chain := range raw.ChainAllowlist {
@@ -216,10 +233,17 @@ func validateRawConfig(raw rawConfig) (Config, error) {
 	return Config{
 		Version: raw.Version, InputTrace: filepath.Clean(raw.InputTrace), ExpectedDigest: expectedDigest,
 		RunRoot: filepath.Clean(raw.RunRoot), Settings: settings, InvalidRowPolicy: policy,
-		CostProfile: raw.CostProfile, CheckpointPolicy: checkpointPolicy, ChainAllowlist: allowlist,
+		CostProfile: raw.CostProfile, CheckpointPolicy: checkpointPolicy, CheckpointPolicies: checkpointPolicies, ChainAllowlist: allowlist,
 		MaxEvents: maxEvents, RecordEvery: raw.RecordEvery, LogEvery: raw.LogEvery,
 		Durability: DurabilityConfig{Synchronous: synchronous},
 	}, nil
+}
+
+func (config Config) CheckpointPolicyForSetting(setting Setting) CheckpointPolicy {
+	if policy, ok := config.CheckpointPolicies[setting]; ok {
+		return policy
+	}
+	return config.CheckpointPolicy
 }
 
 func (config Config) SettingRunDir(setting Setting) string {
