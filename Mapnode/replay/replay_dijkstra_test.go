@@ -155,6 +155,29 @@ func TestReplayDijkstraReferenceCurrentBehavior(t *testing.T) {
 	}
 }
 
+func TestReplayDijkstraReferenceHeightTieBreak(t *testing.T) {
+	view := newReplayDijkstraReferenceView(t)
+	start := ReplayBlockKey{Chain: "s", Height: 1}
+	low := ReplayBlockKey{Chain: "x", Height: 1}
+	high := ReplayBlockKey{Chain: "x", Height: 2}
+	goal := ReplayBlockKey{Chain: "g", Height: 1}
+
+	// Build adjacency directly so no intra-chain x:1 <-> x:2 edge can create a
+	// shorter route than the two deliberately equal-cost alternatives.
+	view.setEdge(start, low, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
+	view.setEdge(start, high, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
+	view.setEdge(low, goal, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
+	view.setEdge(high, goal, ReplayEdge{Kind: ReplayVerifiedDependencyEdgeKind, Weight: 10})
+
+	path, found, err := assertReplayDijkstraReferenceMatches(t, view, start, goal, 20, goal.Chain, goal.Height)
+	if err != nil || !found {
+		t.Fatalf("height tie fixture error = %v, found = %t", err, found)
+	}
+	if len(path.Nodes) != 3 || path.Nodes[1] != low {
+		t.Fatalf("height tie path nodes = %#v, want path through %v", path.Nodes, low)
+	}
+}
+
 func TestReplayDijkstraReferenceMixedFixtures(t *testing.T) {
 	view := newReplayDijkstraReferenceView(t)
 	a1 := ReplayBlockKey{Chain: "a", Height: 1}
