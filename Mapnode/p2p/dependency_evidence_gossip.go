@@ -29,8 +29,10 @@ type GossipOutbox interface {
 
 type GossipConfig struct {
 	PublishInterval time.Duration
+	PublishTimeout  time.Duration
 	RetryBackoff    time.Duration
 	BatchSize       int
+	PublishReady    func() bool
 }
 
 type DependencyEvidenceGossip struct {
@@ -51,6 +53,9 @@ func NewDependencyEvidenceGossip(ctx context.Context, h host.Host, inbox GossipI
 	}
 	if config.RetryBackoff <= 0 {
 		config.RetryBackoff = time.Second
+	}
+	if config.PublishTimeout <= 0 {
+		config.PublishTimeout = 2 * time.Second
 	}
 	if config.BatchSize == 0 {
 		config.BatchSize = 64
@@ -120,6 +125,9 @@ func (gossip *DependencyEvidenceGossip) Run(ctx context.Context) error {
 			return err
 		case now := <-ticker.C:
 			if gossip.outbox != nil {
+				if gossip.config.PublishReady != nil && !gossip.config.PublishReady() {
+					continue
+				}
 				if err := gossip.publishPending(runCtx, now); err != nil {
 					if ctx.Err() != nil {
 						return ctx.Err()
@@ -162,15 +170,24 @@ func (gossip *DependencyEvidenceGossip) receive(ctx context.Context) error {
 		}
 	}
 }
+
 func (gossip *DependencyEvidenceGossip) publishPending(ctx context.Context, now time.Time) error {
+	if gossip.config.PublishReady != nil && !gossip.config.PublishReady() {
+		return nil
+	}
 	items, err := gossip.outbox.PendingEnvelopes(ctx, gossip.config.BatchSize, now)
 	if err != nil {
 		return err
 	}
 	for _, envelope := range items {
+		if gossip.config.PublishReady != nil && !gossip.config.PublishReady() {
+			return nil
+		}
 		encoded, err := envelope.MarshalBinary()
 		if err == nil {
-			err = gossip.topic.Publish(ctx, encoded)
+			publishCtx, cancel := context.WithTimeout(ctx, gossip.config.PublishTimeout)
+			err = gossip.topic.Publish(publishCtx, encoded, pubsub.WithReadiness(gossip.routerReady))
+			cancel()
 		}
 		if err != nil {
 			if markErr := gossip.outbox.MarkRetryable(ctx, envelope.MessageID, err.Error(), now.Add(gossip.config.RetryBackoff)); markErr != nil {
@@ -183,6 +200,13 @@ func (gossip *DependencyEvidenceGossip) publishPending(ctx context.Context, now 
 		}
 	}
 	return nil
+}
+
+func (gossip *DependencyEvidenceGossip) routerReady(router pubsub.PubSubRouter, topic string) (bool, error) {
+	if gossip.config.PublishReady != nil && !gossip.config.PublishReady() {
+		return false, nil
+	}
+	return router.EnoughPeers(topic, 1), nil
 }
 
 func (gossip *DependencyEvidenceGossip) Close() error {

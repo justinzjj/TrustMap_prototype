@@ -188,7 +188,11 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 		application.evidenceOutbox = store.NewEvidenceOutboxRepository(database)
 		application.RemoteDependencies = store.NewRemoteDependencyRepository(database)
 		p2pContext, p2pCancel := context.WithCancel(context.Background())
-		gossip, err := tmp2p.NewDependencyEvidenceGossip(p2pContext, p2pHost, application.EvidenceInbox, application.evidenceOutbox, tmp2p.GossipConfig{})
+		gossipConfig := tmp2p.GossipConfig{}
+		if len(bootstrapPeers) > 0 {
+			gossipConfig.PublishReady = application.p2pBootstrapReady.Load
+		}
+		gossip, err := tmp2p.NewDependencyEvidenceGossip(p2pContext, p2pHost, application.EvidenceInbox, application.evidenceOutbox, gossipConfig)
 		if err != nil {
 			p2pCancel()
 			_ = p2pHost.Close()

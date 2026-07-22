@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,7 +59,7 @@ func TestGossipFailsClosedWhenDurableInboxWriteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	injected := errors.New("inbox disk failure")
-	pub, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisher, nil, &testOutbox{envelope: gossipEnvelope(t, publisher.ID())}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
+	pub, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisher, &testInbox{}, &testOutbox{envelope: gossipEnvelope(t, publisher.ID())}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +86,7 @@ type testOutbox struct {
 	mu        sync.Mutex
 	envelope  tmp2p.DependencyEvidenceEnvelope
 	published bool
+	retries   int
 }
 
 type failingOutbox struct {
@@ -144,7 +146,124 @@ func (outbox *testOutbox) MarkPublished(_ context.Context, id common.Hash) error
 	return nil
 }
 func (outbox *testOutbox) MarkRetryable(context.Context, common.Hash, string, time.Time) error {
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	outbox.retries++
 	return nil
+}
+
+func (outbox *testOutbox) snapshot() (bool, int) {
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	return outbox.published, outbox.retries
+}
+
+func (outbox *testOutbox) reset(envelope tmp2p.DependencyEvidenceEnvelope) {
+	outbox.mu.Lock()
+	defer outbox.mu.Unlock()
+	outbox.envelope, outbox.published, outbox.retries = envelope, false, 0
+}
+
+func TestGossipRouterReadinessTimeoutKeepsPendingAndWorkerLive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	publisher := newLoopbackHost(t)
+	defer publisher.Close()
+	outbox := &testOutbox{envelope: gossipEnvelope(t, publisher.ID())}
+	gossip, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisher, &testInbox{}, outbox, tmp2p.GossipConfig{PublishInterval: 10 * time.Millisecond, PublishTimeout: 50 * time.Millisecond, RetryBackoff: 10 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = gossip.Close()
+	}()
+	done := make(chan error, 1)
+	go func() { done <- gossip.Run(ctx) }()
+	time.Sleep(300 * time.Millisecond)
+	published, retries := outbox.snapshot()
+	if published || retries == 0 {
+		t.Fatalf("router-unready outbox published=%t retries=%d", published, retries)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("router readiness timeout stopped worker: %v", err)
+	default:
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("worker shutdown=%v", err)
+	}
+}
+
+func TestGossipReadinessLossKeepsNewPendingUntilPeerReconnects(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	publisher := newLoopbackHost(t)
+	receiver := newLoopbackHost(t)
+	defer publisher.Close()
+	defer receiver.Close()
+	if err := publisher.Connect(ctx, peer.AddrInfo{ID: receiver.ID(), Addrs: receiver.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	first := gossipEnvelope(t, publisher.ID())
+	outbox := &testOutbox{envelope: first}
+	inbox := &testInbox{received: make(chan tmp2p.DependencyEvidenceEnvelope, 2)}
+	var staticReady atomic.Bool
+	staticReady.Store(true)
+	pubGossip, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisher, &testInbox{}, outbox, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond, PublishTimeout: 250 * time.Millisecond, RetryBackoff: 25 * time.Millisecond, PublishReady: staticReady.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	subGossip, err := tmp2p.NewDependencyEvidenceGossip(ctx, receiver, inbox, nil, tmp2p.GossipConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = pubGossip.Close()
+		_ = subGossip.Close()
+	}()
+	runErrors := make(chan error, 2)
+	go func() { runErrors <- pubGossip.Run(ctx) }()
+	go func() { runErrors <- subGossip.Run(ctx) }()
+	select {
+	case got := <-inbox.received:
+		if got.MessageID != first.MessageID {
+			t.Fatalf("first message=%x", got.MessageID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first message was not delivered")
+	}
+	staticReady.Store(false)
+	if err := publisher.Network().ClosePeer(receiver.ID()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := tmp2p.NewDependencyEvidenceEnvelope(publisher.ID(), first.ObservedAt.Add(time.Second), first.Locator())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox.reset(second)
+	time.Sleep(300 * time.Millisecond)
+	if published, _ := outbox.snapshot(); published {
+		t.Fatal("new pending message was published after static readiness was lost")
+	}
+	if err := publisher.Connect(ctx, peer.AddrInfo{ID: receiver.ID(), Addrs: receiver.Addrs()}); err != nil {
+		t.Fatal(err)
+	}
+	staticReady.Store(true)
+	select {
+	case got := <-inbox.received:
+		if got.MessageID != second.MessageID {
+			t.Fatalf("second message=%x want=%x", got.MessageID, second.MessageID)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("pending message was not delivered after static peer reconnected")
+	}
+	cancel()
+	for range 2 {
+		if err := <-runErrors; !errors.Is(err, context.Canceled) {
+			t.Fatalf("worker shutdown=%v", err)
+		}
+	}
 }
 
 func TestTwoRealLibp2pHostsGossipDependencyEvidenceOnLoopback(t *testing.T) {
@@ -160,7 +279,7 @@ func TestTwoRealLibp2pHostsGossipDependencyEvidenceOnLoopback(t *testing.T) {
 	envelope := gossipEnvelope(t, publisher.ID())
 	outbox := &testOutbox{envelope: envelope}
 	inbox := &testInbox{received: make(chan tmp2p.DependencyEvidenceEnvelope, 1)}
-	pubGossip, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisher, nil, outbox, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond, RetryBackoff: 25 * time.Millisecond})
+	pubGossip, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisher, &testInbox{}, outbox, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond, RetryBackoff: 25 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +342,7 @@ func TestCopiedEnvelopeIsDurablyRejectedWithoutPreemptingGenuineSenderCandidate(
 	if err != nil {
 		t.Fatal(err)
 	}
-	copier, err := tmp2p.NewDependencyEvidenceGossip(ctx, copyHost, nil, &testOutbox{envelope: envelope}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
+	copier, err := tmp2p.NewDependencyEvidenceGossip(ctx, copyHost, &testInbox{}, &testOutbox{envelope: envelope}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +365,7 @@ func TestCopiedEnvelopeIsDurablyRejectedWithoutPreemptingGenuineSenderCandidate(
 	if pending, err := inbox.Pending(ctx, 10, time.Now().Add(time.Hour)); err != nil || len(pending) != 0 {
 		t.Fatalf("copied envelope polluted candidate inbox: pending=%+v err=%v", pending, err)
 	}
-	genuine, err := tmp2p.NewDependencyEvidenceGossip(ctx, genuineHost, nil, &testOutbox{envelope: envelope}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
+	genuine, err := tmp2p.NewDependencyEvidenceGossip(ctx, genuineHost, &testInbox{}, &testOutbox{envelope: envelope}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

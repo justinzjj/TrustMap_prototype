@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	"net"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,8 +16,10 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
 	tmp2p "github.com/justinzjj/TrustMap_prototype/Mapnode/p2p"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
+	libp2p "github.com/libp2p/go-libp2p"
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 func TestEvidenceInboxPersistsCandidateDeduplicatesAndRecoversAfterRestart(t *testing.T) {
@@ -238,6 +243,120 @@ func TestIndexerNeverPublishesEvidenceActivatedOutsideItsConfirmedBlockTransacti
 	if countTable(t, fixture.db, "evidence_outbox") != 0 {
 		t.Fatal("pre-activated remote evidence entered the local confirmed-indexer outbox")
 	}
+}
+
+func TestRestartedPendingOutboxWaitsForLateStaticPeerAndTopicRouterBeforePublished(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	fixture := newDependencyApplyFixture(t)
+	publisherKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisherID, _ := peer.IDFromPrivateKey(publisherKey)
+	fixture.repository.ConfigureEvidenceOutbox(NewEvidenceOutboxRepository(fixture.db), publisherID)
+	if _, err := fixture.repository.ApplyConfirmedBlock(ctx, fixture.block); err != nil {
+		t.Fatal(err)
+	}
+	var sequence int
+	var databaseName, databasePath string
+	if err := fixture.db.sql.QueryRow("PRAGMA database_list").Scan(&sequence, &databaseName, &databasePath); err != nil || databasePath == "" {
+		t.Fatalf("database path=%q err=%v", databasePath, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	outbox := NewEvidenceOutboxRepository(restarted)
+	publisherInbox := NewEvidenceInboxRepository(restarted)
+	publisherHost, err := libp2p.New(libp2p.Identity(publisherKey), libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisherHost.Close()
+	receiverKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverID, _ := peer.IDFromPrivateKey(receiverKey)
+	receiverHost, err := libp2p.New(libp2p.Identity(receiverKey), libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverHost.Close()
+	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reservation.Addr().(*net.TCPAddr).Port
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listenAddress, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverDatabase, err := Open(filepath.Join(t.TempDir(), "receiver.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverDatabase.Close()
+	receiverInbox := NewEvidenceInboxRepository(receiverDatabase)
+	var bootstrapReady atomic.Bool
+	publisher, err := tmp2p.NewDependencyEvidenceGossip(ctx, publisherHost, publisherInbox, outbox, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond, PublishTimeout: 250 * time.Millisecond, PublishReady: bootstrapReady.Load})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiver, err := tmp2p.NewDependencyEvidenceGossip(ctx, receiverHost, receiverInbox, nil, tmp2p.GossipConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cancel()
+		_ = publisher.Close()
+		_ = receiver.Close()
+	}()
+	bootstrapper, err := tmp2p.NewStaticBootstrapper(publisherHost, []peer.AddrInfo{{ID: receiverID, Addrs: []ma.Multiaddr{listenAddress}}}, tmp2p.StaticBootstrapConfig{RetryInterval: 25 * time.Millisecond, DialTimeout: 2 * time.Second}, bootstrapReady.Store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runErrors := make(chan error, 3)
+	go func() { runErrors <- publisher.Run(ctx) }()
+	go func() { runErrors <- receiver.Run(ctx) }()
+	go func() { runErrors <- bootstrapper.Run(ctx) }()
+	time.Sleep(500 * time.Millisecond)
+	pending, err := outbox.Pending(ctx, 10, time.Now().Add(time.Hour))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("offline pending=%+v err=%v; publisher marked without a ready peer/router", pending, err)
+	}
+	if err := receiverHost.Network().Listen(listenAddress); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		received, receiveErr := receiverInbox.Pending(ctx, 10, time.Now().Add(time.Hour))
+		pending, pendingErr := outbox.Pending(ctx, 10, time.Now().Add(time.Hour))
+		if receiveErr == nil && pendingErr == nil && len(received) == 1 && len(pending) == 0 {
+			var state string
+			if err := restarted.sql.QueryRow("SELECT state FROM evidence_outbox").Scan(&state); err != nil || state != "published" || !bootstrapReady.Load() {
+				t.Fatalf("published state=%q ready=%t err=%v", state, bootstrapReady.Load(), err)
+			}
+			cancel()
+			for range 3 {
+				if err := <-runErrors; !errors.Is(err, context.Canceled) {
+					t.Fatalf("worker shutdown=%v", err)
+				}
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var state string
+	_ = restarted.sql.QueryRow("SELECT state FROM evidence_outbox").Scan(&state)
+	t.Fatalf("late static peer did not receive restarted pending outbox message: bootstrap_ready=%t connectedness=%s outbox_state=%s", bootstrapReady.Load(), publisherHost.Network().Connectedness(receiverID), state)
 }
 
 func testStoreEnvelope(t *testing.T) tmp2p.DependencyEvidenceEnvelope {
