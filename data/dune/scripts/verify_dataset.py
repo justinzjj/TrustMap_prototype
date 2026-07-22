@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
@@ -90,15 +89,110 @@ def resolve_path(manifest_path: Path, configured: Any, override: str | None, lab
 
 def validate_height(value: str, label: str) -> None:
     text = value.strip()
+    invalid = f"{label} is not a valid non-negative numeric height"
+    if not text or len(text) > 1024 or text.startswith("-"):
+        raise VerificationError(invalid)
+    if text.startswith("+"):
+        text = text[1:]
+
+    exponent = 0
+    exponent_positions = [index for index, character in enumerate(text) if character in "eE"]
+    if len(exponent_positions) > 1:
+        raise VerificationError(invalid)
+    if exponent_positions:
+        exponent_index = exponent_positions[0]
+        exponent_text = text[exponent_index + 1 :]
+        if not re.fullmatch(r"[+-]?[0-9]+", exponent_text):
+            raise VerificationError(invalid)
+        exponent = int(exponent_text)
+        if exponent < -1024 or exponent > 1024:
+            raise VerificationError(invalid)
+        text = text[:exponent_index]
+
+    parts = text.split(".")
+    if len(parts) > 2:
+        raise VerificationError(invalid)
+    whole = parts[0]
+    fraction = parts[1] if len(parts) == 2 else ""
+    digits = whole + fraction
+    if not digits or any(character < "0" or character > "9" for character in digits):
+        raise VerificationError(invalid)
+
+    coefficient = int(digits)
+    scale = len(fraction) - exponent
+    if scale <= 0:
+        result = coefficient * 10 ** (-scale)
+    else:
+        divisor = 10**scale
+        result, remainder = divmod(coefficient, divisor)
+        comparison = remainder * 2 - divisor
+        if comparison > 0 or (comparison == 0 and result % 2 == 1):
+            result += 1
+    if result > (1 << 64) - 1:
+        raise VerificationError(f"{label} {value!r} exceeds uint64")
+
+
+def validate_csv_quote_structure(path: Path, label: str) -> None:
+    """Reject quote forms that Go encoding/csv rejects but Python accepts."""
     try:
-        height = Decimal(text)
-    except InvalidOperation as error:
-        raise VerificationError(f"{label} is not a non-negative integral height") from error
-    if not text or not height.is_finite() or height < 0 or height != height.to_integral_value():
-        raise VerificationError(f"{label} is not a non-negative integral height")
+        source = path.open("r", encoding="utf-8", newline="")
+    except OSError as error:
+        raise VerificationError(f"cannot read {label} {path}: {error}") from error
+
+    field_start = "field_start"
+    unquoted = "unquoted"
+    quoted = "quoted"
+    after_quote = "after_quote"
+    after_quoted_cr = "after_quoted_cr"
+    state = field_start
+    line_number = 1
+    with source:
+        while chunk := source.read(1024 * 1024):
+            for character in chunk:
+                if state == quoted:
+                    if character == '"':
+                        state = after_quote
+                elif state == after_quote:
+                    if character == '"':
+                        state = quoted
+                    elif character == ",":
+                        state = field_start
+                    elif character == "\n":
+                        state = field_start
+                    elif character == "\r":
+                        state = after_quoted_cr
+                    else:
+                        raise VerificationError(
+                            f"{label} has invalid CSV quote structure near line {line_number}"
+                        )
+                elif state == after_quoted_cr:
+                    if character != "\n":
+                        raise VerificationError(
+                            f"{label} has invalid CSV quote structure near line {line_number}"
+                        )
+                    state = field_start
+                elif state == field_start:
+                    if character == '"':
+                        state = quoted
+                    elif character == "," or character == "\n":
+                        state = field_start
+                    else:
+                        state = unquoted
+                else:
+                    if character == '"':
+                        raise VerificationError(
+                            f"{label} has invalid CSV quote structure near line {line_number}"
+                        )
+                    if character == "," or character == "\n":
+                        state = field_start
+                if character == "\n":
+                    line_number += 1
+    if state == quoted or state == after_quoted_cr:
+        raise VerificationError(f"{label} has invalid CSV quote structure at end of file")
 
 
 def read_trace(path: Path, expected_columns: list[str], query_start: datetime, query_end: datetime) -> dict[str, Any]:
+    validate_csv_quote_structure(path, "trace")
     try:
         source = path.open("r", encoding="utf-8", newline="")
     except OSError as error:
@@ -106,8 +200,10 @@ def read_trace(path: Path, expected_columns: list[str], query_start: datetime, q
 
     row_count = 0
     chains: set[str] = set()
-    src_times: list[datetime] = []
-    dst_times: list[datetime] = []
+    src_min: datetime | None = None
+    src_max: datetime | None = None
+    dst_min: datetime | None = None
+    dst_max: datetime | None = None
     with source:
         reader = csv.reader(source, strict=True)
         try:
@@ -149,8 +245,10 @@ def read_trace(path: Path, expected_columns: list[str], query_start: datetime, q
                 if source_time < query_start or source_time >= query_end:
                     raise VerificationError(f"trace row {line_number} source time is outside query UTC bounds")
                 chains.update((source_chain, destination_chain))
-                src_times.append(source_time)
-                dst_times.append(destination_time)
+                src_min = source_time if src_min is None or source_time < src_min else src_min
+                src_max = source_time if src_max is None or source_time > src_max else src_max
+                dst_min = destination_time if dst_min is None or destination_time < dst_min else dst_min
+                dst_max = destination_time if dst_max is None or destination_time > dst_max else dst_max
                 row_count += 1
         except csv.Error as error:
             raise VerificationError(f"malformed trace row: {error}") from error
@@ -161,10 +259,10 @@ def read_trace(path: Path, expected_columns: list[str], query_start: datetime, q
         "rows": row_count,
         "chains": sorted(chains),
         "time_bounds": {
-            "src_min": min(src_times),
-            "src_max": max(src_times),
-            "dst_min": min(dst_times),
-            "dst_max": max(dst_times),
+            "src_min": src_min,
+            "src_max": src_max,
+            "dst_min": dst_min,
+            "dst_max": dst_max,
         },
     }
 
@@ -220,7 +318,8 @@ def verify_trace(manifest_path: Path, manifest: dict[str, Any], override: str | 
     return trace_path
 
 
-def count_page_rows(path: Path) -> int:
+def read_page_shape(path: Path) -> tuple[list[str], int]:
+    validate_csv_quote_structure(path, f"raw page {path.name}")
     try:
         source = path.open("r", encoding="utf-8", newline="")
     except OSError as error:
@@ -240,7 +339,7 @@ def count_page_rows(path: Path) -> int:
             raise VerificationError(f"raw page {path.name} is empty") from error
         except csv.Error as error:
             raise VerificationError(f"raw page {path.name} is malformed: {error}") from error
-    return rows
+    return header, rows
 
 
 def verify_raw_pages(manifest_path: Path, manifest: dict[str, Any], override: str) -> Path:
@@ -252,6 +351,14 @@ def verify_raw_pages(manifest_path: Path, manifest: dict[str, Any], override: st
     raw_dir = resolve_path(manifest_path, raw.get("path"), override, "raw_pages.path")
     count = require_count(raw.get("count"), "raw_pages.count")
     expected_total_rows = require_count(raw.get("rows"), "raw_pages.rows")
+    trace = require_mapping(manifest.get("trace"), "trace")
+    expected_trace_rows = require_count(trace.get("rows"), "trace.rows")
+    if expected_total_rows != expected_trace_rows:
+        raise VerificationError("raw page total rows must equal trace rows")
+    expected_columns_raw = require_list(trace.get("columns"), "trace.columns")
+    if any(not isinstance(column, str) or not column for column in expected_columns_raw):
+        raise VerificationError("trace.columns must contain non-blank strings")
+    expected_columns = list(expected_columns_raw)
     expected_inventory_digest = require_digest(raw.get("inventory_sha256"), "raw_pages.inventory_sha256")
     pages = require_list(raw.get("pages"), "raw_pages.pages")
     if len(pages) != count:
@@ -269,11 +376,15 @@ def verify_raw_pages(manifest_path: Path, manifest: dict[str, Any], override: st
             raise VerificationError("raw page inventory has a gap or invalid page name")
         expected_digest = require_digest(page.get("sha256"), f"raw_pages.pages[{index}].sha256")
         expected_rows = require_count(page.get("rows"), f"raw_pages.pages[{index}].rows")
+        if expected_rows == 0:
+            raise VerificationError(f"raw page {name} must contain at least one data row")
         page_path = raw_dir / name
         actual_digest = sha256_file(page_path)
         if actual_digest != expected_digest:
             raise VerificationError(f"raw page checksum does not match manifest: {name}")
-        actual_rows = count_page_rows(page_path)
+        actual_header, actual_rows = read_page_shape(page_path)
+        if actual_header != expected_columns:
+            raise VerificationError(f"raw page {name} header does not match trace columns")
         if actual_rows != expected_rows:
             raise VerificationError(f"raw page row count does not match manifest: {name}")
         total_rows += actual_rows
@@ -298,8 +409,9 @@ def load_manifest(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise VerificationError(f"cannot load manifest {path}: {error}") from error
     manifest = require_mapping(value, "manifest")
-    if isinstance(manifest.get("version"), bool) or manifest.get("version") != 1:
-        raise VerificationError("manifest version must be 1")
+    version = manifest.get("version")
+    if type(version) is not int or version != 1:
+        raise VerificationError("manifest version must be exact integer 1")
     require_string(manifest.get("dataset_id"), "dataset_id")
     return manifest
 
