@@ -69,7 +69,7 @@ func run(arguments []string, stderr io.Writer) int {
 	defer application.Close()
 
 	logger := log.New(stderr, "", log.LstdFlags|log.LUTC)
-	logger.Printf("mapnode=%s chain_id=%s confirmed Gateway indexer ready; p2p/transaction execution remain deferred", config.Name, config.HomeChain.ChainID)
+	logger.Printf("mapnode=%s chain_id=%s confirmed Gateway indexer and dependency evidence gossip configured; transaction execution remains deferred", config.Name, config.HomeChain.ChainID)
 	if config.DirectVerifier.Profile.MeasuredDirectCostGas == nil {
 		logger.Printf("mapnode=%s chain_id=%s direct verifier profile=%s is uncalibrated; measured_direct_cost_gas is null", config.Name, config.HomeChain.ChainID, config.DirectVerifier.Profile.ProfileID)
 	}
@@ -79,14 +79,31 @@ func run(arguments []string, stderr io.Writer) int {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	workerContext, cancelWorker := context.WithCancel(context.Background())
-	workerDone := make(chan struct{})
+	workerCount := 1
+	workerDone := make(chan error, 2)
 	go func() {
-		defer close(workerDone)
-		if err := application.RunConfirmedIndexer(workerContext); err != nil && !errors.Is(err, context.Canceled) {
+		err := application.RunConfirmedIndexer(workerContext)
+		if err != nil && !errors.Is(err, context.Canceled) {
 			logger.Printf("confirmed Gateway indexer stopped: %v", err)
 		}
+		workerDone <- err
 	}()
-	defer func() { cancelWorker(); <-workerDone }()
+	if config.P2P.Enabled {
+		workerCount++
+		go func() {
+			err := application.RunDependencyEvidenceWorkers(workerContext)
+			if err != nil && !errors.Is(err, context.Canceled) {
+				logger.Printf("dependency evidence workers stopped: %v", err)
+			}
+			workerDone <- err
+		}()
+	}
+	defer func() {
+		cancelWorker()
+		for range workerCount {
+			<-workerDone
+		}
+	}()
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	go func() {

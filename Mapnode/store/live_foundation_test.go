@@ -18,20 +18,20 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 )
 
-func TestConfirmedIndexerMigrationIsV5AndPreservesPriorChecksums(t *testing.T) {
+func TestDependencyEvidenceMigrationIsV6AndPreservesPriorChecksums(t *testing.T) {
 	db := openTestDB(t)
-	for _, table := range []string{"live_chains", "canonical_cursors", "trust_root_observations", "live_indexer_configs", "indexer_degraded_states", "indexed_gateway_logs", "verification_receipts", "request_resolutions"} {
+	for _, table := range []string{"live_chains", "canonical_cursors", "trust_root_observations", "live_indexer_configs", "indexer_degraded_states", "indexed_gateway_logs", "verification_receipts", "request_resolutions", "evidence_inbox", "evidence_outbox"} {
 		var strict int
 		if err := db.sql.QueryRow("SELECT strict FROM pragma_table_list WHERE name=?", table).Scan(&strict); err != nil || strict != 1 {
 			t.Fatalf("table %s strict=%d err=%v", table, strict, err)
 		}
 	}
 	var version, count int
-	if err := db.sql.QueryRow("SELECT MAX(version),COUNT(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 5 || count != 5 {
+	if err := db.sql.QueryRow("SELECT MAX(version),COUNT(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 6 || count != 6 {
 		t.Fatalf("migration history max=%d count=%d err=%v", version, count, err)
 	}
-	checksums := [][32]byte{sha256.Sum256([]byte(phase3Schema)), sha256.Sum256([]byte(pathProofIntegrityV2)), sha256.Sum256([]byte(liveObservationFoundationV3)), sha256.Sum256([]byte(liveChainDeleteProtectionV4))}
-	wants := []string{"ab9d49540980805aa7f76dd84a4c99bce4df85ed61f4f9eeb3285c91ec40dc4a", "795e28e399ac9df3d8a39a1dbf309ca964de3025a5f4090758bd98a2eda8841e", "dff57af6e30db4a26d11a45c29ac46a5425f563552b6a5430af05b9f69c3a088", "b2d912d7120e34420424e9f33b8cfa9df3c2c3fb829d2d13c67b63a312634fc5"}
+	checksums := [][32]byte{sha256.Sum256([]byte(phase3Schema)), sha256.Sum256([]byte(pathProofIntegrityV2)), sha256.Sum256([]byte(liveObservationFoundationV3)), sha256.Sum256([]byte(liveChainDeleteProtectionV4)), sha256.Sum256([]byte(confirmedGatewayIndexerV5))}
+	wants := []string{"ab9d49540980805aa7f76dd84a4c99bce4df85ed61f4f9eeb3285c91ec40dc4a", "795e28e399ac9df3d8a39a1dbf309ca964de3025a5f4090758bd98a2eda8841e", "dff57af6e30db4a26d11a45c29ac46a5425f563552b6a5430af05b9f69c3a088", "b2d912d7120e34420424e9f33b8cfa9df3c2c3fb829d2d13c67b63a312634fc5", "1eca6274db154e9fe9ad53c6f28cade7a7d03f9e881db2769667297c1a06c9ea"}
 	for index, checksum := range checksums {
 		if got := common.Bytes2Hex(checksum[:]); got != wants[index] {
 			t.Fatalf("v%d checksum drifted: %s", index+1, got)
@@ -39,7 +39,7 @@ func TestConfirmedIndexerMigrationIsV5AndPreservesPriorChecksums(t *testing.T) {
 	}
 }
 
-func TestConfirmedIndexerMigrationUpgradesRealV4DatabaseWithoutChecksumDrift(t *testing.T) {
+func TestDependencyEvidenceMigrationUpgradesRealV4DatabaseWithoutChecksumDrift(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v4.sqlite")
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -66,7 +66,7 @@ func TestConfirmedIndexerMigrationUpgradesRealV4DatabaseWithoutChecksumDrift(t *
 	}
 	defer db.Close()
 	var version, count int
-	if err := db.sql.QueryRow(`SELECT MAX(version),COUNT(*) FROM schema_migrations`).Scan(&version, &count); err != nil || version != 5 || count != 5 {
+	if err := db.sql.QueryRow(`SELECT MAX(version),COUNT(*) FROM schema_migrations`).Scan(&version, &count); err != nil || version != 6 || count != 6 {
 		t.Fatalf("history max=%d count=%d err=%v", version, count, err)
 	}
 	for _, item := range migrations[:4] {

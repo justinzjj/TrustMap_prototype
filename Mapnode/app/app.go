@@ -10,13 +10,16 @@ import (
 	"math/big"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/chain"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/indexer"
+	tmp2p "github.com/justinzjj/TrustMap_prototype/Mapnode/p2p"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/planner"
 	pathproof "github.com/justinzjj/TrustMap_prototype/Mapnode/proof"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/registry"
@@ -24,6 +27,8 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/store"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
+	libp2p "github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 )
 
 var (
@@ -32,17 +37,21 @@ var (
 )
 
 type App struct {
-	Registry              *registry.Registry
-	ChainCatalog          *chain.Registry
-	LiveChains            *store.LiveChainRepository
-	TrustRootObservations *store.TrustRootObservationRepository
-	Evidence              *store.EvidenceRepository
-	Requests              *store.RequestRepository
-	TrustView             *store.TrustViewRepository
-	Plans                 *store.PlanRepository
-	PathProofs            *store.PathProofRepository
-	PathProofBuilder      *pathproof.Builder
-	ConfirmedEventIndexer *indexer.ConfirmedEventIndexer
+	Registry                 *registry.Registry
+	ChainCatalog             *chain.Registry
+	LiveChains               *store.LiveChainRepository
+	TrustRootObservations    *store.TrustRootObservationRepository
+	Evidence                 *store.EvidenceRepository
+	Requests                 *store.RequestRepository
+	TrustView                *store.TrustViewRepository
+	Plans                    *store.PlanRepository
+	PathProofs               *store.PathProofRepository
+	PathProofBuilder         *pathproof.Builder
+	ConfirmedEventIndexer    *indexer.ConfirmedEventIndexer
+	EvidenceInbox            *store.EvidenceInboxRepository
+	EvidenceOutbox           *store.EvidenceOutboxRepository
+	RemoteDependencies       *store.RemoteDependencyRepository
+	DependencyEvidenceGossip *tmp2p.DependencyEvidenceGossip
 
 	database          *store.DB
 	pathTreeDepth     uint8
@@ -50,6 +59,9 @@ type App struct {
 	operationalMu     sync.RWMutex
 	indexerValidated  bool
 	indexerFailed     bool
+	p2pFailed         bool
+	p2pHost           host.Host
+	p2pCancel         context.CancelFunc
 	canonicalCursors  *store.CanonicalCursorRepository
 	planner           *planner.Planner
 	coordinator       requestProcessor
@@ -115,7 +127,8 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 		return nil, fmt.Errorf("persist home Gateway deployment: %w", err)
 	}
 	application.canonicalCursors = store.NewCanonicalCursorRepository(database)
-	application.indexerRepository = store.NewIndexerRepository(database)
+	indexerRepository := store.NewIndexerRepository(database)
+	application.indexerRepository = indexerRepository
 	application.TrustRootObservations = store.NewTrustRootObservationRepository(database)
 	application.Evidence = store.NewEvidenceRepository(database)
 	application.Requests = store.NewRequestRepository(database)
@@ -147,6 +160,48 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 	}
 	application.observers[homeChainID] = observerBinding{client: homeRPC}
 	application.ConfirmedEventIndexer = confirmedIndexer
+	if config.P2P.Enabled {
+		privateKey, peerID, err := tmp2p.LoadPersistentEd25519Identity(config.P2P.PrivateKeyFile)
+		if err != nil {
+			homeRPC.Close()
+			_ = database.Close()
+			return nil, err
+		}
+		bootstrapPeers, err := tmp2p.LoadBootstrapPeers(config.P2P.BootstrapFile, peerID)
+		if err != nil {
+			homeRPC.Close()
+			_ = database.Close()
+			return nil, err
+		}
+		p2pHost, err := libp2p.New(libp2p.Identity(privateKey), libp2p.ListenAddrStrings(config.P2P.Listen))
+		if err != nil {
+			homeRPC.Close()
+			_ = database.Close()
+			return nil, fmt.Errorf("create persistent libp2p host: %w", err)
+		}
+		if err := tmp2p.ConnectBootstrapPeers(ctx, p2pHost, bootstrapPeers); err != nil {
+			_ = p2pHost.Close()
+			homeRPC.Close()
+			_ = database.Close()
+			return nil, err
+		}
+		application.p2pHost = p2pHost
+		application.EvidenceInbox = store.NewEvidenceInboxRepository(database)
+		application.EvidenceOutbox = store.NewEvidenceOutboxRepository(database)
+		application.RemoteDependencies = store.NewRemoteDependencyRepository(database)
+		p2pContext, p2pCancel := context.WithCancel(context.Background())
+		gossip, err := tmp2p.NewDependencyEvidenceGossip(p2pContext, p2pHost, application.EvidenceInbox, application.EvidenceOutbox, tmp2p.GossipConfig{})
+		if err != nil {
+			p2pCancel()
+			_ = p2pHost.Close()
+			homeRPC.Close()
+			_ = database.Close()
+			return nil, err
+		}
+		application.p2pCancel = p2pCancel
+		application.DependencyEvidenceGossip = gossip
+		indexerRepository.ConfigureEvidenceOutbox(application.EvidenceOutbox, peerID)
+	}
 	application.ready.Store(true)
 	return application, nil
 }
@@ -222,6 +277,9 @@ func (application *App) indexerWorkerGate(ctx context.Context) error {
 		return ErrOperationalUnavailable
 	}
 	if application.indexerFailed {
+		return ErrOperationalDegraded
+	}
+	if application.p2pFailed {
 		return ErrOperationalDegraded
 	}
 	degraded, err := application.canonicalCursors.HasDegradedCanonicalCursor(ctx)
@@ -475,6 +533,134 @@ func (application *App) observer(entry chain.Chain) (observerBinding, error) {
 	return binding, nil
 }
 
+type remoteObservationAdapter struct{ application *App }
+
+func (adapter remoteObservationAdapter) ObserveExpectedTrustRoot(ctx context.Context, chainID domain.ChainID, height domain.BlockHeight, blockHash, expectedRoot common.Hash) (evidence.ValidatedTrustRootObservation, error) {
+	node, err := adapter.application.ObserveExpectedTrustRoot(ctx, chainID, height, blockHash, expectedRoot)
+	if err != nil {
+		if deterministicObservationError(err) || errors.Is(err, indexer.ErrDeterministicObservation) {
+			return evidence.ValidatedTrustRootObservation{}, fmt.Errorf("%w: %v", evidence.ErrInvalidTrustRootObservation, err)
+		}
+		return evidence.ValidatedTrustRootObservation{}, err
+	}
+	return evidence.ValidatedTrustRootObservation{ChainID: node.Key.ChainID, Height: node.Key.Height, BlockHash: node.Key.BlockHash, TrustRoot: node.Root.Hash, EvidenceID: node.EvidenceID}, nil
+}
+
+func (application *App) remoteValidator(entry chain.Chain) (*evidence.RemoteDependencyValidator, error) {
+	binding, err := application.observer(entry)
+	if err != nil {
+		return nil, err
+	}
+	config, err := chain.LoadGatewayDeploymentConfig(entry)
+	if err != nil {
+		return nil, err
+	}
+	return evidence.NewRemoteDependencyValidator(evidence.RemoteDependencyConfig{ChainID: entry.ChainID, Gateway: config.Deployment.Address, GatewayCodeHash: config.Deployment.CodeHash, DeploymentBlock: config.DeploymentBlock.BigInt().Uint64(), Confirmations: entry.Confirmations, MerkleDepth: config.MerkleDepth, PathStepCostGas: config.PathStepCostGas}, binding.client, remoteObservationAdapter{application})
+}
+
+func (application *App) StepRemoteDependencyEvidence(ctx context.Context) (int, error) {
+	if application == nil || application.EvidenceInbox == nil || application.RemoteDependencies == nil {
+		return 0, ErrOperationalUnavailable
+	}
+	items, err := application.EvidenceInbox.Pending(ctx, 64, time.Now().UTC())
+	if err != nil {
+		return 0, err
+	}
+	validated := 0
+	for _, item := range items {
+		entry, ok := application.ChainCatalog.Chain(item.Envelope.RecordingChainID)
+		if !ok {
+			if err := application.EvidenceInbox.MarkInvalid(ctx, item.Envelope.MessageID, "recording chain is absent from trusted catalog"); err != nil {
+				return validated, err
+			}
+			continue
+		}
+		validator, err := application.remoteValidator(entry)
+		if err != nil {
+			if deterministicObservationError(err) || errors.Is(err, chain.ErrInvalidGatewayManifest) {
+				if markErr := application.EvidenceInbox.MarkInvalid(ctx, item.Envelope.MessageID, err.Error()); markErr != nil {
+					return validated, markErr
+				}
+			} else {
+				if markErr := application.EvidenceInbox.MarkRetryable(ctx, item.Envelope.MessageID, err.Error(), time.Now().UTC().Add(time.Second)); markErr != nil {
+					return validated, markErr
+				}
+			}
+			continue
+		}
+		result, err := validator.Validate(ctx, item.Envelope.Locator())
+		if errors.Is(err, evidence.ErrRemoteDependencyInvalid) {
+			if markErr := application.EvidenceInbox.MarkInvalid(ctx, item.Envelope.MessageID, err.Error()); markErr != nil {
+				return validated, markErr
+			}
+			continue
+		}
+		if errors.Is(err, evidence.ErrRemoteDependencyRetryable) {
+			if markErr := application.EvidenceInbox.MarkRetryable(ctx, item.Envelope.MessageID, err.Error(), time.Now().UTC().Add(time.Second)); markErr != nil {
+				return validated, markErr
+			}
+			continue
+		}
+		if err != nil {
+			return validated, err
+		}
+		application.operationalMu.Lock()
+		if gateErr := application.indexerWorkerGate(ctx); gateErr != nil {
+			application.operationalMu.Unlock()
+			return validated, gateErr
+		}
+		_, err = application.RemoteDependencies.Activate(ctx, item.Envelope.MessageID, result)
+		application.operationalMu.Unlock()
+		if err != nil {
+			return validated, err
+		}
+		validated++
+	}
+	return validated, nil
+}
+
+func (application *App) RunRemoteDependencyEvidence(ctx context.Context) error {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := application.StepRemoteDependencyEvidence(ctx); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (application *App) RunDependencyEvidenceWorkers(ctx context.Context) error {
+	if application == nil || application.DependencyEvidenceGossip == nil {
+		return ErrOperationalUnavailable
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 2)
+	go func() { done <- application.DependencyEvidenceGossip.Run(workerCtx) }()
+	go func() { done <- application.RunRemoteDependencyEvidence(workerCtx) }()
+	err := <-done
+	cancel()
+	otherErr := <-done
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, context.Canceled) && !errors.Is(otherErr, context.Canceled) {
+		err = otherErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	application.operationalMu.Lock()
+	application.p2pFailed = true
+	application.operationalMu.Unlock()
+	return err
+}
+
 func (application *App) Close() error {
 	if application == nil {
 		return nil
@@ -482,6 +668,15 @@ func (application *App) Close() error {
 	application.operationalMu.Lock()
 	defer application.operationalMu.Unlock()
 	application.ready.Store(false)
+	if application.p2pCancel != nil {
+		application.p2pCancel()
+	}
+	if application.DependencyEvidenceGossip != nil {
+		_ = application.DependencyEvidenceGossip.Close()
+	}
+	if application.p2pHost != nil {
+		_ = application.p2pHost.Close()
+	}
 	application.observerMu.Lock()
 	closed := make(map[*ethclient.Client]struct{})
 	for _, binding := range application.observers {

@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -24,7 +26,64 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/reorg"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/store"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
+	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
+
+func TestOpenComposesPersistentP2PAndP2PFailureClosesOperationalGate(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	privateKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := libp2pcrypto.MarshalPrivateKey(privateKey)
+	id, _ := peer.IDFromPrivateKey(privateKey)
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "p2p-private-key")
+	bootstrapPath := filepath.Join(dir, "bootstrap.json")
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(raw)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	valid, _ := json.Marshal(map[string]any{"version": 1, "nodes": []map[string]string{{"name": "self", "peer_id": id.String(), "multiaddr": "/ip4/127.0.0.1/tcp/1/p2p/" + id.String()}}})
+	if err := os.WriteFile(bootstrapPath, valid, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.P2P = bootstrap.P2P{Enabled: true, Listen: "/ip4/127.0.0.1/tcp/0", PrivateKeyFile: keyPath, BootstrapFile: bootstrapPath}
+	startupContext, cancelStartup := context.WithCancel(context.Background())
+	application, err := Open(startupContext, config, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelStartup()
+	defer application.Close()
+	if application.DependencyEvidenceGossip == nil || application.EvidenceInbox == nil || application.EvidenceOutbox == nil {
+		t.Fatalf("incomplete p2p composition: %+v", application)
+	}
+	workerContext, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- application.RunDependencyEvidenceWorkers(workerContext) }()
+	select {
+	case err := <-workerDone:
+		t.Fatalf("startup context cancellation stopped p2p workers: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancelWorker()
+	if err := <-workerDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("worker shutdown=%v", err)
+	}
+	application.indexerValidated = true
+	if !application.Ready() {
+		t.Fatal("healthy composed p2p app not ready after indexer validation")
+	}
+	application.p2pFailed = true
+	if application.Ready() {
+		t.Fatal("p2p worker failure left app ready")
+	}
+	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
+		t.Fatalf("Process error=%v", err)
+	}
+}
 
 func TestOpenBuildsPhaseThreeAppButFailsClosedUntilIndexerValidation(t *testing.T) {
 	config, manifest, closeRPC := appFixture(t, "0x2711")

@@ -15,10 +15,12 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/indexer"
+	tmp2p "github.com/justinzjj/TrustMap_prototype/Mapnode/p2p"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/reorg"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/trustview"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 	internalproof "github.com/justinzjj/TrustMap_prototype/internal/proof"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 type IndexerConfig struct {
@@ -33,9 +35,18 @@ type IndexerConfig struct {
 type IndexerRepository struct {
 	db           *DB
 	beforeCommit func() error
+	outbox       *EvidenceOutboxRepository
+	outboxPeer   peer.ID
 }
 
 func NewIndexerRepository(db *DB) *IndexerRepository { return &IndexerRepository{db: db} }
+
+func (repository *IndexerRepository) ConfigureEvidenceOutbox(outbox *EvidenceOutboxRepository, origin peer.ID) {
+	if repository == nil || outbox == nil || repository.db == nil || outbox.db != repository.db || origin == "" {
+		return
+	}
+	repository.outbox, repository.outboxPeer = outbox, origin
+}
 
 func (repository *IndexerRepository) Degrade(ctx context.Context, chainID domain.ChainID, reason string) error {
 	if repository == nil || repository.db == nil || reason == "" {
@@ -200,6 +211,13 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 			return false, err
 		}
 		graphChanged = graphChanged || changed
+		if repository.outbox != nil {
+			outboxChanged, err := enqueueActiveEvidenceOutbox(ctx, tx, repository.outboxPeer, material.Evidence)
+			if err != nil {
+				return false, err
+			}
+			durableChanged = durableChanged || outboxChanged
+		}
 	}
 	durableChanged = durableChanged || graphChanged
 	if replay && durableChanged {
@@ -232,6 +250,38 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 		return false, fmt.Errorf("commit confirmed block: %w", err)
 	}
 	return !replay, nil
+}
+
+func enqueueActiveEvidenceOutbox(ctx context.Context, tx *sql.Tx, origin peer.ID, record evidence.Record) (bool, error) {
+	persisted, err := scanEvidence(tx.QueryRowContext(ctx, evidenceSelect+" WHERE id=?", record.ID[:]))
+	if err != nil || persisted.State != evidence.Active || persisted.Locator != record.Locator {
+		return false, ErrEvidenceBinding
+	}
+	var existing []byte
+	err = tx.QueryRowContext(ctx, `SELECT envelope FROM evidence_outbox WHERE evidence_id=?`, record.ID[:]).Scan(&existing)
+	if err == nil {
+		envelope, parseErr := tmp2p.ParseDependencyEvidenceEnvelope(existing)
+		if parseErr != nil || envelope.OriginPeer != origin || envelope.Locator() != record.Locator {
+			return false, ErrRecordConflict
+		}
+		return false, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	envelope, err := tmp2p.NewDependencyEvidenceEnvelope(origin, time.Now().UTC(), record.Locator)
+	if err != nil {
+		return false, err
+	}
+	encoded, err := envelope.MarshalBinary()
+	if err != nil {
+		return false, err
+	}
+	now := time.Now().UTC().UnixNano()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO evidence_outbox(message_id,evidence_id,origin_peer,envelope,state,attempts,next_attempt_at,last_error,created_at,updated_at,published_at) VALUES(?,?,?,?,'pending',0,?,'',?,?,NULL)`, envelope.MessageID[:], record.ID[:], origin.String(), encoded, now, now, now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func requireIndexerConfig(ctx context.Context, tx *sql.Tx, block indexer.ConfirmedBlock) error {

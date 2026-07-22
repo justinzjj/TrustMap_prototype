@@ -45,6 +45,7 @@ func TestOpenEnablesWALForeignKeysAndCreatesCompletePhaseThreeSchema(t *testing.
 		"trust_nodes", "trust_edges", "trustview_snapshots", "snapshot_nodes", "snapshot_edges",
 		"membership_witnesses", "membership_witness_siblings", "plans", "plan_hops",
 		"request_current_plan", "proofs", "proof_hops",
+		"evidence_inbox", "evidence_outbox",
 	}
 	for _, table := range wantTables {
 		var strict int
@@ -59,8 +60,8 @@ func TestOpenEnablesWALForeignKeysAndCreatesCompletePhaseThreeSchema(t *testing.
 	if err := db.sql.QueryRow("SELECT MAX(version),COUNT(*) FROM schema_migrations").Scan(&version, &count); err != nil {
 		t.Fatal(err)
 	}
-	if version != 5 || count != 5 {
-		t.Fatalf("migration history = max %d count %d, want max 5 count 5", version, count)
+	if version != 6 || count != 6 {
+		t.Fatalf("migration history = max %d count %d, want max 6 count 6", version, count)
 	}
 	if got := sha256.Sum256([]byte(phase3Schema)); got != [32]byte{0xab, 0x9d, 0x49, 0x54, 0x09, 0x80, 0x80, 0x5a, 0xa7, 0xf7, 0x6d, 0xd8, 0x4a, 0x4c, 0x99, 0xbc, 0xe4, 0xdf, 0x85, 0xed, 0x61, 0xf4, 0xf9, 0xee, 0xb3, 0x28, 0x5c, 0x91, 0xec, 0x40, 0xdc, 0x4a} {
 		t.Fatalf("v1 migration checksum drifted: %x", got)
@@ -410,7 +411,7 @@ func TestMigrationsAreIdempotentAndDetectTampering(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := future.sql.Exec(
-		"INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(6,'future',zeroblob(32),1)",
+		"INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES(7,'future',zeroblob(32),1)",
 	); err != nil {
 		t.Fatal(err)
 	}

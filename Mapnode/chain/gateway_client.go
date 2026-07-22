@@ -110,52 +110,72 @@ type gatewayManifest struct {
 	Transactions json.RawMessage `json:"transactions,omitempty"`
 }
 
-func NewTrustRootReaderForChain(entry Chain, rpc TrustRootRPC) (*TrustRootReader, GatewayDeployment, domain.BlockHeight, error) {
+type GatewayDeploymentConfig struct {
+	Deployment      GatewayDeployment
+	DeploymentBlock domain.BlockHeight
+	MerkleDepth     uint8
+	PathStepCostGas uint64
+}
+
+func LoadGatewayDeploymentConfig(entry Chain) (GatewayDeploymentConfig, error) {
 	if err := validateChain(entry); err != nil {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, err
+		return GatewayDeploymentConfig{}, err
 	}
 	file, err := os.Open(entry.DeploymentManifest)
 	if err != nil {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("open Gateway deployment manifest: %w", err)
+		return GatewayDeploymentConfig{}, fmt.Errorf("open Gateway deployment manifest: %w", err)
 	}
 	defer file.Close()
 	const maxGatewayManifestBytes = 1 << 20
 	content, err := io.ReadAll(io.LimitReader(file, maxGatewayManifestBytes+1))
 	if err != nil {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("read Gateway deployment manifest: %w", err)
+		return GatewayDeploymentConfig{}, fmt.Errorf("read Gateway deployment manifest: %w", err)
 	}
 	if len(content) > maxGatewayManifestBytes {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: exceeds 1 MiB", ErrInvalidGatewayManifest)
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: exceeds 1 MiB", ErrInvalidGatewayManifest)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(content))
 	decoder.DisallowUnknownFields()
 	var manifest gatewayManifest
 	if err := decoder.Decode(&manifest); err != nil {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: decode: %v", ErrInvalidGatewayManifest, err)
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: decode: %v", ErrInvalidGatewayManifest, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: trailing JSON", ErrInvalidGatewayManifest)
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: trailing JSON", ErrInvalidGatewayManifest)
 	}
 	manifestChainID, ok := new(big.Int).SetString(manifest.ChainID, 10)
 	if manifest.Version != 1 || manifest.Status != "deployed" || !ok || manifestChainID.String() != manifest.ChainID || manifestChainID.Cmp(entry.ChainID.BigInt()) != 0 {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: chain identity mismatch", ErrInvalidGatewayManifest)
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: chain identity mismatch", ErrInvalidGatewayManifest)
 	}
-	if manifest.DeploymentBlock == 0 || !common.IsHexAddress(manifest.Gateway) {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: incomplete", ErrInvalidGatewayManifest)
+	if manifest.DeploymentBlock == 0 || manifest.MerkleDepth == 0 || manifest.MerkleDepth > 32 || !common.IsHexAddress(manifest.Gateway) {
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: incomplete", ErrInvalidGatewayManifest)
 	}
 	if manifest.PathStepCostGas != nil && (*manifest.PathStepCostGas == 0 || *manifest.PathStepCostGas > uint64(^uint64(0)>>1)) {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: pathStepCostGas must be positive and SQLite-safe", ErrInvalidGatewayManifest)
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: pathStepCostGas must be positive and SQLite-safe", ErrInvalidGatewayManifest)
 	}
 	decodedHash := common.FromHex(manifest.CodeHashes.Gateway)
 	if len(decodedHash) != common.HashLength || !strings.HasPrefix(manifest.CodeHashes.Gateway, "0x") {
-		return nil, GatewayDeployment{}, domain.BlockHeight{}, fmt.Errorf("%w: code hash must be 32 bytes", ErrInvalidGatewayManifest)
+		return GatewayDeploymentConfig{}, fmt.Errorf("%w: code hash must be 32 bytes", ErrInvalidGatewayManifest)
 	}
 	deployment := GatewayDeployment{ChainID: entry.ChainID, Address: common.HexToAddress(manifest.Gateway), CodeHash: common.BytesToHash(decodedHash)}
 	block, err := domain.NewBlockHeight(manifest.DeploymentBlock)
 	if err != nil {
+		return GatewayDeploymentConfig{}, err
+	}
+	cost := uint64(30_713)
+	if manifest.PathStepCostGas != nil {
+		cost = *manifest.PathStepCostGas
+	}
+	return GatewayDeploymentConfig{Deployment: deployment, DeploymentBlock: block, MerkleDepth: manifest.MerkleDepth, PathStepCostGas: cost}, nil
+}
+
+func NewTrustRootReaderForChain(entry Chain, rpc TrustRootRPC) (*TrustRootReader, GatewayDeployment, domain.BlockHeight, error) {
+	config, err := LoadGatewayDeploymentConfig(entry)
+	if err != nil {
 		return nil, GatewayDeployment{}, domain.BlockHeight{}, err
 	}
+	deployment, block := config.Deployment, config.DeploymentBlock
 	client, err := NewGatewayClient(rpc, deployment)
 	if err != nil {
 		return nil, GatewayDeployment{}, domain.BlockHeight{}, err

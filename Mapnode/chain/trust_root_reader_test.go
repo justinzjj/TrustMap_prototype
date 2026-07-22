@@ -185,6 +185,10 @@ func TestNewTrustRootReaderForChainStrictlyLoadsRemoteManifestLazily(t *testing.
 	if err != nil || reader == nil || deployment.ChainID != entry.ChainID || deployment.CodeHash != common.HexToHash("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") || block.BigInt().Cmp(big.NewInt(5)) != 0 {
 		t.Fatalf("factory reader=%v deployment=%+v block=%s err=%v", reader, deployment, block.BigInt(), err)
 	}
+	runtimeConfig, err := chain.LoadGatewayDeploymentConfig(entry)
+	if err != nil || runtimeConfig.Deployment != deployment || runtimeConfig.DeploymentBlock != block || runtimeConfig.MerkleDepth != 8 || runtimeConfig.PathStepCostGas != 30_713 {
+		t.Fatalf("runtime config=%+v err=%v", runtimeConfig, err)
+	}
 
 	wrongChain := []byte(string([]byte(manifest)))
 	wrongChain = []byte(strings.Replace(string(wrongChain), `"chainId":"10001"`, `"chainId":"10002"`, 1))

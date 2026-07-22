@@ -20,6 +20,7 @@ var migrations = []migration{
 	{version: 3, name: "live_observation_foundation", sql: liveObservationFoundationV3},
 	{version: 4, name: "live_chain_delete_protection", sql: liveChainDeleteProtectionV4},
 	{version: 5, name: "confirmed_gateway_indexer", sql: confirmedGatewayIndexerV5},
+	{version: 6, name: "dependency_evidence_mailboxes", sql: dependencyEvidenceMailboxesV6},
 }
 
 const migrationTable = `
@@ -725,4 +726,47 @@ CREATE TRIGGER prevent_verification_receipt_update BEFORE UPDATE ON verification
 CREATE TRIGGER prevent_verification_receipt_delete BEFORE DELETE ON verification_receipts BEGIN SELECT RAISE(ABORT,'verification receipt is append-only'); END;
 CREATE TRIGGER prevent_request_resolution_update BEFORE UPDATE ON request_resolutions BEGIN SELECT RAISE(ABORT,'request resolution is append-only'); END;
 CREATE TRIGGER prevent_request_resolution_delete BEFORE DELETE ON request_resolutions BEGIN SELECT RAISE(ABORT,'request resolution is append-only'); END;
+`
+
+const dependencyEvidenceMailboxesV6 = `
+CREATE TABLE evidence_inbox (
+    message_id BLOB PRIMARY KEY CHECK(typeof(message_id)='blob' AND length(message_id)=32),
+    evidence_id BLOB NOT NULL CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
+    protocol_version INTEGER NOT NULL CHECK(protocol_version=1),
+    origin_peer TEXT NOT NULL CHECK(length(origin_peer) BETWEEN 1 AND 256),
+    observed_at INTEGER NOT NULL CHECK(observed_at>0),
+    envelope BLOB NOT NULL CHECK(typeof(envelope)='blob' AND length(envelope) BETWEEN 1 AND 512),
+    state TEXT NOT NULL CHECK(state IN ('pending','retryable','validated','invalid')),
+    invalid_reason TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+    next_attempt_at INTEGER NOT NULL CHECK(next_attempt_at>0),
+    received_at INTEGER NOT NULL CHECK(received_at>0),
+    updated_at INTEGER NOT NULL CHECK(updated_at>0),
+    FOREIGN KEY(evidence_id) REFERENCES evidence(id),
+    CHECK((state='invalid' AND length(invalid_reason)>0) OR (state<>'invalid' AND invalid_reason=''))
+) STRICT;
+
+CREATE TABLE evidence_outbox (
+    message_id BLOB PRIMARY KEY CHECK(typeof(message_id)='blob' AND length(message_id)=32),
+    evidence_id BLOB NOT NULL UNIQUE CHECK(typeof(evidence_id)='blob' AND length(evidence_id)=32),
+    origin_peer TEXT NOT NULL CHECK(length(origin_peer) BETWEEN 1 AND 256),
+    envelope BLOB NOT NULL CHECK(typeof(envelope)='blob' AND length(envelope) BETWEEN 1 AND 512),
+    state TEXT NOT NULL CHECK(state IN ('pending','published')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts>=0),
+    next_attempt_at INTEGER NOT NULL CHECK(next_attempt_at>0),
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL CHECK(created_at>0),
+    updated_at INTEGER NOT NULL CHECK(updated_at>0),
+    published_at INTEGER CHECK(published_at IS NULL OR published_at>0),
+    FOREIGN KEY(evidence_id) REFERENCES evidence(id),
+    CHECK((state='published' AND published_at IS NOT NULL AND last_error='') OR (state='pending' AND published_at IS NULL))
+) STRICT;
+
+CREATE INDEX evidence_inbox_pending ON evidence_inbox(state,next_attempt_at,received_at);
+CREATE INDEX evidence_outbox_pending ON evidence_outbox(state,next_attempt_at,created_at);
+
+CREATE TRIGGER prevent_evidence_inbox_identity_update BEFORE UPDATE OF message_id,evidence_id,protocol_version,origin_peer,observed_at,envelope,received_at ON evidence_inbox BEGIN SELECT RAISE(ABORT,'evidence inbox identity is immutable'); END;
+CREATE TRIGGER prevent_evidence_inbox_delete BEFORE DELETE ON evidence_inbox BEGIN SELECT RAISE(ABORT,'evidence inbox is append-only'); END;
+CREATE TRIGGER prevent_evidence_outbox_identity_update BEFORE UPDATE OF message_id,evidence_id,origin_peer,envelope,created_at ON evidence_outbox BEGIN SELECT RAISE(ABORT,'evidence outbox identity is immutable'); END;
+CREATE TRIGGER prevent_evidence_outbox_delete BEFORE DELETE ON evidence_outbox BEGIN SELECT RAISE(ABORT,'evidence outbox is append-only'); END;
 `
