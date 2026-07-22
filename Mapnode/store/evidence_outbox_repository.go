@@ -20,49 +20,15 @@ type OutboxItem struct {
 }
 type EvidenceOutboxRepository struct{ db *DB }
 
+var ErrOutboxTransactionRequired = errors.New("dependency evidence outbox writes require the confirmed indexer transaction")
+
 func NewEvidenceOutboxRepository(db *DB) *EvidenceOutboxRepository {
 	return &EvidenceOutboxRepository{db: db}
 }
 
-func (repository *EvidenceOutboxRepository) Enqueue(ctx context.Context, envelope tmp2p.DependencyEvidenceEnvelope) (bool, error) {
-	if repository == nil || repository.db == nil {
-		return false, errors.New("nil evidence outbox database")
-	}
-	encoded, err := envelope.MarshalBinary()
-	if err != nil {
-		return false, err
-	}
-	locator := envelope.Locator()
-	id, err := evidence.ComputeID(locator)
-	if err != nil {
-		return false, err
-	}
-	record, err := scanEvidence(repository.db.sql.QueryRowContext(ctx, evidenceSelect+" WHERE id=?", id[:]))
-	if err != nil {
-		return false, err
-	}
-	if record.State != evidence.Active {
-		return false, ErrInactiveEvidence
-	}
-	if record.Locator != locator {
-		return false, ErrEvidenceBinding
-	}
-	now := time.Now().UTC().UnixNano()
-	result, err := repository.db.sql.ExecContext(ctx, `INSERT INTO evidence_outbox(message_id,evidence_id,origin_peer,envelope,state,attempts,next_attempt_at,last_error,created_at,updated_at,published_at) VALUES(?,?,?,?,'pending',0,?,'',?,?,NULL) ON CONFLICT(message_id) DO NOTHING`, envelope.MessageID[:], id[:], envelope.OriginPeer.String(), encoded, now, now, now)
-	if err != nil {
-		return false, err
-	}
-	inserted, err := oneRowChanged(result)
-	if err != nil {
-		return false, err
-	}
-	if !inserted {
-		var stored, eid []byte
-		if err := repository.db.sql.QueryRowContext(ctx, `SELECT envelope,evidence_id FROM evidence_outbox WHERE message_id=?`, envelope.MessageID[:]).Scan(&stored, &eid); err != nil || !equalBytes(stored, encoded) || !equalBytes(eid, id[:]) {
-			return false, ErrRecordConflict
-		}
-	}
-	return inserted, nil
+// Enqueue is sealed so callers cannot bypass the confirmed indexer's SQL transaction.
+func (*EvidenceOutboxRepository) Enqueue(context.Context, tmp2p.DependencyEvidenceEnvelope) (bool, error) {
+	return false, ErrOutboxTransactionRequired
 }
 
 func (repository *EvidenceOutboxRepository) Pending(ctx context.Context, limit int, now time.Time) ([]OutboxItem, error) {

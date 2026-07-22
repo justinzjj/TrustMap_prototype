@@ -1,6 +1,6 @@
-// Package app composes the durable MapNode core and the confirmation-only home
-// Gateway indexer. P2P gossip, transaction execution, and the inspection API
-// remain deferred to later Phase 4 tasks.
+// Package app composes the durable MapNode core, confirmation-only Gateway
+// indexer, and dependency-evidence GossipSub. Transaction execution and the
+// inspection API remain deferred to later Phase 4 tasks.
 package app
 
 import (
@@ -49,7 +49,6 @@ type App struct {
 	PathProofBuilder         *pathproof.Builder
 	ConfirmedEventIndexer    *indexer.ConfirmedEventIndexer
 	EvidenceInbox            *store.EvidenceInboxRepository
-	EvidenceOutbox           *store.EvidenceOutboxRepository
 	RemoteDependencies       *store.RemoteDependencyRepository
 	DependencyEvidenceGossip *tmp2p.DependencyEvidenceGossip
 
@@ -62,6 +61,10 @@ type App struct {
 	p2pFailed         bool
 	p2pHost           host.Host
 	p2pCancel         context.CancelFunc
+	p2pRequired       bool
+	p2pBootstrapReady atomic.Bool
+	staticBootstrap   *tmp2p.StaticBootstrapper
+	evidenceOutbox    *store.EvidenceOutboxRepository
 	canonicalCursors  *store.CanonicalCursorRepository
 	planner           *planner.Planner
 	coordinator       requestProcessor
@@ -179,18 +182,13 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 			_ = database.Close()
 			return nil, fmt.Errorf("create persistent libp2p host: %w", err)
 		}
-		if err := tmp2p.ConnectBootstrapPeers(ctx, p2pHost, bootstrapPeers); err != nil {
-			_ = p2pHost.Close()
-			homeRPC.Close()
-			_ = database.Close()
-			return nil, err
-		}
 		application.p2pHost = p2pHost
+		application.p2pRequired = true
 		application.EvidenceInbox = store.NewEvidenceInboxRepository(database)
-		application.EvidenceOutbox = store.NewEvidenceOutboxRepository(database)
+		application.evidenceOutbox = store.NewEvidenceOutboxRepository(database)
 		application.RemoteDependencies = store.NewRemoteDependencyRepository(database)
 		p2pContext, p2pCancel := context.WithCancel(context.Background())
-		gossip, err := tmp2p.NewDependencyEvidenceGossip(p2pContext, p2pHost, application.EvidenceInbox, application.EvidenceOutbox, tmp2p.GossipConfig{})
+		gossip, err := tmp2p.NewDependencyEvidenceGossip(p2pContext, p2pHost, application.EvidenceInbox, application.evidenceOutbox, tmp2p.GossipConfig{})
 		if err != nil {
 			p2pCancel()
 			_ = p2pHost.Close()
@@ -198,9 +196,22 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 			_ = database.Close()
 			return nil, err
 		}
+		bootstrapper, err := tmp2p.NewStaticBootstrapper(p2pHost, bootstrapPeers, tmp2p.StaticBootstrapConfig{}, application.p2pBootstrapReady.Store)
+		if err != nil {
+			_ = gossip.Close()
+			p2pCancel()
+			_ = p2pHost.Close()
+			homeRPC.Close()
+			_ = database.Close()
+			return nil, err
+		}
+		if len(bootstrapPeers) == 0 {
+			application.p2pBootstrapReady.Store(true)
+		}
 		application.p2pCancel = p2pCancel
 		application.DependencyEvidenceGossip = gossip
-		indexerRepository.ConfigureEvidenceOutbox(application.EvidenceOutbox, peerID)
+		application.staticBootstrap = bootstrapper
+		indexerRepository.ConfigureEvidenceOutbox(application.evidenceOutbox, peerID)
 	}
 	application.ready.Store(true)
 	return application, nil
@@ -281,6 +292,9 @@ func (application *App) indexerWorkerGate(ctx context.Context) error {
 	}
 	if application.p2pFailed {
 		return ErrOperationalDegraded
+	}
+	if application.p2pRequired && !application.p2pBootstrapReady.Load() {
+		return ErrOperationalUnavailable
 	}
 	degraded, err := application.canonicalCursors.HasDegradedCanonicalCursor(ctx)
 	if err != nil {
@@ -640,17 +654,26 @@ func (application *App) RunDependencyEvidenceWorkers(ctx context.Context) error 
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan error, 2)
+	workerCount := 2
+	if application.staticBootstrap != nil {
+		workerCount++
+	}
+	done := make(chan error, workerCount)
 	go func() { done <- application.DependencyEvidenceGossip.Run(workerCtx) }()
 	go func() { done <- application.RunRemoteDependencyEvidence(workerCtx) }()
+	if application.staticBootstrap != nil {
+		go func() { done <- application.staticBootstrap.Run(workerCtx) }()
+	}
 	err := <-done
 	cancel()
-	otherErr := <-done
+	for range workerCount - 1 {
+		otherErr := <-done
+		if errors.Is(err, context.Canceled) && !errors.Is(otherErr, context.Canceled) {
+			err = otherErr
+		}
+	}
 	if ctx.Err() != nil {
 		return ctx.Err()
-	}
-	if errors.Is(err, context.Canceled) && !errors.Is(otherErr, context.Canceled) {
-		err = otherErr
 	}
 	if errors.Is(err, context.Canceled) {
 		return err

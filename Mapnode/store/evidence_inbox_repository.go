@@ -38,6 +38,54 @@ func NewEvidenceInboxRepository(db *DB) *EvidenceInboxRepository {
 	return &EvidenceInboxRepository{db: db}
 }
 
+func (repository *EvidenceInboxRepository) RejectProvenance(ctx context.Context, rejection tmp2p.IngressRejection) (bool, error) {
+	if repository == nil || repository.db == nil || rejection.RejectionID == (common.Hash{}) || rejection.ActualOrigin == "" || rejection.ClaimedOrigin == "" || rejection.ActualOrigin == rejection.ClaimedOrigin || rejection.ClaimedMessageID == (common.Hash{}) || rejection.PayloadFingerprint == (common.Hash{}) || rejection.Reason == "" || rejection.ReceivedAt.IsZero() {
+		return false, errors.New("invalid evidence ingress provenance rejection")
+	}
+	result, err := repository.db.sql.ExecContext(ctx, "INSERT INTO evidence_ingress_rejections(rejection_id,actual_origin_peer,claimed_origin_peer,claimed_message_id,payload_fingerprint,reason,received_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(rejection_id) DO NOTHING", rejection.RejectionID[:], rejection.ActualOrigin.String(), rejection.ClaimedOrigin.String(), rejection.ClaimedMessageID[:], rejection.PayloadFingerprint[:], rejection.Reason, rejection.ReceivedAt.UTC().UnixNano())
+	if err != nil {
+		return false, err
+	}
+	inserted, err := oneRowChanged(result)
+	if err != nil {
+		return false, err
+	}
+	if !inserted {
+		stored, err := repository.LoadIngressRejection(ctx, rejection.RejectionID)
+		if err != nil || stored.RejectionID != rejection.RejectionID || stored.ActualOrigin != rejection.ActualOrigin || stored.ClaimedOrigin != rejection.ClaimedOrigin || stored.ClaimedMessageID != rejection.ClaimedMessageID || stored.PayloadFingerprint != rejection.PayloadFingerprint || stored.Reason != rejection.Reason {
+			return false, ErrRecordConflict
+		}
+	}
+	return inserted, nil
+}
+
+func (repository *EvidenceInboxRepository) LoadIngressRejection(ctx context.Context, id common.Hash) (tmp2p.IngressRejection, error) {
+	if repository == nil || repository.db == nil || id == (common.Hash{}) {
+		return tmp2p.IngressRejection{}, errors.New("invalid evidence ingress rejection lookup")
+	}
+	var rejectionID, claimedMessageID, fingerprint []byte
+	var actualRaw, claimedRaw, reason string
+	var receivedAt int64
+	if err := repository.db.sql.QueryRowContext(ctx, "SELECT rejection_id,actual_origin_peer,claimed_origin_peer,claimed_message_id,payload_fingerprint,reason,received_at FROM evidence_ingress_rejections WHERE rejection_id=?", id[:]).Scan(&rejectionID, &actualRaw, &claimedRaw, &claimedMessageID, &fingerprint, &reason, &receivedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return tmp2p.IngressRejection{}, ErrRecordNotFound
+		}
+		return tmp2p.IngressRejection{}, err
+	}
+	actual, actualErr := peer.Decode(actualRaw)
+	claimed, claimedErr := peer.Decode(claimedRaw)
+	if actualErr != nil || claimedErr != nil || len(rejectionID) != 32 || len(claimedMessageID) != 32 || len(fingerprint) != 32 {
+		return tmp2p.IngressRejection{}, ErrRecordConflict
+	}
+	var result tmp2p.IngressRejection
+	copy(result.RejectionID[:], rejectionID)
+	copy(result.ClaimedMessageID[:], claimedMessageID)
+	copy(result.PayloadFingerprint[:], fingerprint)
+	result.ActualOrigin, result.ClaimedOrigin, result.Reason = actual, claimed, reason
+	result.ReceivedAt = time.Unix(0, receivedAt).UTC()
+	return result, nil
+}
+
 func (repository *EvidenceInboxRepository) Receive(ctx context.Context, envelope tmp2p.DependencyEvidenceEnvelope, sender peer.ID) (evidence.Record, bool, error) {
 	if repository == nil || repository.db == nil {
 		return evidence.Record{}, false, errors.New("nil evidence inbox database")

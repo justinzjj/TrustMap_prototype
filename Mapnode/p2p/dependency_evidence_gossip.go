@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 type GossipInbox interface {
 	Receive(context.Context, DependencyEvidenceEnvelope, peer.ID) (evidence.Record, bool, error)
+	RejectProvenance(context.Context, IngressRejection) (bool, error)
 }
 
 type GossipOutbox interface {
@@ -78,28 +80,22 @@ func NewDependencyEvidenceGossip(ctx context.Context, h host.Host, inbox GossipI
 
 func dependencyEnvelopeMessageID(message *pb.Message) string {
 	if message != nil {
+		senderBytes := message.GetFrom()
 		if envelope, err := ParseDependencyEvidenceEnvelope(message.GetData()); err == nil {
-			return string(envelope.MessageID[:])
+			if sender, senderErr := peer.IDFromBytes(senderBytes); senderErr == nil && sender == envelope.OriginPeer {
+				return string(envelope.MessageID[:])
+			}
 		}
-		sum := sha256.Sum256(message.GetData())
-		return string(sum[:])
+		hash := sha256.New()
+		_, _ = hash.Write([]byte("TrustMap/DependencyEvidenceEnvelope/FallbackMessageID/v1\x00"))
+		var length [4]byte
+		binary.BigEndian.PutUint32(length[:], uint32(len(senderBytes)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.Write(senderBytes)
+		_, _ = hash.Write(message.GetData())
+		return string(hash.Sum(nil))
 	}
 	return ""
-}
-
-func ConnectBootstrapPeers(ctx context.Context, h host.Host, peers []peer.AddrInfo) error {
-	if h == nil {
-		return errors.New("nil libp2p host")
-	}
-	for _, info := range peers {
-		if info.ID == "" || info.ID == h.ID() {
-			continue
-		}
-		if err := h.Connect(ctx, info); err != nil {
-			return fmt.Errorf("connect bootstrap peer %s: %w", info.ID, err)
-		}
-	}
-	return nil
 }
 
 func (gossip *DependencyEvidenceGossip) Run(ctx context.Context) error {
@@ -147,6 +143,16 @@ func (gossip *DependencyEvidenceGossip) receive(ctx context.Context) error {
 		}
 		author := message.GetFrom()
 		if err := envelope.ValidateFrom(author); err != nil {
+			rejection, rejectionErr := NewIngressRejection(author, envelope, message.GetData(), err.Error(), time.Now().UTC())
+			if rejectionErr != nil {
+				return fmt.Errorf("construct dependency evidence provenance rejection: %w", rejectionErr)
+			}
+			if _, rejectionErr := gossip.inbox.RejectProvenance(ctx, rejection); rejectionErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return fmt.Errorf("persist dependency evidence provenance rejection: %w", rejectionErr)
+			}
 			continue
 		}
 		if _, _, err := gossip.inbox.Receive(ctx, envelope, author); err != nil && ctx.Err() != nil {

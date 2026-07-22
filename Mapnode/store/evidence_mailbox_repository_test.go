@@ -78,13 +78,50 @@ func TestEvidenceInboxRecordsPermanentInvalidAndRetryableFailures(t *testing.T) 
 	}
 }
 
-func TestEvidenceOutboxRequiresActiveDurableEvidenceAndRecoversAtLeastOnce(t *testing.T) {
+func TestEvidenceIngressRejectionPersistsProvenanceWithoutCreatingCandidateEvidence(t *testing.T) {
 	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "outbox.db")
-	db, err := Open(path)
+	db := openTestDB(t)
+	inbox := NewEvidenceInboxRepository(db)
+	envelope := testStoreEnvelope(t)
+	encoded, err := envelope.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
+	_, public, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := peer.IDFromPublicKey(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejection, err := tmp2p.NewIngressRejection(actual, envelope, encoded, "signed sender does not match claimed origin", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted, err := inbox.RejectProvenance(ctx, rejection); err != nil || !inserted {
+		t.Fatalf("RejectProvenance()=%v,%v", inserted, err)
+	}
+	replayed := rejection
+	replayed.ReceivedAt = rejection.ReceivedAt.Add(time.Minute)
+	if inserted, err := inbox.RejectProvenance(ctx, replayed); err != nil || inserted {
+		t.Fatalf("duplicate RejectProvenance()=%v,%v", inserted, err)
+	}
+	loaded, err := inbox.LoadIngressRejection(ctx, rejection.RejectionID)
+	if err != nil || loaded != rejection {
+		t.Fatalf("LoadIngressRejection()=%+v,%v", loaded, err)
+	}
+	if countTable(t, db, "evidence") != 0 || countTable(t, db, "evidence_inbox") != 0 {
+		t.Fatal("provenance rejection polluted canonical candidate evidence")
+	}
+	if _, err := db.sql.Exec("DELETE FROM evidence_ingress_rejections WHERE rejection_id=?", rejection.RejectionID[:]); err == nil {
+		t.Fatal("append-only ingress rejection was deleted")
+	}
+}
+
+func TestEvidenceOutboxRejectsStandaloneEnqueueEvenForRemoteActiveEvidence(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
 	envelope := testStoreEnvelope(t)
 	locator := envelope.Locator()
 	id, _ := evidence.ComputeID(locator)
@@ -93,35 +130,12 @@ func TestEvidenceOutboxRequiresActiveDurableEvidenceAndRecoversAtLeastOnce(t *te
 		t.Fatal(err)
 	}
 	outbox := NewEvidenceOutboxRepository(db)
-	if _, err := outbox.Enqueue(ctx, envelope); !errors.Is(err, ErrInactiveEvidence) {
-		t.Fatalf("candidate Enqueue() error = %v", err)
-	}
 	activateEvidence(t, NewEvidenceRepository(db), id)
-	if inserted, err := outbox.Enqueue(ctx, envelope); err != nil || !inserted {
-		t.Fatalf("Enqueue() = %v, %v", inserted, err)
+	if inserted, err := outbox.Enqueue(ctx, envelope); err == nil || inserted {
+		t.Fatalf("standalone Enqueue() = %v, %v; want sealed write path", inserted, err)
 	}
-	if inserted, err := outbox.Enqueue(ctx, envelope); err != nil || inserted {
-		t.Fatalf("duplicate Enqueue() = %v, %v", inserted, err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	outbox = NewEvidenceOutboxRepository(db)
-	pending, err := outbox.Pending(ctx, 10, time.Now())
-	if err != nil || len(pending) != 1 || pending[0].Envelope.MessageID != envelope.MessageID {
-		t.Fatalf("Pending() = %+v, %v", pending, err)
-	}
-	if err := outbox.MarkPublished(ctx, envelope.MessageID); err != nil {
-		t.Fatal(err)
-	}
-	pending, err = outbox.Pending(ctx, 10, time.Now().Add(time.Hour))
-	if err != nil || len(pending) != 0 {
-		t.Fatalf("published Pending() = %+v, %v", pending, err)
+	if countTable(t, db, "evidence_outbox") != 0 {
+		t.Fatal("remote active evidence entered local outbox")
 	}
 }
 
@@ -181,6 +195,48 @@ func TestIndexerPublishesOnlyActiveDependencyThroughAtomicOutboxHook(t *testing.
 	pending, err := outbox.PendingEnvelopes(ctx, 10, time.Now().Add(time.Second))
 	if err != nil || len(pending) != 1 || pending[0].OriginPeer != origin || pending[0].Locator() != fixture.block.Dependencies[0].Evidence.Locator {
 		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	wantMessageID := pending[0].MessageID
+	var sequence int
+	var databaseName, databasePath string
+	if err := fixture.db.sql.QueryRow("PRAGMA database_list").Scan(&sequence, &databaseName, &databasePath); err != nil || databasePath == "" {
+		t.Fatalf("database path=%q err=%v", databasePath, err)
+	}
+	if err := fixture.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	restartedOutbox := NewEvidenceOutboxRepository(restarted)
+	restartedIndexer := NewIndexerRepository(restarted)
+	restartedIndexer.ConfigureEvidenceOutbox(restartedOutbox, origin)
+	if changed, err := restartedIndexer.ApplyConfirmedBlock(ctx, fixture.block); err != nil || changed {
+		t.Fatalf("restart replay changed=%v err=%v", changed, err)
+	}
+	pending, err = restartedOutbox.PendingEnvelopes(ctx, 10, time.Now().Add(time.Hour))
+	if err != nil || len(pending) != 1 || pending[0].MessageID != wantMessageID {
+		t.Fatalf("restart pending=%+v err=%v", pending, err)
+	}
+}
+
+func TestIndexerNeverPublishesEvidenceActivatedOutsideItsConfirmedBlockTransaction(t *testing.T) {
+	ctx := context.Background()
+	fixture := newDependencyApplyFixture(t)
+	material := fixture.block.Dependencies[0]
+	if _, _, err := NewEvidenceRepository(fixture.db).Observe(ctx, material.Evidence); err != nil {
+		t.Fatal(err)
+	}
+	activateEvidence(t, NewEvidenceRepository(fixture.db), material.Evidence.ID)
+	origin := tmp2pTestEnvelope(t).OriginPeer
+	fixture.repository.ConfigureEvidenceOutbox(NewEvidenceOutboxRepository(fixture.db), origin)
+	if _, err := fixture.repository.ApplyConfirmedBlock(ctx, fixture.block); err != nil {
+		t.Fatal(err)
+	}
+	if countTable(t, fixture.db, "evidence_outbox") != 0 {
+		t.Fatal("pre-activated remote evidence entered the local confirmed-indexer outbox")
 	}
 }
 

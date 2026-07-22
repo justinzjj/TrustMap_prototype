@@ -206,13 +206,20 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 	}
 	graphChanged := false
 	for _, material := range block.Dependencies {
+		var existingEvidence int
+		existedBeforeApply := true
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM evidence WHERE id=?`, material.Evidence.ID[:]).Scan(&existingEvidence); errors.Is(err, sql.ErrNoRows) {
+			existedBeforeApply = false
+		} else if err != nil {
+			return false, err
+		}
 		changed, err := applyDependencyMaterialization(ctx, tx, block, material)
 		if err != nil {
 			return false, err
 		}
 		graphChanged = graphChanged || changed
-		if repository.outbox != nil {
-			outboxChanged, err := enqueueActiveEvidenceOutbox(ctx, tx, repository.outboxPeer, material.Evidence)
+		if repository.outbox != nil && !existedBeforeApply {
+			outboxChanged, err := enqueueActiveEvidenceOutbox(ctx, tx, repository.outboxPeer, block, material)
 			if err != nil {
 				return false, err
 			}
@@ -252,9 +259,19 @@ func (repository *IndexerRepository) ApplyConfirmedBlock(ctx context.Context, bl
 	return !replay, nil
 }
 
-func enqueueActiveEvidenceOutbox(ctx context.Context, tx *sql.Tx, origin peer.ID, record evidence.Record) (bool, error) {
+func enqueueActiveEvidenceOutbox(ctx context.Context, tx *sql.Tx, origin peer.ID, block indexer.ConfirmedBlock, material indexer.DependencyMaterialization) (bool, error) {
+	if origin == "" || material.Evidence.Locator.ChainID != block.ChainID || material.Evidence.Locator.ContractAddress != block.Gateway {
+		return false, ErrEvidenceBinding
+	}
+	if err := verifyDependencyReceiptAndResolution(ctx, tx, block, material); err != nil {
+		return false, ErrEvidenceBinding
+	}
+	if err := verifyDependencyIndexedLog(ctx, tx, block, material); err != nil {
+		return false, ErrEvidenceBinding
+	}
+	record := material.Evidence
 	persisted, err := scanEvidence(tx.QueryRowContext(ctx, evidenceSelect+" WHERE id=?", record.ID[:]))
-	if err != nil || persisted.State != evidence.Active || persisted.Locator != record.Locator {
+	if err != nil || persisted.State != evidence.Active || persisted.InvalidReason != "" || persisted.Locator != record.Locator {
 		return false, ErrEvidenceBinding
 	}
 	var existing []byte

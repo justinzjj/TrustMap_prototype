@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
 	tmp2p "github.com/justinzjj/TrustMap_prototype/Mapnode/p2p"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/store"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
 	libp2p "github.com/libp2p/go-libp2p"
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -36,6 +38,13 @@ func (inbox *testInbox) Receive(_ context.Context, envelope tmp2p.DependencyEvid
 	}
 	id, _ := evidence.ComputeID(envelope.Locator())
 	return evidence.Record{ID: id, Locator: envelope.Locator(), State: evidence.Candidate}, true, nil
+}
+
+func (inbox *testInbox) RejectProvenance(context.Context, tmp2p.IngressRejection) (bool, error) {
+	if inbox.err != nil {
+		return false, inbox.err
+	}
+	return true, nil
 }
 
 func TestGossipFailsClosedWhenDurableInboxWriteFails(t *testing.T) {
@@ -185,6 +194,82 @@ func TestTwoRealLibp2pHostsGossipDependencyEvidenceOnLoopback(t *testing.T) {
 			t.Fatal("gossip goroutine did not stop")
 		}
 	}
+}
+
+func TestCopiedEnvelopeIsDurablyRejectedWithoutPreemptingGenuineSenderCandidate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genuineHost := newLoopbackHost(t)
+	copyHost := newLoopbackHost(t)
+	receiverHost := newLoopbackHost(t)
+	defer genuineHost.Close()
+	defer copyHost.Close()
+	defer receiverHost.Close()
+	for _, source := range []host.Host{genuineHost, copyHost} {
+		if err := source.Connect(ctx, peer.AddrInfo{ID: receiverHost.ID(), Addrs: receiverHost.Addrs()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	database, err := store.Open(filepath.Join(t.TempDir(), "ingress.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	inbox := store.NewEvidenceInboxRepository(database)
+	envelope := gossipEnvelope(t, genuineHost.ID())
+	encoded, _ := envelope.MarshalBinary()
+	rejectionProbe, _ := tmp2p.NewIngressRejection(copyHost.ID(), envelope, encoded, "probe", time.Now().UTC())
+	receiver, err := tmp2p.NewDependencyEvidenceGossip(ctx, receiverHost, inbox, nil, tmp2p.GossipConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	copier, err := tmp2p.NewDependencyEvidenceGossip(ctx, copyHost, nil, &testOutbox{envelope: envelope}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	defer copier.Close()
+	runErrors := make(chan error, 3)
+	go func() { runErrors <- receiver.Run(ctx) }()
+	go func() { runErrors <- copier.Run(ctx) }()
+	rejectionDeadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(rejectionDeadline) {
+		if _, err := inbox.LoadIngressRejection(ctx, rejectionProbe.RejectionID); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	rejection, err := inbox.LoadIngressRejection(ctx, rejectionProbe.RejectionID)
+	if err != nil || rejection.ActualOrigin != copyHost.ID() || rejection.ClaimedOrigin != genuineHost.ID() {
+		t.Fatalf("copied ingress rejection=%+v err=%v", rejection, err)
+	}
+	if pending, err := inbox.Pending(ctx, 10, time.Now().Add(time.Hour)); err != nil || len(pending) != 0 {
+		t.Fatalf("copied envelope polluted candidate inbox: pending=%+v err=%v", pending, err)
+	}
+	genuine, err := tmp2p.NewDependencyEvidenceGossip(ctx, genuineHost, nil, &testOutbox{envelope: envelope}, tmp2p.GossipConfig{PublishInterval: 25 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer genuine.Close()
+	go func() { runErrors <- genuine.Run(ctx) }()
+	candidateDeadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(candidateDeadline) {
+		pending, pendingErr := inbox.Pending(ctx, 10, time.Now().Add(time.Hour))
+		if pendingErr == nil && len(pending) == 1 {
+			if pending[0].Envelope.MessageID != envelope.MessageID || pending[0].OriginPeer != genuineHost.ID() {
+				t.Fatalf("genuine candidate=%+v", pending[0])
+			}
+			cancel()
+			for range 3 {
+				if err := <-runErrors; !errors.Is(err, context.Canceled) {
+					t.Fatalf("gossip shutdown=%v", err)
+				}
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("genuine sender message did not enter candidate inbox after copied rejection")
 }
 
 func newLoopbackHost(t *testing.T) host.Host {

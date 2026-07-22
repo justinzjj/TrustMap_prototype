@@ -21,6 +21,7 @@ var migrations = []migration{
 	{version: 4, name: "live_chain_delete_protection", sql: liveChainDeleteProtectionV4},
 	{version: 5, name: "confirmed_gateway_indexer", sql: confirmedGatewayIndexerV5},
 	{version: 6, name: "dependency_evidence_mailboxes", sql: dependencyEvidenceMailboxesV6},
+	{version: 7, name: "evidence_ingress_rejections", sql: evidenceIngressRejectionsV7},
 }
 
 const migrationTable = `
@@ -769,4 +770,20 @@ CREATE TRIGGER prevent_evidence_inbox_identity_update BEFORE UPDATE OF message_i
 CREATE TRIGGER prevent_evidence_inbox_delete BEFORE DELETE ON evidence_inbox BEGIN SELECT RAISE(ABORT,'evidence inbox is append-only'); END;
 CREATE TRIGGER prevent_evidence_outbox_identity_update BEFORE UPDATE OF message_id,evidence_id,origin_peer,envelope,created_at ON evidence_outbox BEGIN SELECT RAISE(ABORT,'evidence outbox identity is immutable'); END;
 CREATE TRIGGER prevent_evidence_outbox_delete BEFORE DELETE ON evidence_outbox BEGIN SELECT RAISE(ABORT,'evidence outbox is append-only'); END;
+`
+
+const evidenceIngressRejectionsV7 = `
+CREATE TABLE evidence_ingress_rejections (
+    rejection_id BLOB PRIMARY KEY CHECK(typeof(rejection_id)='blob' AND length(rejection_id)=32),
+    actual_origin_peer TEXT NOT NULL CHECK(length(actual_origin_peer) BETWEEN 1 AND 256),
+    claimed_origin_peer TEXT NOT NULL CHECK(length(claimed_origin_peer) BETWEEN 1 AND 256),
+    claimed_message_id BLOB NOT NULL CHECK(typeof(claimed_message_id)='blob' AND length(claimed_message_id)=32),
+    payload_fingerprint BLOB NOT NULL CHECK(typeof(payload_fingerprint)='blob' AND length(payload_fingerprint)=32),
+    reason TEXT NOT NULL CHECK(length(reason)>0),
+    received_at INTEGER NOT NULL CHECK(received_at>0)
+) STRICT;
+
+CREATE UNIQUE INDEX evidence_ingress_rejection_provenance ON evidence_ingress_rejections(actual_origin_peer,payload_fingerprint);
+CREATE TRIGGER prevent_evidence_ingress_rejection_update BEFORE UPDATE ON evidence_ingress_rejections BEGIN SELECT RAISE(ABORT,'evidence ingress rejection is immutable'); END;
+CREATE TRIGGER prevent_evidence_ingress_rejection_delete BEFORE DELETE ON evidence_ingress_rejections BEGIN SELECT RAISE(ABORT,'evidence ingress rejection is append-only'); END;
 `

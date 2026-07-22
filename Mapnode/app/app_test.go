@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,8 +28,11 @@ import (
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/reorg"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/store"
 	"github.com/justinzjj/TrustMap_prototype/internal/domain"
+	libp2p "github.com/libp2p/go-libp2p"
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	libp2pnetwork "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 func TestOpenComposesPersistentP2PAndP2PFailureClosesOperationalGate(t *testing.T) {
@@ -57,7 +62,7 @@ func TestOpenComposesPersistentP2PAndP2PFailureClosesOperationalGate(t *testing.
 	}
 	cancelStartup()
 	defer application.Close()
-	if application.DependencyEvidenceGossip == nil || application.EvidenceInbox == nil || application.EvidenceOutbox == nil {
+	if application.DependencyEvidenceGossip == nil || application.EvidenceInbox == nil || application.evidenceOutbox == nil {
 		t.Fatalf("incomplete p2p composition: %+v", application)
 	}
 	workerContext, cancelWorker := context.WithCancel(context.Background())
@@ -82,6 +87,105 @@ func TestOpenComposesPersistentP2PAndP2PFailureClosesOperationalGate(t *testing.
 	}
 	if _, err := application.Process(context.Background(), coordinator.Work{}); !errors.Is(err, ErrOperationalDegraded) {
 		t.Fatalf("Process error=%v", err)
+	}
+}
+
+func TestP2PColdStartReturnsBeforePeerListensThenBecomesReadyAfterOneStaticPeerConnects(t *testing.T) {
+	config, manifest, closeRPC := appFixture(t, "0x2711")
+	defer closeRPC()
+	localKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localRaw, _ := libp2pcrypto.MarshalPrivateKey(localKey)
+	localID, _ := peer.IDFromPrivateKey(localKey)
+	remoteKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteID, _ := peer.IDFromPrivateKey(remoteKey)
+	remote, err := libp2p.New(libp2p.Identity(remoteKey), libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	unavailableKey, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableID, _ := peer.IDFromPrivateKey(unavailableKey)
+	unavailable, err := libp2p.New(libp2p.Identity(unavailableKey), libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unavailable.Close()
+	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reservation.Addr().(*net.TCPAddr).Port
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listenAddress, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableReservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailablePort := unavailableReservation.Addr().(*net.TCPAddr).Port
+	if err := unavailableReservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unavailableAddress, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", unavailablePort))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "p2p-private-key")
+	bootstrapPath := filepath.Join(dir, "bootstrap.json")
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(localRaw)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	document, _ := json.Marshal(map[string]any{"version": 1, "nodes": []map[string]string{
+		{"name": "self", "peer_id": localID.String(), "multiaddr": "/ip4/127.0.0.1/tcp/1/p2p/" + localID.String()},
+		{"name": "late", "peer_id": remoteID.String(), "multiaddr": listenAddress.String() + "/p2p/" + remoteID.String()},
+		{"name": "unavailable", "peer_id": unavailableID.String(), "multiaddr": unavailableAddress.String() + "/p2p/" + unavailableID.String()},
+	}})
+	if err := os.WriteFile(bootstrapPath, document, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.P2P = bootstrap.P2P{Enabled: true, Listen: "/ip4/127.0.0.1/tcp/0", PrivateKeyFile: keyPath, BootstrapFile: bootstrapPath}
+	application, err := Open(context.Background(), config, manifest)
+	if err != nil {
+		t.Fatalf("cold-start Open() error=%v", err)
+	}
+	defer application.Close()
+	application.indexerValidated = true
+	workerContext, cancelWorkers := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- application.RunDependencyEvidenceWorkers(workerContext) }()
+	defer func() {
+		cancelWorkers()
+		if err := <-workerDone; !errors.Is(err, context.Canceled) {
+			t.Errorf("worker shutdown=%v", err)
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if application.Ready() {
+		t.Fatal("P2P app became ready before any static peer was reachable")
+	}
+	if err := remote.Network().Listen(listenAddress); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for !application.Ready() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !application.Ready() || application.p2pHost.Network().Connectedness(remoteID) != libp2pnetwork.Connected {
+		t.Fatalf("late static peer never satisfied readiness: ready=%t connectedness=%s", application.Ready(), application.p2pHost.Network().Connectedness(remoteID))
 	}
 }
 
