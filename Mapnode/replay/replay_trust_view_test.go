@@ -1,6 +1,176 @@
 package replay
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
+
+func TestReplayTrustViewAssignsStableNodeIDsToCanonicalKeys(t *testing.T) {
+	view, err := NewReplayTrustView(CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := view.Activate(ReplayBlock{Chain: " C ", OriginalHeight: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := view.nodeIDs[key]
+	if id != replayNodeID(0) {
+		t.Fatalf("first node ID = %d, want 0", id)
+	}
+
+	duplicate, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate != key {
+		t.Fatalf("duplicate key = %v, want %v", duplicate, key)
+	}
+	if got := view.nodeIDs[duplicate]; got != id {
+		t.Fatalf("duplicate node ID = %d, want original ID %d", got, id)
+	}
+	if len(view.nodeIDs) != 1 || len(view.nodeKeys) != 1 {
+		t.Fatalf("duplicate activation grew IDs: map=%d keys=%d", len(view.nodeIDs), len(view.nodeKeys))
+	}
+}
+
+func TestReplayTrustViewAssignsMonotonicContiguousNodeIDs(t *testing.T) {
+	view, err := NewReplayTrustView(CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := []ReplayBlock{
+		{Chain: "c", OriginalHeight: 100},
+		{Chain: "a", OriginalHeight: 5},
+		{Chain: "b", OriginalHeight: 9},
+	}
+	for want, block := range blocks {
+		key, activateErr := view.Activate(block)
+		if activateErr != nil {
+			t.Fatal(activateErr)
+		}
+		if got := view.nodeIDs[key]; got != replayNodeID(want) {
+			t.Fatalf("node %v ID = %d, want %d", key, got, want)
+		}
+		if got := view.nodeKeys[want]; got != key {
+			t.Fatalf("node key at ID %d = %v, want %v", want, got, key)
+		}
+	}
+}
+
+func TestReplayTrustViewMiddleSplitPreservesExistingNodeIDs(t *testing.T) {
+	view, err := NewReplayTrustView(CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	low, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	high, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowID, highID := view.nodeIDs[low], view.nodeIDs[high]
+
+	middle, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: 150})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := view.nodeIDs[low]; got != lowID {
+		t.Fatalf("low node ID changed from %d to %d", lowID, got)
+	}
+	if got := view.nodeIDs[high]; got != highID {
+		t.Fatalf("high node ID changed from %d to %d", highID, got)
+	}
+	if got := view.nodeIDs[middle]; got != replayNodeID(2) {
+		t.Fatalf("middle node ID = %d, want 2", got)
+	}
+}
+
+func TestReplayTrustViewFailedActivationDoesNotLeakNodeIDOrGraphState(t *testing.T) {
+	view, err := NewReplayTrustView(CostProfile{ID: "overflow", DirectStepCost: math.MaxUint64, PathStepCost: 1, TrustRootUpdateCost: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := view.Activate(ReplayBlock{Chain: "c", OriginalHeight: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID := view.nodeIDs[first]
+
+	failed := ReplayBlockKey{Chain: "c", Height: 3}
+	if _, err := view.Activate(ReplayBlock{Chain: " C ", OriginalHeight: failed.Height}); err == nil {
+		t.Fatal("overflowing second activation succeeded")
+	}
+	if len(view.nodes) != 1 || len(view.nodeIDs) != 1 || len(view.nodeKeys) != 1 {
+		t.Fatalf("failed activation leaked node state: nodes=%d IDs=%d keys=%d", len(view.nodes), len(view.nodeIDs), len(view.nodeKeys))
+	}
+	if got := view.nodeIDs[first]; got != firstID || view.nodeKeys[firstID] != first {
+		t.Fatalf("existing node mapping changed: ID=%d key=%v", got, view.nodeKeys[firstID])
+	}
+	if _, ok := view.nodes[failed]; ok {
+		t.Fatalf("failed node %v leaked into nodes", failed)
+	}
+	if _, ok := view.nodeIDs[failed]; ok {
+		t.Fatalf("failed node %v leaked an ID", failed)
+	}
+	if view.heights["c"].Contains(failed.Height) {
+		t.Fatalf("failed height %d leaked into index", failed.Height)
+	}
+	if view.edgeCount != 0 || len(view.adjacency) != 0 {
+		t.Fatalf("failed activation leaked edges: cached=%d adjacency=%d", view.edgeCount, len(view.adjacency))
+	}
+}
+
+func TestReplayTrustViewProductionGraphHasCompleteCanonicalNodeIDMappings(t *testing.T) {
+	view, err := NewReplayTrustView(CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, height := range []uint64{100, 200, 150} {
+		if _, err := view.Activate(ReplayBlock{Chain: " C ", OriginalHeight: height}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := view.AddVerifiedDependency(
+		ReplayBlock{Chain: " B ", OriginalHeight: 1},
+		ReplayBlock{Chain: " A ", OriginalHeight: 10},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(view.nodes) != len(view.nodeIDs) || len(view.nodeIDs) != len(view.nodeKeys) {
+		t.Fatalf("node mapping sizes differ: nodes=%d IDs=%d keys=%d", len(view.nodes), len(view.nodeIDs), len(view.nodeKeys))
+	}
+	for key := range view.nodes {
+		assertReplayNodeIDMapping(t, view, key)
+	}
+	for from, neighbours := range view.adjacency {
+		assertReplayNodeIDMapping(t, view, from)
+		for to := range neighbours {
+			assertReplayNodeIDMapping(t, view, to)
+		}
+	}
+}
+
+func assertReplayNodeIDMapping(t *testing.T, view *ReplayTrustView, key ReplayBlockKey) {
+	t.Helper()
+	if key != canonicalKey(key) {
+		t.Fatalf("non-canonical graph key %v", key)
+	}
+	id, ok := view.nodeIDs[key]
+	if !ok {
+		t.Fatalf("graph key %v has no node ID", key)
+	}
+	if id < 0 || int(id) >= len(view.nodeKeys) {
+		t.Fatalf("graph key %v has out-of-range node ID %d", key, id)
+	}
+	if got := view.nodeKeys[id]; got != key {
+		t.Fatalf("node key at ID %d = %v, want %v", id, got, key)
+	}
+}
 
 func TestReplayTrustViewSplitsIntraChainNeighboursWithAsymmetricCosts(t *testing.T) {
 	view, err := NewReplayTrustView(CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5})

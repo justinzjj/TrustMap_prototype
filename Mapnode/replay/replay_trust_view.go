@@ -7,6 +7,8 @@ import (
 	"sync"
 )
 
+type replayNodeID int
+
 // ReplayTrustView is the active, event-time graph used only for cost replay.
 // A deterministic treap indexes observed heights without a network dependency.
 type ReplayTrustView struct {
@@ -15,6 +17,8 @@ type ReplayTrustView struct {
 	heights         map[string]*orderedHeightIndex
 	adjacency       map[ReplayBlockKey]map[ReplayBlockKey]ReplayEdge
 	nodes           map[ReplayBlockKey]struct{}
+	nodeIDs         map[ReplayBlockKey]replayNodeID
+	nodeKeys        []ReplayBlockKey
 	edgeCount       uint64
 	crossEdgesAdded uint64
 }
@@ -28,6 +32,7 @@ func NewReplayTrustView(profile CostProfile) (*ReplayTrustView, error) {
 		heights:   make(map[string]*orderedHeightIndex),
 		adjacency: make(map[ReplayBlockKey]map[ReplayBlockKey]ReplayEdge),
 		nodes:     make(map[ReplayBlockKey]struct{}),
+		nodeIDs:   make(map[ReplayBlockKey]replayNodeID),
 	}, nil
 }
 
@@ -87,6 +92,8 @@ func (view *ReplayTrustView) activateLocked(block ReplayBlock) (ReplayBlockKey, 
 
 	index.Insert(key.Height)
 	view.nodes[key] = struct{}{}
+	view.nodeIDs[key] = replayNodeID(len(view.nodeKeys))
+	view.nodeKeys = append(view.nodeKeys, key)
 	if hasPredecessor && hasSuccessor {
 		view.deleteEdgeLocked(ReplayBlockKey{Chain: key.Chain, Height: predecessor}, ReplayBlockKey{Chain: key.Chain, Height: successor})
 		view.deleteEdgeLocked(ReplayBlockKey{Chain: key.Chain, Height: successor}, ReplayBlockKey{Chain: key.Chain, Height: predecessor})
