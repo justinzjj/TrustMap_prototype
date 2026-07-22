@@ -1,6 +1,6 @@
 # Replay-Compatible MapNode Design
 
-**Status:** Approved in design discussion on 2026-07-22; written specification pending final user review.
+**Status:** Approved by the user on 2026-07-22 and ready for implementation.
 
 ## 1. Purpose
 
