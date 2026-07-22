@@ -1,0 +1,5 @@
+# Exact integer parameters used by the legacy v4.1 simulator.
+id: legacy-v4.1
+direct_step_cost: 3000000
+path_step_cost: 30000
+trust_root_update_cost: 110000

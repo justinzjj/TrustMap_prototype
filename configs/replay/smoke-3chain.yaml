@@ -1,0 +1,20 @@
+# Documentation template. replay-smoke.sh resolves both paths to safe absolute
+# paths before invoking MapNode; LoadConfig intentionally rejects relative paths.
+version: 1
+input_trace: /absolute/path/to/planner-smoke-3chain.csv
+run_root: /absolute/path/to/replay-output
+settings: [B0, B1, B2, B3]
+invalid_row_policy: reject
+cost_profile:
+  id: legacy-v4.1
+  direct_step_cost: 3000000
+  path_step_cost: 30000
+  trust_root_update_cost: 110000
+checkpoint_periods:
+  a: 10000
+  b: 10000
+  c: 10000
+record_every: 1
+log_every: 1
+durability:
+  synchronous: full

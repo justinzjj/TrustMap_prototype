@@ -3,7 +3,9 @@ package replay
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const ReplaySchemaVersion = 1
+const ReplaySchemaVersion = 2
 
 // ReplayRunIdentity contains every persisted input that must remain unchanged
 // when a replay setting is resumed.
@@ -119,7 +121,7 @@ func (repository *ReplayRepository) initialize(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS replay_events (sequence INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, event_json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS replay_progress (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), completed_events INTEGER NOT NULL, last_sequence INTEGER)`,
 		`CREATE TABLE IF NOT EXISTS replay_baselines (verifier_chain TEXT NOT NULL, target_chain TEXT NOT NULL, height INTEGER NOT NULL, PRIMARY KEY(verifier_chain, target_chain))`,
-		`CREATE TABLE IF NOT EXISTS replay_decisions (sequence INTEGER PRIMARY KEY REFERENCES replay_events(sequence), decision_json BLOB NOT NULL, direct_cost INTEGER NOT NULL, chosen_cost INTEGER NOT NULL, decision TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS replay_decisions (sequence INTEGER PRIMARY KEY REFERENCES replay_events(sequence), decision_json BLOB NOT NULL, direct_cost INTEGER NOT NULL, chosen_cost INTEGER NOT NULL, decision TEXT NOT NULL, integrity_digest TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS replay_paths (sequence INTEGER PRIMARY KEY REFERENCES replay_events(sequence), path_json BLOB NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS replay_cross_edges (sequence INTEGER PRIMARY KEY REFERENCES replay_events(sequence), from_chain TEXT NOT NULL, from_height INTEGER NOT NULL, to_chain TEXT NOT NULL, to_height INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS replay_snapshots (sequence INTEGER PRIMARY KEY REFERENCES replay_events(sequence), snapshot_json BLOB NOT NULL)`,
@@ -178,6 +180,7 @@ func (repository *ReplayRepository) CommitEvent(ctx context.Context, event Repla
 	if err != nil {
 		return fmt.Errorf("encode replay decision: %w", err)
 	}
+	integrityDigest := replayDecisionIntegrityDigest(eventJSON, decisionJSON)
 	var requestedSnapshotJSON []byte
 	if snapshot != nil {
 		if snapshot.Sequence != event.Sequence || !snapshot.Time.Equal(event.SourceTime) || snapshot.GraphNodes != decision.GraphNodes || snapshot.GraphEdges != decision.GraphEdges || snapshot.CrossEdgesAdded != decision.CrossEdgesAdded {
@@ -215,7 +218,7 @@ func (repository *ReplayRepository) CommitEvent(ctx context.Context, event Repla
 	if _, err := tx.ExecContext(ctx, `INSERT INTO replay_events(sequence, event_id, event_json) VALUES(?, ?, ?)`, event.Sequence, event.ID, eventJSON); err != nil {
 		return fmt.Errorf("persist replay event: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO replay_decisions(sequence, decision_json, direct_cost, chosen_cost, decision) VALUES(?, ?, ?, ?, ?)`, event.Sequence, decisionJSON, decision.DirectCost, decision.ChosenCost, decision.Decision); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO replay_decisions(sequence, decision_json, direct_cost, chosen_cost, decision, integrity_digest) VALUES(?, ?, ?, ?, ?, ?)`, event.Sequence, decisionJSON, decision.DirectCost, decision.ChosenCost, decision.Decision, integrityDigest); err != nil {
 		return fmt.Errorf("persist replay decision: %w", err)
 	}
 	if decision.Decision == ReplayDecisionTrustMap {
@@ -247,6 +250,15 @@ func (repository *ReplayRepository) CommitEvent(ctx context.Context, event Repla
 	return nil
 }
 
+func replayDecisionIntegrityDigest(eventJSON, decisionJSON []byte) string {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte("trustmap/replay-committed-decision/v1\n"))
+	_, _ = digest.Write(eventJSON)
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(decisionJSON)
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
 func (repository *ReplayRepository) Progress(ctx context.Context) (ReplayProgress, error) {
 	var progress ReplayProgress
 	var last sql.NullInt64
@@ -260,186 +272,246 @@ func (repository *ReplayRepository) Progress(ctx context.Context) (ReplayProgres
 }
 
 func (repository *ReplayRepository) CompletedEvents(ctx context.Context) ([]ReplayCommittedEvent, error) {
-	rows, err := repository.db.QueryContext(ctx, `SELECT e.event_json, d.decision_json, s.snapshot_json FROM replay_events e JOIN replay_decisions d USING(sequence) LEFT JOIN replay_snapshots s USING(sequence) ORDER BY e.sequence`)
-	if err != nil {
-		return nil, fmt.Errorf("query completed replay events: %w", err)
-	}
-	defer rows.Close()
 	var completed []ReplayCommittedEvent
-	for rows.Next() {
-		var eventJSON, decisionJSON []byte
-		var snapshotJSON []byte
-		if err := rows.Scan(&eventJSON, &decisionJSON, &snapshotJSON); err != nil {
-			return nil, fmt.Errorf("scan completed replay event: %w", err)
-		}
-		var item ReplayCommittedEvent
-		if err := json.Unmarshal(eventJSON, &item.Event); err != nil {
-			return nil, fmt.Errorf("decode completed replay event: %w", err)
-		}
-		if err := json.Unmarshal(decisionJSON, &item.Decision); err != nil {
-			return nil, fmt.Errorf("decode completed replay decision: %w", err)
-		}
-		if snapshotJSON != nil {
-			item.Snapshot = new(ReplaySnapshot)
-			if err := json.Unmarshal(snapshotJSON, item.Snapshot); err != nil {
-				return nil, fmt.Errorf("decode replay snapshot: %w", err)
-			}
-		}
+	if err := repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 		completed = append(completed, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate completed replay events: %w", err)
-	}
-	for sequence, item := range completed {
-		if item.Event.Sequence != uint64(sequence) || item.Decision.Sequence != uint64(sequence) || item.Event.ID != item.Decision.EventID {
-			return nil, fmt.Errorf("completed replay event sequence %d is inconsistent", sequence)
-		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return completed, nil
 }
 
+// ForEachCompleted visits committed replay rows in sequence order without
+// retaining prior rows. The callback must not issue another query against this
+// repository: replay databases intentionally use a single SQLite connection.
+func (repository *ReplayRepository) ForEachCompleted(ctx context.Context, visit func(ReplayCommittedEvent) error) error {
+	if visit == nil {
+		return fmt.Errorf("completed replay event visitor is required")
+	}
+	rows, err := repository.db.QueryContext(ctx, `SELECT e.event_json, d.decision_json, s.snapshot_json FROM replay_events e JOIN replay_decisions d USING(sequence) LEFT JOIN replay_snapshots s USING(sequence) ORDER BY e.sequence`)
+	if err != nil {
+		return fmt.Errorf("query completed replay events: %w", err)
+	}
+	defer rows.Close()
+	var expectedSequence uint64
+	for rows.Next() {
+		var eventJSON, decisionJSON []byte
+		var snapshotJSON []byte
+		if err := rows.Scan(&eventJSON, &decisionJSON, &snapshotJSON); err != nil {
+			return fmt.Errorf("scan completed replay event: %w", err)
+		}
+		var item ReplayCommittedEvent
+		if err := json.Unmarshal(eventJSON, &item.Event); err != nil {
+			return fmt.Errorf("decode completed replay event: %w", err)
+		}
+		if err := json.Unmarshal(decisionJSON, &item.Decision); err != nil {
+			return fmt.Errorf("decode completed replay decision: %w", err)
+		}
+		if snapshotJSON != nil {
+			item.Snapshot = new(ReplaySnapshot)
+			if err := json.Unmarshal(snapshotJSON, item.Snapshot); err != nil {
+				return fmt.Errorf("decode replay snapshot: %w", err)
+			}
+		}
+		if item.Event.Sequence != expectedSequence || item.Decision.Sequence != expectedSequence || item.Event.ID != item.Decision.EventID {
+			return fmt.Errorf("completed replay event sequence %d is inconsistent", expectedSequence)
+		}
+		if err := visit(item); err != nil {
+			return fmt.Errorf("visit completed replay event %d: %w", expectedSequence, err)
+		}
+		expectedSequence++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate completed replay events: %w", err)
+	}
+	return nil
+}
+
 func RecoverReplayCoordinator(ctx context.Context, repository *ReplayRepository, setting Setting, initHeights map[string]uint64, profile CostProfile, policy CheckpointPolicy) (*ReplayCoordinator, uint64, error) {
+	coordinator, completed, _, err := recoverReplayCoordinator(ctx, repository, setting, initHeights, profile, policy, nil)
+	return coordinator, completed, err
+}
+
+func recoverReplayCoordinator(ctx context.Context, repository *ReplayRepository, setting Setting, initHeights map[string]uint64, profile CostProfile, policy CheckpointPolicy, inspect func(ReplayCommittedEvent) error) (*ReplayCoordinator, uint64, uint64, error) {
 	if repository.identity.Setting != setting {
-		return nil, 0, fmt.Errorf("replay recovery setting conflicts with run identity")
+		return nil, 0, 0, fmt.Errorf("replay recovery setting conflicts with run identity")
 	}
 	coordinator, err := NewReplayCoordinator(setting, initHeights, profile, policy)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	completed, err := repository.CompletedEvents(ctx)
-	if err != nil {
-		return nil, 0, err
+	// Validate all persisted projections before restoring the coordinator so
+	// corruption is reported at its durable source rather than as a later
+	// planner-state mismatch.
+	if err := repository.verifyPersistedDerivedState(ctx); err != nil {
+		return nil, 0, 0, err
 	}
-	if uint64(len(completed)) > repository.identity.PreparedRows {
-		return nil, 0, fmt.Errorf("completed replay rows exceed run identity")
-	}
-	for _, item := range completed {
-		if err := coordinator.Restore(item.Event, item.Decision); err != nil {
-			return nil, 0, err
+	var completed uint64
+	var trustMapRows uint64
+	err = repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
+		if completed >= repository.identity.PreparedRows {
+			return fmt.Errorf("completed replay rows exceed run identity")
 		}
+		if inspect != nil {
+			if err := inspect(item); err != nil {
+				return err
+			}
+		}
+		if err := coordinator.Restore(item.Event, item.Decision); err != nil {
+			return err
+		}
+		if item.Decision.Decision == ReplayDecisionTrustMap {
+			trustMapRows++
+		}
+		completed++
+		return nil
+	})
+	if err != nil {
+		return nil, 0, 0, err
 	}
-	if err := repository.verifyPersistedDerivedState(ctx, completed); err != nil {
-		return nil, 0, err
-	}
-	return coordinator, uint64(len(completed)), nil
+	return coordinator, completed, trustMapRows, nil
 }
 
-func (repository *ReplayRepository) verifyPersistedDerivedState(ctx context.Context, completed []ReplayCommittedEvent) error {
+func (repository *ReplayRepository) verifyPersistedDerivedState(ctx context.Context) error {
 	progress, err := repository.Progress(ctx)
 	if err != nil {
 		return err
 	}
-	if progress.CompletedEvents != uint64(len(completed)) || (len(completed) > 0 && progress.LastCompletedSequence != uint64(len(completed)-1)) {
+
+	expected := make(map[baselineKey]uint64)
+	rows, err := repository.db.QueryContext(ctx, `SELECT e.sequence, e.event_json, d.decision_json, d.direct_cost, d.chosen_cost, d.decision, d.integrity_digest, p.path_json, c.sequence, c.from_chain, c.from_height, c.to_chain, c.to_height, s.snapshot_json
+		FROM replay_events e
+		JOIN replay_decisions d USING(sequence)
+		LEFT JOIN replay_paths p USING(sequence)
+		LEFT JOIN replay_cross_edges c USING(sequence)
+		LEFT JOIN replay_snapshots s USING(sequence)
+		ORDER BY e.sequence`)
+	if err != nil {
+		return fmt.Errorf("read persisted replay derived state: %w", err)
+	}
+	var completed uint64
+	var expectedPaths uint64
+	var expectedSnapshots uint64
+	for rows.Next() {
+		var sequence uint64
+		var eventJSON, decisionJSON, pathJSON, snapshotJSON []byte
+		var directCost, chosenCost uint64
+		var decisionKind, integrityDigest string
+		var crossSequence sql.NullInt64
+		var fromChain, toChain sql.NullString
+		var fromHeight, toHeight sql.NullInt64
+		if err := rows.Scan(&sequence, &eventJSON, &decisionJSON, &directCost, &chosenCost, &decisionKind, &integrityDigest, &pathJSON, &crossSequence, &fromChain, &fromHeight, &toChain, &toHeight, &snapshotJSON); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan persisted replay derived state: %w", err)
+		}
+		var event ReplayEvent
+		var decision ReplayDecision
+		if err := json.Unmarshal(eventJSON, &event); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode persisted replay event: %w", err)
+		}
+		if err := json.Unmarshal(decisionJSON, &decision); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("decode persisted replay decision: %w", err)
+		}
+		if sequence != completed || event.Sequence != sequence || decision.Sequence != sequence || event.ID != decision.EventID {
+			_ = rows.Close()
+			return fmt.Errorf("completed replay event sequence %d is inconsistent", completed)
+		}
+		if directCost != decision.DirectCost || chosenCost != decision.ChosenCost || decisionKind != string(decision.Decision) {
+			_ = rows.Close()
+			return fmt.Errorf("persisted decision scalar columns at sequence %d do not match decision JSON", sequence)
+		}
+		if integrityDigest != replayDecisionIntegrityDigest(eventJSON, decisionJSON) {
+			_ = rows.Close()
+			return fmt.Errorf("persisted decision integrity digest at sequence %d does not match event and decision JSON", sequence)
+		}
+		expected[baselineKey{verifier: canonicalChain(event.Destination.Chain), target: canonicalChain(event.Source.Chain)}] = decision.BaselineAfter
+		if !crossSequence.Valid || uint64(crossSequence.Int64) != sequence || !fromChain.Valid || fromChain.String != canonicalChain(event.Destination.Chain) || !fromHeight.Valid || uint64(fromHeight.Int64) != event.Destination.OriginalHeight || !toChain.Valid || toChain.String != canonicalChain(event.Source.Chain) || !toHeight.Valid || uint64(toHeight.Int64) != event.Source.OriginalHeight {
+			_ = rows.Close()
+			return fmt.Errorf("persisted cross edge at sequence %d does not match completed event", sequence)
+		}
+		if decision.Decision == ReplayDecisionTrustMap {
+			expectedPaths++
+			expectedPath, marshalErr := json.Marshal(decision.Path)
+			if marshalErr != nil {
+				_ = rows.Close()
+				return fmt.Errorf("encode expected replay path: %w", marshalErr)
+			}
+			if pathJSON == nil || !bytes.Equal(expectedPath, pathJSON) {
+				_ = rows.Close()
+				return fmt.Errorf("persisted path at sequence %d does not match selected decision", sequence)
+			}
+		} else if pathJSON != nil {
+			_ = rows.Close()
+			return fmt.Errorf("persisted path at sequence %d does not match selected decision", sequence)
+		}
+		expectsSnapshot := repository.identity.Setting.UsesTrustMap() && repository.identity.RecordEvery > 0 && sequence%repository.identity.RecordEvery == 0
+		if expectsSnapshot != (snapshotJSON != nil) {
+			_ = rows.Close()
+			return fmt.Errorf("persisted snapshot at sequence %d does not match record interval", sequence)
+		}
+		if snapshotJSON != nil {
+			expectedSnapshots++
+			var snapshot ReplaySnapshot
+			if err := json.Unmarshal(snapshotJSON, &snapshot); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("decode persisted replay snapshot: %w", err)
+			}
+			if snapshot.Sequence != event.Sequence || !snapshot.Time.Equal(event.SourceTime) || snapshot.GraphNodes != decision.GraphNodes || snapshot.GraphEdges != decision.GraphEdges || snapshot.CrossEdgesAdded != decision.CrossEdgesAdded {
+				_ = rows.Close()
+				return fmt.Errorf("persisted snapshot at sequence %d does not match decision", sequence)
+			}
+		}
+		completed++
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close persisted replay derived state: %w", err)
+	}
+	if progress.CompletedEvents != completed || (completed > 0 && progress.LastCompletedSequence != completed-1) {
 		return fmt.Errorf("persisted replay progress does not match completed events")
 	}
-	expected := make(map[baselineKey]uint64)
-	for _, item := range completed {
-		expected[baselineKey{verifier: canonicalChain(item.Event.Destination.Chain), target: canonicalChain(item.Event.Source.Chain)}] = item.Decision.BaselineAfter
+	var crossCount, pathCount, snapshotCount uint64
+	if err := repository.db.QueryRowContext(ctx, `SELECT
+		(SELECT count(*) FROM replay_cross_edges),
+		(SELECT count(*) FROM replay_paths),
+		(SELECT count(*) FROM replay_snapshots)`).Scan(&crossCount, &pathCount, &snapshotCount); err != nil {
+		return fmt.Errorf("count persisted replay derived rows: %w", err)
 	}
-	rows, err := repository.db.QueryContext(ctx, `SELECT verifier_chain, target_chain, height FROM replay_baselines`)
+	if crossCount != completed {
+		return fmt.Errorf("persisted cross-edge count does not match completed events")
+	}
+	if pathCount != expectedPaths {
+		return fmt.Errorf("persisted path count does not match selected decisions")
+	}
+	if snapshotCount != expectedSnapshots {
+		return fmt.Errorf("persisted snapshot count does not match record interval")
+	}
+
+	baselineRows, err := repository.db.QueryContext(ctx, `SELECT verifier_chain, target_chain, height FROM replay_baselines`)
 	if err != nil {
 		return fmt.Errorf("read persisted replay baselines: %w", err)
 	}
-	actual := make(map[baselineKey]uint64)
-	for rows.Next() {
+	actualCount := 0
+	for baselineRows.Next() {
 		var key baselineKey
 		var height uint64
-		if err := rows.Scan(&key.verifier, &key.target, &height); err != nil {
-			_ = rows.Close()
+		if err := baselineRows.Scan(&key.verifier, &key.target, &height); err != nil {
+			_ = baselineRows.Close()
 			return fmt.Errorf("scan persisted replay baseline: %w", err)
 		}
-		actual[key] = height
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close persisted replay baselines: %w", err)
-	}
-	if len(actual) != len(expected) {
-		return fmt.Errorf("persisted baseline count does not match completed events")
-	}
-	for key, height := range expected {
-		if actual[key] != height {
+		if expectedHeight, ok := expected[key]; !ok || expectedHeight != height {
+			_ = baselineRows.Close()
 			return fmt.Errorf("persisted baseline for %s/%s does not match completed events", key.verifier, key.target)
 		}
+		actualCount++
 	}
-	var crossEdges int
-	if err := repository.db.QueryRowContext(ctx, `SELECT count(*) FROM replay_cross_edges`).Scan(&crossEdges); err != nil {
-		return fmt.Errorf("count persisted replay cross edges: %w", err)
+	if err := baselineRows.Close(); err != nil {
+		return fmt.Errorf("close persisted replay baselines: %w", err)
 	}
-	if crossEdges != len(completed) {
-		return fmt.Errorf("persisted cross-edge count does not match completed events")
-	}
-	crossRows, err := repository.db.QueryContext(ctx, `SELECT sequence, from_chain, from_height, to_chain, to_height FROM replay_cross_edges ORDER BY sequence`)
-	if err != nil {
-		return fmt.Errorf("read persisted cross edges: %w", err)
-	}
-	crossIndex := 0
-	for crossRows.Next() {
-		var sequence, fromHeight, toHeight uint64
-		var fromChain, toChain string
-		if err := crossRows.Scan(&sequence, &fromChain, &fromHeight, &toChain, &toHeight); err != nil {
-			_ = crossRows.Close()
-			return fmt.Errorf("scan persisted cross edge: %w", err)
-		}
-		if crossIndex >= len(completed) {
-			_ = crossRows.Close()
-			return fmt.Errorf("persisted cross edge has no completed event")
-		}
-		event := completed[crossIndex].Event
-		if sequence != event.Sequence || fromChain != canonicalChain(event.Destination.Chain) || fromHeight != event.Destination.OriginalHeight || toChain != canonicalChain(event.Source.Chain) || toHeight != event.Source.OriginalHeight {
-			_ = crossRows.Close()
-			return fmt.Errorf("persisted cross edge at sequence %d does not match completed event", sequence)
-		}
-		crossIndex++
-	}
-	if err := crossRows.Close(); err != nil {
-		return fmt.Errorf("close persisted cross edges: %w", err)
-	}
-
-	expectedPaths := make(map[uint64][]byte)
-	for _, item := range completed {
-		if item.Decision.Decision != ReplayDecisionTrustMap {
-			continue
-		}
-		encoded, err := json.Marshal(item.Decision.Path)
-		if err != nil {
-			return fmt.Errorf("encode expected replay path: %w", err)
-		}
-		expectedPaths[item.Event.Sequence] = encoded
-	}
-	pathRows, err := repository.db.QueryContext(ctx, `SELECT sequence, path_json FROM replay_paths ORDER BY sequence`)
-	if err != nil {
-		return fmt.Errorf("read persisted paths: %w", err)
-	}
-	actualPaths := 0
-	for pathRows.Next() {
-		var sequence uint64
-		var encoded []byte
-		if err := pathRows.Scan(&sequence, &encoded); err != nil {
-			_ = pathRows.Close()
-			return fmt.Errorf("scan persisted path: %w", err)
-		}
-		expected, ok := expectedPaths[sequence]
-		if !ok || !bytes.Equal(expected, encoded) {
-			_ = pathRows.Close()
-			return fmt.Errorf("persisted path at sequence %d does not match selected decision", sequence)
-		}
-		actualPaths++
-	}
-	if err := pathRows.Close(); err != nil {
-		return fmt.Errorf("close persisted paths: %w", err)
-	}
-	if actualPaths != len(expectedPaths) {
-		return fmt.Errorf("persisted path count does not match selected decisions")
-	}
-
-	for _, item := range completed {
-		expectsSnapshot := repository.identity.Setting.UsesTrustMap() && repository.identity.RecordEvery > 0 && item.Event.Sequence%repository.identity.RecordEvery == 0
-		if expectsSnapshot != (item.Snapshot != nil) {
-			return fmt.Errorf("persisted snapshot at sequence %d does not match record interval", item.Event.Sequence)
-		}
-		if item.Snapshot != nil && (item.Snapshot.Sequence != item.Event.Sequence || !item.Snapshot.Time.Equal(item.Event.SourceTime) || item.Snapshot.GraphNodes != item.Decision.GraphNodes || item.Snapshot.GraphEdges != item.Decision.GraphEdges || item.Snapshot.CrossEdgesAdded != item.Decision.CrossEdgesAdded) {
-			return fmt.Errorf("persisted snapshot at sequence %d does not match decision", item.Event.Sequence)
-		}
+	if actualCount != len(expected) {
+		return fmt.Errorf("persisted baseline count does not match completed events")
 	}
 	return nil
 }

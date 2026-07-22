@@ -13,12 +13,15 @@ evidence. The normative design remains in `docs/superpowers/specs/`.
 | Verified dependency propagation creates TrustView edges | `Mapnode/p2p`, remote evidence validation, `Mapnode/store` | P2P/validator tests and exact edge assertions in both live scripts |
 | Planner selects a real two-hop route without Direct fallback | Planner/coordinator/proof builder | Phase 3 checkpoint plus live Path API/event `hop_count == 2` assertions |
 | Static topology range is 2–21 chains | topology config/renderer | example tests and Compose config checks for 2, 3, and 21 chains |
+| Legacy-compatible B0--B3 replay without weakening live TrustView | `Mapnode/replay`, replay-only SQLite/WAL and `ReplayTrustView` | replay unit tests and `replay_smoke_test.sh` golden check |
+| Full 21-chain cost replay is reproducible and separately calibrated | replay profiles, checkpoint policies, full-run script and aggregate checker | exact `legacy-v4.1` selection, aggregate, graph and hash checks |
 
 ## Live acceptance commands
 
 ```sh
 ./tests/integration/live_two_chain_test.sh
 ./tests/integration/live_three_chain_test.sh
+./tests/integration/replay_smoke_test.sh
 ```
 
 Success is reported only after the transaction receipt contains the expected
@@ -39,3 +42,6 @@ and the exact resulting edge is visible through another MapNode's TrustView.
   Gateway state remain authoritative.
 - The 21-chain artifact is static render/config validation, not a 21-chain live
   performance result.
+- Replay is a deterministic cost-estimation experiment, not a claim that each
+  trace message executed SPV or an on-chain transaction. The calibrated profile
+  is sensitivity analysis; only `legacy-v4.1` is the legacy reproduction.

@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
 	"os"
@@ -8,6 +9,20 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestReplayImplementationIdentityIsStableAndConcrete(t *testing.T) {
+	first, err := replayImplementationIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := replayImplementationIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == "" || first == "unknown" || first != second {
+		t.Fatalf("implementation identity first=%q second=%q", first, second)
+	}
+}
 
 func TestRunReplayIsFiniteResumableAndUsesIsolatedSettingDatabases(t *testing.T) {
 	directory := t.TempDir()
@@ -61,5 +76,35 @@ func TestRunReplayIsFiniteResumableAndUsesIsolatedSettingDatabases(t *testing.T)
 	}
 	if got := strings.Join(rows[0], ","); got != strings.Join(legacyDecisionHeader(SettingB2), ",") {
 		t.Fatalf("B2 header = %s", got)
+	}
+}
+
+func TestRunReplayWithProgressHonorsLogInterval(t *testing.T) {
+	directory := t.TempDir()
+	tracePath := filepath.Join(directory, "trace.csv")
+	traceCSV := "src_chain,dst_chain,src_block_number,dst_block_number,src_block_time\n" +
+		"a,b,1,1,2025-12-01T00:00:00Z\n" +
+		"a,b,2,2,2025-12-01T00:00:01Z\n" +
+		"a,b,3,3,2025-12-01T00:00:02Z\n"
+	if err := os.WriteFile(tracePath, []byte(traceCSV), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRoot := filepath.Join(directory, "runs")
+	if err := os.Mkdir(runRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	policy, _ := NewCheckpointPolicy(nil)
+	config := Config{
+		Version: 1, InputTrace: tracePath, RunRoot: runRoot, Settings: []Setting{SettingB0},
+		InvalidRowPolicy: InvalidRowReject, CostProfile: CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5},
+		CheckpointPolicy: policy, LogEvery: 2, Durability: DurabilityConfig{Synchronous: "full"},
+	}
+	var progress bytes.Buffer
+	if _, err := RunReplayWithProgress(t.Context(), config, &progress); err != nil {
+		t.Fatal(err)
+	}
+	output := progress.String()
+	if strings.Count(output, "mapnode replay progress") != 2 || !strings.Contains(output, "completed=2/3") || !strings.Contains(output, "completed=3/3") {
+		t.Fatalf("progress output = %q", output)
 	}
 }

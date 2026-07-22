@@ -350,7 +350,7 @@ support count.
 
 ## 9. Replay Planner
 
-For a trace row `A@H2 -> B@H1` in the original notation:
+For B2/B3 and a trace row `A@H2 -> B@H1` in the original notation:
 
 ```text
 start = (B, H1)
@@ -374,6 +374,12 @@ The event performs these operations in order:
 10. commit progress and results.
 
 Strict `<` is compatibility behavior and must not become `<=`.
+
+B0/B1 preserve the legacy baseline-only implementation: they estimate Direct,
+advance the baseline, and persist the event transition, but do not materialize
+an unused `ReplayTrustView` adjacency graph. This keeps full baseline runs
+bounded without changing any B0/B1 decision or output; graph construction and
+the ordered event sequence above apply to the TrustMap-enabled B2/B3 settings.
 
 ### 9.1 Dijkstra compatibility
 
@@ -412,6 +418,7 @@ One event transaction persists:
 
 - its unique completion identity;
 - decision and compatibility fields;
+- a domain-separated event-and-decision integrity digest;
 - path and path-audit fields when selected;
 - baseline before/after;
 - the logical cross-edge addition;
@@ -422,7 +429,9 @@ The in-memory ordered height index and adjacency graph are derived state.
 Restart verifies the run identity, then deterministically rebuilds them by
 applying completed events without rerunning plan selection. It resumes at the
 first incomplete sequence. Exact replay of a completed event is idempotent;
-conflicting content is fatal.
+conflicting content is fatal. Recovery verifies the independent integrity
+digest, redundant scalar columns, derived path/cross-edge/snapshot rows, and
+the semantic state transition before applying each committed decision.
 
 CSV files are exported from committed database rows rather than appended as
 the transaction authority. A crash cannot leave a half-committed decision.
@@ -513,9 +522,15 @@ Representative commands are:
 ```text
 mapnode replay --config configs/replay/smoke-3chain.yaml --setting B2
 mapnode replay --config configs/replay/full-21chain.yaml --setting all
-mapnode replay --run-dir runtime/replay/<run-id> --resume
-mapnode replay export --run-dir runtime/replay/<run-id>
 ```
+
+`--setting all` executes the settings listed by the configuration; a concrete
+setting selects only that member of the matrix. Resume and export deliberately
+remain part of the same finite command in this prototype: rerunning an
+identical configuration and run root validates and restores committed SQLite
+state, completes any remaining events, and regenerates exports atomically.
+Separate `resume` and `export` subcommands add operator surface without changing
+the experiment semantics, so they are omitted.
 
 The smoke configuration filters to events whose source and destination are both
 inside the allowlist and then applies its event limit. Initial heights are

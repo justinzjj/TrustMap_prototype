@@ -2,10 +2,45 @@ package replay
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestReplayRepositoryForEachCompletedStreamsInOrderAndStopsOnVisitorError(t *testing.T) {
+	ctx := context.Background()
+	identity := ReplayRunIdentity{RunID: "stream", Setting: SettingB0, TraceDigest: strings.Repeat("9", 64), PreparedRows: 3}
+	repository, err := OpenReplayRepository(ctx, filepath.Join(t.TempDir(), "b0"), identity, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	for sequence := uint64(0); sequence < 3; sequence++ {
+		event := ReplayEvent{ID: "event-" + uintText(sequence), Sequence: sequence, Source: ReplayBlock{Chain: "a", OriginalHeight: sequence + 1}, Destination: ReplayBlock{Chain: "b", OriginalHeight: sequence + 1}}
+		decision := ReplayDecision{EventID: event.ID, Sequence: sequence, Setting: SettingB0, Decision: ReplayDecisionDirect, BaselineAfter: sequence + 1, GraphNodes: sequence + 2, GraphEdges: sequence + 1, CrossEdgesAdded: sequence + 1}
+		if err := repository.CommitEvent(ctx, event, decision, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stop := errors.New("stop visiting")
+	var visited []uint64
+	err = repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
+		visited = append(visited, item.Event.Sequence)
+		if item.Event.Sequence == 1 {
+			return stop
+		}
+		return nil
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("visitor error = %v, want %v", err, stop)
+	}
+	if got, want := len(visited), 2; got != want || visited[0] != 0 || visited[1] != 1 {
+		t.Fatalf("visited = %v", visited)
+	}
+}
 
 func TestReplayRepositoryEventTransactionIsIdempotentAndConflictsFail(t *testing.T) {
 	ctx := context.Background()
@@ -192,6 +227,66 @@ func TestRecoverReplayCoordinatorVerifiesPersistedDerivedTables(t *testing.T) {
 	_ = repository.Close()
 }
 
+func TestRecoverReplayCoordinatorRejectsDecisionScalarColumnMismatch(t *testing.T) {
+	ctx := context.Background()
+	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
+	policy, _ := NewCheckpointPolicy(nil)
+	identity := ReplayRunIdentity{RunID: "scalar-corrupt", Setting: SettingB0, TraceDigest: strings.Repeat("e", 64), PreparedRows: 1}
+	repository, err := OpenReplayRepository(ctx, filepath.Join(t.TempDir(), "b0"), identity, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	event := ReplayEvent{ID: "e0", Sequence: 0, Source: ReplayBlock{Chain: "a", OriginalHeight: 10}, Destination: ReplayBlock{Chain: "b", OriginalHeight: 1}}
+	coordinator, _ := NewReplayCoordinator(SettingB0, map[string]uint64{"a": 0, "b": 0}, profile, policy)
+	decision, err := coordinator.Process(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CommitEvent(ctx, event, decision, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.db.ExecContext(ctx, `UPDATE replay_decisions SET chosen_cost = chosen_cost + 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RecoverReplayCoordinator(ctx, repository, SettingB0, map[string]uint64{"a": 0, "b": 0}, profile, policy); err == nil || !strings.Contains(err.Error(), "decision scalar") {
+		t.Fatalf("decision scalar mismatch error = %v", err)
+	}
+}
+
+func TestRecoverReplayCoordinatorRejectsRewrittenDecisionWithStaleIntegrityDigest(t *testing.T) {
+	ctx := context.Background()
+	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
+	policy, _ := NewCheckpointPolicy(nil)
+	identity := ReplayRunIdentity{RunID: "integrity-corrupt", Setting: SettingB0, TraceDigest: strings.Repeat("a", 64), PreparedRows: 1}
+	repository, err := OpenReplayRepository(ctx, filepath.Join(t.TempDir(), "b0"), identity, "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repository.Close()
+	event := ReplayEvent{ID: "e0", Sequence: 0, Source: ReplayBlock{Chain: "a", OriginalHeight: 10}, Destination: ReplayBlock{Chain: "b", OriginalHeight: 1}}
+	coordinator, _ := NewReplayCoordinator(SettingB0, map[string]uint64{"a": 0, "b": 0}, profile, policy)
+	decision, err := coordinator.Process(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.CommitEvent(ctx, event, decision, nil); err != nil {
+		t.Fatal(err)
+	}
+	decision.DirectCost++
+	decision.ChosenCost++
+	encoded, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.db.ExecContext(ctx, `UPDATE replay_decisions SET decision_json = ?, direct_cost = ?, chosen_cost = ?`, encoded, decision.DirectCost, decision.ChosenCost); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RecoverReplayCoordinator(ctx, repository, SettingB0, map[string]uint64{"a": 0, "b": 0}, profile, policy); err == nil || !strings.Contains(err.Error(), "integrity digest") {
+		t.Fatalf("decision integrity error = %v", err)
+	}
+}
+
 func TestRecoverReplayCoordinatorRejectsCorruptCrossPathAndSnapshotRows(t *testing.T) {
 	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
 	policy, _ := NewCheckpointPolicy(nil)
@@ -229,6 +324,45 @@ func TestRecoverReplayCoordinatorRejectsCorruptCrossPathAndSnapshotRows(t *testi
 			}
 			if _, _, err := RecoverReplayCoordinator(ctx, repository, SettingB2, map[string]uint64{"a": 0, "b": 0}, profile, policy); err == nil || !strings.Contains(err.Error(), "persisted "+corrupt) {
 				t.Fatalf("%s corruption error = %v", corrupt, err)
+			}
+		})
+	}
+}
+
+func TestRecoverReplayCoordinatorRejectsOrphanDerivedRows(t *testing.T) {
+	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
+	policy, _ := NewCheckpointPolicy(nil)
+	for _, test := range []struct {
+		name      string
+		statement string
+		want      string
+	}{
+		{"cross", `INSERT INTO replay_cross_edges(sequence, from_chain, from_height, to_chain, to_height) VALUES(99, 'b', 1, 'a', 10)`, "persisted cross-edge count"},
+		{"path", `INSERT INTO replay_paths(sequence, path_json) VALUES(99, '{}')`, "persisted path count"},
+		{"snapshot", `INSERT INTO replay_snapshots(sequence, snapshot_json) VALUES(99, '{}')`, "persisted snapshot count"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			identity := ReplayRunIdentity{RunID: "orphan-" + test.name, Setting: SettingB0, TraceDigest: strings.Repeat("2", 64), PreparedRows: 1}
+			repository, err := OpenReplayRepository(ctx, filepath.Join(t.TempDir(), "b0"), identity, "full")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer repository.Close()
+			event := ReplayEvent{ID: "e0", Sequence: 0, Source: ReplayBlock{Chain: "a", OriginalHeight: 10}, Destination: ReplayBlock{Chain: "b", OriginalHeight: 1}}
+			coordinator, _ := NewReplayCoordinator(SettingB0, map[string]uint64{"a": 0, "b": 0}, profile, policy)
+			decision, err := coordinator.Process(event)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := repository.CommitEvent(ctx, event, decision, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := repository.db.ExecContext(ctx, test.statement); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := RecoverReplayCoordinator(ctx, repository, SettingB0, map[string]uint64{"a": 0, "b": 0}, profile, policy); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("orphan %s error = %v", test.name, err)
 			}
 		})
 	}

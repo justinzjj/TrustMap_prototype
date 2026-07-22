@@ -1,0 +1,65 @@
+# Local full-run template matching the legacy v4.1 experiment. replay-full.sh
+# generates this shape with resolved absolute TRACE_PATH and RUN_ROOT values.
+version: 1
+input_trace: /absolute/path/to/msg.csv
+expected_digest: ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175
+run_root: /absolute/path/to/replay-output
+settings: [B0, B1, B2, B3]
+invalid_row_policy: reject
+cost_profile:
+  id: legacy-v4.1
+  direct_step_cost: 3000000
+  path_step_cost: 30000
+  trust_root_update_cost: 110000
+checkpoint_periods_by_setting:
+  B1:
+    arbitrum: 1800
+    avalanche_c: 1
+    base: 1800
+    berachain: 192
+    bnb: 200
+    ethereum: 8192
+    flare: 168000
+    hyperevm: 60
+    ink: 10800
+    linea: 1620
+    nova: 1800
+    optimism: 1770
+    plasma: 1
+    polygon: 512
+    scroll: 1170
+    unichain: 1800
+    worldchain: 1800
+    zksync: 3600
+  B3:
+    arbitrum: 1800
+    avalanche_c: 1
+    base: 1800
+    berachain: 192
+    blast: 40
+    bnb: 200
+    boba: 40
+    cyber: 40
+    ethereum: 8192
+    flare: 168000
+    fraxtal: 40
+    hyperevm: 60
+    ink: 10800
+    linea: 1620
+    metal: 40
+    mode: 40
+    nova: 1800
+    opbnb: 40
+    optimism: 1770
+    plasma: 1
+    polygon: 512
+    redstone: 40
+    scroll: 1170
+    unichain: 1800
+    worldchain: 1800
+    zksync: 3600
+    zora: 40
+record_every: 1000
+log_every: 1000
+durability:
+  synchronous: normal

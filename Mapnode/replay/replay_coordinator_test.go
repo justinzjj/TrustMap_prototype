@@ -1,6 +1,9 @@
 package replay
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCoordinatorHandCalculatedFixtureAndNoFutureCrossEdge(t *testing.T) {
 	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
@@ -89,14 +92,40 @@ func TestCoordinatorSettingsAreIsolatedAndGateTrustMapAndCheckpoint(t *testing.T
 	if got := runs[SettingB1].Baselines().Get("b", "a"); got != 19 {
 		t.Fatalf("B1 baseline = %d", got)
 	}
-	// A second event only in B0 must not change any other graph or baseline.
+	// Baseline-only settings do not materialize the replay graph. A second B0
+	// event must also not change any other setting's baseline.
 	if _, err := runs[SettingB0].Process(ReplayEvent{ID: "e2", Source: ReplayBlock{Chain: "a", OriginalHeight: 25}, Destination: ReplayBlock{Chain: "b", OriginalHeight: 2}}); err != nil {
 		t.Fatal(err)
 	}
 	if got := runs[SettingB1].Baselines().Get("b", "a"); got != 19 {
 		t.Fatalf("B1 baseline changed through B0: %d", got)
 	}
-	if runs[SettingB0].TrustView().CrossEdgesAdded() != 2 || runs[SettingB1].TrustView().CrossEdgesAdded() != 1 {
-		t.Fatal("setting graph state is shared")
+	if runs[SettingB0].TrustView().CrossEdgesAdded() != 0 || runs[SettingB1].TrustView().CrossEdgesAdded() != 0 {
+		t.Fatal("baseline-only settings materialized ReplayTrustView edges")
+	}
+	if runs[SettingB2].TrustView().CrossEdgesAdded() != 1 || runs[SettingB3].TrustView().CrossEdgesAdded() != 1 {
+		t.Fatal("TrustMap setting graph state is missing or shared")
+	}
+}
+
+func TestCoordinatorRestoreRejectsCorruptDecisionCostWithoutReplanning(t *testing.T) {
+	profile := CostProfile{ID: "fixture", DirectStepCost: 100, PathStepCost: 10, TrustRootUpdateCost: 5}
+	policy, _ := NewCheckpointPolicy(nil)
+	event := ReplayEvent{ID: "event", Sequence: 0, Source: ReplayBlock{Chain: "a", OriginalHeight: 10}, Destination: ReplayBlock{Chain: "b", OriginalHeight: 1}}
+	original, err := NewReplayCoordinator(SettingB2, map[string]uint64{"a": 0, "b": 0}, profile, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := original.Process(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision.DirectCost++
+	recovered, err := NewReplayCoordinator(SettingB2, map[string]uint64{"a": 0, "b": 0}, profile, policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.Restore(event, decision); err == nil || !strings.Contains(err.Error(), "direct estimate") {
+		t.Fatalf("corrupt decision restore error = %v", err)
 	}
 }

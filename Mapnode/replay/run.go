@@ -6,13 +6,67 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"reflect"
+	"runtime/debug"
+	"strings"
+	"sync"
 )
 
 const ReplayImplementationVersion = "replay-v1"
 
 // ReplayGitCommit may be set with -ldflags for published experiment binaries.
 var ReplayGitCommit = "unknown"
+
+var replayIdentityCache struct {
+	sync.Once
+	value string
+	err   error
+}
+
+func replayImplementationIdentity() (string, error) {
+	replayIdentityCache.Do(func() {
+		if configured := strings.TrimSpace(ReplayGitCommit); configured != "" && configured != "unknown" {
+			replayIdentityCache.value = configured
+			return
+		}
+		if build, ok := debug.ReadBuildInfo(); ok {
+			var revision string
+			modified := false
+			for _, setting := range build.Settings {
+				switch setting.Key {
+				case "vcs.revision":
+					revision = strings.TrimSpace(setting.Value)
+				case "vcs.modified":
+					modified = setting.Value == "true"
+				}
+			}
+			if revision != "" && !modified {
+				replayIdentityCache.value = "git:" + revision
+				return
+			}
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			replayIdentityCache.err = fmt.Errorf("locate replay executable for implementation identity: %w", err)
+			return
+		}
+		file, err := os.Open(executable)
+		if err != nil {
+			replayIdentityCache.err = fmt.Errorf("open replay executable for implementation identity: %w", err)
+			return
+		}
+		defer file.Close()
+		digest := sha256.New()
+		if _, err := io.Copy(digest, file); err != nil {
+			replayIdentityCache.err = fmt.Errorf("hash replay executable for implementation identity: %w", err)
+			return
+		}
+		replayIdentityCache.value = "binary-sha256:" + hex.EncodeToString(digest.Sum(nil))
+	})
+	return replayIdentityCache.value, replayIdentityCache.err
+}
 
 type ReplayRunResult struct {
 	Setting         Setting
@@ -22,6 +76,15 @@ type ReplayRunResult struct {
 }
 
 func RunReplay(ctx context.Context, config Config) ([]ReplayRunResult, error) {
+	return RunReplayWithProgress(ctx, config, io.Discard)
+}
+
+// RunReplayWithProgress runs the same finite replay and emits bounded,
+// line-oriented progress messages. A nil writer is treated as io.Discard.
+func RunReplayWithProgress(ctx context.Context, config Config, progressWriter io.Writer) ([]ReplayRunResult, error) {
+	if progressWriter == nil {
+		progressWriter = io.Discard
+	}
 	trace, err := PrepareTrace(config.InputTrace, TraceOptions{
 		InvalidRowPolicy: config.InvalidRowPolicy,
 		ChainAllowlist:   config.ChainAllowlist,
@@ -48,22 +111,16 @@ func RunReplay(ctx context.Context, config Config) ([]ReplayRunResult, error) {
 		if openErr != nil {
 			return nil, fmt.Errorf("open %s replay run: %w", setting, openErr)
 		}
-		completed, readErr := repository.CompletedEvents(ctx)
-		if readErr != nil {
-			_ = repository.Close()
-			return nil, readErr
-		}
-		if len(completed) > len(trace.Events) {
-			_ = repository.Close()
-			return nil, fmt.Errorf("%s replay progress exceeds prepared trace", setting)
-		}
-		for index, item := range completed {
-			if !reflect.DeepEqual(item.Event, trace.Events[index]) {
-				_ = repository.Close()
-				return nil, fmt.Errorf("%s replay committed event %d conflicts with prepared trace", setting, index)
+		coordinator, next, trustMapRows, recoverErr := recoverReplayCoordinator(ctx, repository, setting, trace.InitHeights, config.CostProfile, policy, func(item ReplayCommittedEvent) error {
+			index := item.Event.Sequence
+			if index >= uint64(len(trace.Events)) {
+				return fmt.Errorf("%s replay progress exceeds prepared trace", setting)
 			}
-		}
-		coordinator, next, recoverErr := RecoverReplayCoordinator(ctx, repository, setting, trace.InitHeights, config.CostProfile, policy)
+			if !reflect.DeepEqual(item.Event, trace.Events[index]) {
+				return fmt.Errorf("%s replay committed event %d conflicts with prepared trace", setting, index)
+			}
+			return nil
+		})
 		if recoverErr != nil {
 			_ = repository.Close()
 			return nil, fmt.Errorf("recover %s replay: %w", setting, recoverErr)
@@ -87,6 +144,13 @@ func RunReplay(ctx context.Context, config Config) ([]ReplayRunResult, error) {
 				_ = repository.Close()
 				return nil, fmt.Errorf("commit %s replay event %d: %w", setting, sequence, err)
 			}
+			if decision.Decision == ReplayDecisionTrustMap {
+				trustMapRows++
+			}
+			completedCount := sequence + 1
+			if config.LogEvery > 0 && (completedCount%config.LogEvery == 0 || completedCount == uint64(len(trace.Events))) {
+				fmt.Fprintf(progressWriter, "mapnode replay progress setting=%s completed=%d/%d trustmap=%d graph_nodes=%d graph_edges=%d\n", setting, completedCount, len(trace.Events), trustMapRows, decision.GraphNodes, decision.GraphEdges)
+			}
 		}
 		if err := ExportReplayRun(ctx, repository, trace, config, setting, policy); err != nil {
 			_ = repository.Close()
@@ -101,6 +165,10 @@ func RunReplay(ctx context.Context, config Config) ([]ReplayRunResult, error) {
 }
 
 func NewReplayRunIdentity(config Config, trace PreparedTrace, setting Setting, policy CheckpointPolicy) (ReplayRunIdentity, error) {
+	implementationIdentity, err := replayImplementationIdentity()
+	if err != nil {
+		return ReplayRunIdentity{}, err
+	}
 	selection, err := json.Marshal(struct {
 		Allowlist        []string         `json:"allowlist"`
 		MaxEvents        uint64           `json:"max_events"`
@@ -113,7 +181,7 @@ func NewReplayRunIdentity(config Config, trace PreparedTrace, setting Setting, p
 	identity := ReplayRunIdentity{
 		Setting: setting, TraceDigest: trace.Digest, PreparedRows: uint64(len(trace.Events)),
 		ImplementationVersion: ReplayImplementationVersion, SchemaVersion: ReplaySchemaVersion,
-		GitCommit: ReplayGitCommit, CostProfileFingerprint: config.CostProfile.Fingerprint(),
+		GitCommit: implementationIdentity, CostProfileFingerprint: config.CostProfile.Fingerprint(),
 		CheckpointPolicyFingerprint: policy.Fingerprint(), SelectionFingerprint: hex.EncodeToString(selectionDigest[:]),
 		RecordEvery: config.RecordEvery, LogEvery: config.LogEvery,
 	}

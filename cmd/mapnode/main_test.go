@@ -102,6 +102,66 @@ func TestRunReplaySubcommandExecutesFiniteReplay(t *testing.T) {
 	}
 }
 
+func TestRunReplaySettingOverridesConfiguredMatrix(t *testing.T) {
+	directory := t.TempDir()
+	trace := filepath.Join(directory, "trace.csv")
+	if err := os.WriteFile(trace, []byte("src_chain,dst_chain,src_block_number,dst_block_number,src_block_time\na,b,10,1,2025-12-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRoot := filepath.Join(directory, "runs")
+	if err := os.Mkdir(runRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(directory, "replay.yaml")
+	body := "version: 1\ninput_trace: " + trace + "\nrun_root: " + runRoot + "\nsettings: [B0, B2]\ncost_profile:\n  id: fixture\n  direct_step_cost: 100\n  path_step_cost: 10\n  trust_root_update_cost: 5\n"
+	if err := os.WriteFile(config, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := run([]string{"replay", "--config", config, "--setting", "B2"}, &stderr); code != 0 {
+		t.Fatalf("setting override code=%d stderr=%q", code, stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(runRoot, "b2", "decisions.csv")); err != nil {
+		t.Fatalf("B2 replay result missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runRoot, "b0")); !os.IsNotExist(err) {
+		t.Fatalf("B0 must not run under B2 override: %v", err)
+	}
+}
+
+func TestRunReplayRejectsSettingOutsideValidatedConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	trace := filepath.Join(directory, "trace.csv")
+	if err := os.WriteFile(trace, []byte("src_chain,dst_chain,src_block_number,dst_block_number,src_block_time\na,b,10,1,2025-12-01T00:00:00Z\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runRoot := filepath.Join(directory, "runs")
+	outside := filepath.Join(directory, "outside")
+	if err := os.Mkdir(runRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(runRoot, "b3")); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(directory, "replay.yaml")
+	body := "version: 1\ninput_trace: " + trace + "\nrun_root: " + runRoot + "\nsettings: [B0]\ncost_profile:\n  id: fixture\n  direct_step_cost: 100\n  path_step_cost: 10\n  trust_root_update_cost: 5\n"
+	if err := os.WriteFile(config, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	code := run([]string{"replay", "--config", config, "--setting", "B3"}, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "not present in the validated configuration") {
+		t.Fatalf("absent setting override code=%d stderr=%q", code, stderr.String())
+	}
+	entries, err := os.ReadDir(outside)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("outside directory was touched: entries=%v err=%v", entries, err)
+	}
+}
+
 func TestRunRejectsRuntimeChainMismatchBeforeServingReady(t *testing.T) {
 	rpcServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

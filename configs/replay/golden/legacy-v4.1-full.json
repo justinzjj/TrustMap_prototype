@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "trace_digest": "ae35b6fd51185822dcfd8e338b2af43735bb2141764feead9ec993633a232175",
+  "prepared_rows": 245000,
+  "chain_count": 21,
+  "cost_profile_id": "legacy-v4.1",
+  "settings": {
+    "B0": {
+      "trustmap_rows": 0,
+      "avg_direct_cost": 6155119356.734694,
+      "avg_chosen_cost": 6155119356.734694,
+      "total_saving": 0,
+      "decision_digest": "4e3c2eddc9325b65c53151d74150415a6ed074f4055b787909190c21c092bb63"
+    },
+    "B1": {
+      "trustmap_rows": 0,
+      "avg_direct_cost": 1285850899.5918367,
+      "avg_chosen_cost": 1285850899.5918367,
+      "total_saving": 0,
+      "decision_digest": "9d6390735b885e7b227f9c592707c23434ed9d0e7d47c740c099adf365f6d34e"
+    },
+    "B2": {
+      "trustmap_rows": 111058,
+      "avg_direct_cost": 6155119356.734694,
+      "avg_chosen_cost": 871342032.2040817,
+      "total_saving": 1294525444510000,
+      "decision_digest": "e73e366829bb5586f1f49f2c0c31dc8232ec58b481c3100591ae0549e55c15c5",
+      "path_digest": "a82e299cf9f740c67239690d2e3e4e92d12f12fb3a1a2eb9f1ddf780af055b60",
+      "graph": {
+        "nodes": 453949,
+        "edges_total": 1152851,
+        "edges_cross_added": 245000
+      }
+    },
+    "B3": {
+      "trustmap_rows": 91829,
+      "avg_direct_cost": 1285850899.5918367,
+      "avg_chosen_cost": 458070470.97959185,
+      "total_saving": 202806205010000,
+      "decision_digest": "c802cb9559d9241c981ef5cef20099b8917435497ab48759d6c78bfd27e0777d",
+      "path_digest": "ed5e74b4f19b0b40e9d54925ca51d794e692a5eaa258227dde0b65f1883a9ae9",
+      "graph": {
+        "nodes": 453949,
+        "edges_total": 1152851,
+        "edges_cross_added": 245000
+      }
+    }
+  }
+}

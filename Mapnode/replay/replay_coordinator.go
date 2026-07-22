@@ -73,13 +73,17 @@ func NewReplayCoordinators(settings []Setting, initHeights map[string]uint64, pr
 }
 
 func (coordinator *ReplayCoordinator) Process(event ReplayEvent) (ReplayDecision, error) {
-	start, err := coordinator.view.Activate(event.Destination)
-	if err != nil {
-		return ReplayDecision{}, fmt.Errorf("activate replay start: %w", err)
-	}
-	goal, err := coordinator.view.Activate(event.Source)
-	if err != nil {
-		return ReplayDecision{}, fmt.Errorf("activate replay goal: %w", err)
+	start, goal := event.Destination.Key(), event.Source.Key()
+	if coordinator.setting.UsesTrustMap() {
+		var err error
+		start, err = coordinator.view.Activate(event.Destination)
+		if err != nil {
+			return ReplayDecision{}, fmt.Errorf("activate replay start: %w", err)
+		}
+		goal, err = coordinator.view.Activate(event.Source)
+		if err != nil {
+			return ReplayDecision{}, fmt.Errorf("activate replay goal: %w", err)
+		}
 	}
 	estimate, err := coordinator.baselines.EstimateDirect(
 		event.Destination.Chain, event.Source.Chain, event.Source.OriginalHeight,
@@ -117,12 +121,14 @@ func (coordinator *ReplayCoordinator) Process(event ReplayEvent) (ReplayDecision
 		}
 	}
 	result.BaselineAfter = coordinator.baselines.Advance(event.Destination.Chain, event.Source.Chain, event.Source.OriginalHeight)
-	if _, err := coordinator.view.AddVerifiedDependency(event.Destination, event.Source); err != nil {
-		return ReplayDecision{}, fmt.Errorf("add replay dependency after decision: %w", err)
+	if result.PlanningEnabled {
+		if _, err := coordinator.view.AddVerifiedDependency(event.Destination, event.Source); err != nil {
+			return ReplayDecision{}, fmt.Errorf("add replay dependency after decision: %w", err)
+		}
+		result.CrossEdgesAdded = coordinator.view.CrossEdgesAdded()
+		result.GraphNodes = coordinator.view.NodeCount()
+		result.GraphEdges = coordinator.view.EdgeCount()
 	}
-	result.CrossEdgesAdded = coordinator.view.CrossEdgesAdded()
-	result.GraphNodes = coordinator.view.NodeCount()
-	result.GraphEdges = coordinator.view.EdgeCount()
 	return result, nil
 }
 
@@ -132,25 +138,109 @@ func (coordinator *ReplayCoordinator) Restore(event ReplayEvent, decision Replay
 	if decision.EventID != event.ID || decision.Sequence != event.Sequence || decision.Setting != coordinator.setting {
 		return fmt.Errorf("restore replay event identity mismatch at sequence %d", event.Sequence)
 	}
-	if _, err := coordinator.view.Activate(event.Destination); err != nil {
-		return fmt.Errorf("restore replay start: %w", err)
-	}
-	if _, err := coordinator.view.Activate(event.Source); err != nil {
-		return fmt.Errorf("restore replay goal: %w", err)
+	if coordinator.setting.UsesTrustMap() {
+		if _, err := coordinator.view.Activate(event.Destination); err != nil {
+			return fmt.Errorf("restore replay start: %w", err)
+		}
+		if _, err := coordinator.view.Activate(event.Source); err != nil {
+			return fmt.Errorf("restore replay goal: %w", err)
+		}
 	}
 	baseline := coordinator.baselines.Get(event.Destination.Chain, event.Source.Chain)
 	if baseline != decision.BaselineBefore {
 		return fmt.Errorf("restore replay baseline before mismatch at sequence %d: got %d want %d", event.Sequence, baseline, decision.BaselineBefore)
 	}
+	estimate, err := coordinator.baselines.EstimateDirect(
+		event.Destination.Chain, event.Source.Chain, event.Source.OriginalHeight,
+		coordinator.profile, coordinator.policy, coordinator.setting.UsesCheckpoint(),
+	)
+	if err != nil {
+		return fmt.Errorf("restore replay direct estimate: %w", err)
+	}
+	if err := coordinator.validateRestoredDecision(event, decision, estimate); err != nil {
+		return err
+	}
 	after := coordinator.baselines.Advance(event.Destination.Chain, event.Source.Chain, event.Source.OriginalHeight)
 	if after != decision.BaselineAfter {
 		return fmt.Errorf("restore replay baseline after mismatch at sequence %d: got %d want %d", event.Sequence, after, decision.BaselineAfter)
 	}
-	if _, err := coordinator.view.AddVerifiedDependency(event.Destination, event.Source); err != nil {
-		return fmt.Errorf("restore replay dependency: %w", err)
+	if coordinator.setting.UsesTrustMap() {
+		if _, err := coordinator.view.AddVerifiedDependency(event.Destination, event.Source); err != nil {
+			return fmt.Errorf("restore replay dependency: %w", err)
+		}
 	}
 	if coordinator.view.NodeCount() != decision.GraphNodes || coordinator.view.EdgeCount() != decision.GraphEdges || coordinator.view.CrossEdgesAdded() != decision.CrossEdgesAdded {
 		return fmt.Errorf("restore replay graph counter mismatch at sequence %d", event.Sequence)
+	}
+	return nil
+}
+
+func (coordinator *ReplayCoordinator) validateRestoredDecision(event ReplayEvent, decision ReplayDecision, estimate ReplayDirectEstimate) error {
+	sequenceError := func(detail string) error {
+		return fmt.Errorf("restore replay decision %s mismatch at sequence %d", detail, event.Sequence)
+	}
+	if decision.PlanningEnabled != coordinator.setting.UsesTrustMap() {
+		return sequenceError("planning mode")
+	}
+	if decision.BaselineBefore != estimate.BaselineBefore || decision.DirectStart != estimate.DirectStart || decision.DirectBlocks != estimate.DirectBlocks ||
+		decision.CheckpointConfigured != estimate.CheckpointConfigured || decision.CheckpointPeriod != estimate.CheckpointPeriod ||
+		decision.CheckpointHeight != estimate.CheckpointHeight || decision.CheckpointApplied != estimate.CheckpointApplied || decision.DirectCost != estimate.Cost {
+		return sequenceError("direct estimate")
+	}
+	expectedAfter := decision.BaselineBefore
+	if event.Source.OriginalHeight > expectedAfter {
+		expectedAfter = event.Source.OriginalHeight
+	}
+	if decision.BaselineAfter != expectedAfter {
+		return sequenceError("baseline after")
+	}
+	if !decision.PlanningEnabled {
+		if decision.Decision != ReplayDecisionDirect || decision.ChosenCost != decision.DirectCost || decision.PathFound || decision.PathCost != 0 || decision.TrustMapTotalCost != 0 || len(decision.Path.Nodes) != 0 || len(decision.Path.Segments) != 0 {
+			return sequenceError("baseline-only result")
+		}
+		return nil
+	}
+	if decision.Decision != ReplayDecisionDirect && decision.Decision != ReplayDecisionTrustMap {
+		return sequenceError("kind")
+	}
+	if !decision.PathFound {
+		if decision.Decision != ReplayDecisionDirect || decision.ChosenCost != decision.DirectCost || decision.PathCost != 0 || decision.TrustMapTotalCost != 0 || len(decision.Path.Nodes) != 0 || len(decision.Path.Segments) != 0 {
+			return sequenceError("missing path")
+		}
+		return nil
+	}
+	path := decision.Path
+	if len(path.Nodes) == 0 || len(path.Segments)+1 != len(path.Nodes) || path.Nodes[0] != event.Destination.Key() || path.Nodes[len(path.Nodes)-1] != event.Source.Key() {
+		return sequenceError("path endpoints")
+	}
+	pathCost := uint64(0)
+	for index, segment := range path.Segments {
+		if segment.From != path.Nodes[index] || segment.To != path.Nodes[index+1] {
+			return sequenceError("path segment")
+		}
+		edge, ok := coordinator.view.Edge(segment.From, segment.To)
+		if !ok || edge.Kind != segment.Kind || edge.Weight != segment.Weight {
+			return sequenceError("path edge")
+		}
+		var err error
+		pathCost, err = CheckedAdd(pathCost, segment.Weight)
+		if err != nil {
+			return sequenceError("path cost overflow")
+		}
+	}
+	if path.Cost != pathCost || decision.PathCost != pathCost {
+		return sequenceError("path cost")
+	}
+	total, err := CheckedAdd(pathCost, coordinator.profile.TrustRootUpdateCost)
+	if err != nil || decision.TrustMapTotalCost != total {
+		return sequenceError("TrustMap total")
+	}
+	if decision.Decision == ReplayDecisionTrustMap {
+		if total >= decision.DirectCost || decision.ChosenCost != total {
+			return sequenceError("TrustMap selection")
+		}
+	} else if total < decision.DirectCost || decision.ChosenCost != decision.DirectCost {
+		return sequenceError("Direct selection")
 	}
 	return nil
 }

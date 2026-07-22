@@ -48,6 +48,24 @@ The two-chain test verifies a real Direct transaction and the propagated
 then proves that C selects and executes a two-hop Path transaction for A. Both
 tests assert the canonical success, dependency, and request-resolution events.
 
+## Replay the evaluation dataset
+
+Replay mode uses the real MapNode planner implementation with a replay-only
+cost model and durable `ReplayTrustView`; it does not submit per-message
+transactions and does not need Geth.
+
+```sh
+./tests/integration/replay_smoke_test.sh
+./scripts/replay-full.sh --profile legacy-v4.1
+```
+
+The six-row smoke runs B0--B3 and requires B2/B3 to select TrustMap. The full
+entry point supports the 245,000-message, 21-chain trace and checks the exact
+legacy decisions, paths, costs, and aggregates. `prototype-calibrated` is a separate sensitivity profile,
+not an exact legacy reproduction. See
+[docs/replay-experiments.md](docs/replay-experiments.md) for configuration,
+overrides, resumption, output and Docker usage.
+
 ## Development checks
 
 ```sh
@@ -57,6 +75,7 @@ CGO_ENABLED=0 go build ./cmd/mapnode
 CGO_ENABLED=0 go build ./cmd/trustmapctl
 forge test --root contracts -vv
 ./tests/integration/container_build_test.sh
+./tests/integration/replay_smoke_test.sh
 ```
 
 The minimal read-only MapNode API exposes `/health/live`, `/health/ready`,

@@ -15,69 +15,65 @@ import (
 )
 
 func ExportReplayRun(ctx context.Context, repository *ReplayRepository, trace PreparedTrace, config Config, setting Setting, policy CheckpointPolicy) error {
-	completed, err := repository.CompletedEvents(ctx)
-	if err != nil {
-		return err
-	}
 	runDir := config.SettingRunDir(setting)
 	if err := writeCSVAtomic(filepath.Join(runDir, "decisions.csv"), legacyDecisionHeader(setting), func(writer *csv.Writer) error {
-		for _, item := range completed {
+		return repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 			if err := writer.Write(legacyDecisionRow(setting, item.Event, item.Decision)); err != nil {
 				return err
 			}
-		}
-		return nil
+			return nil
+		})
 	}); err != nil {
 		return err
 	}
 	if setting.UsesTrustMap() {
 		if err := writeCSVAtomic(filepath.Join(runDir, "paths.csv"), legacyPathHeader(setting), func(writer *csv.Writer) error {
-			for _, item := range completed {
+			return repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 				if item.Decision.Decision == ReplayDecisionTrustMap {
 					if err := writer.Write(legacyPathRow(setting, item.Event, item.Decision)); err != nil {
 						return err
 					}
 				}
-			}
-			return nil
+				return nil
+			})
 		}); err != nil {
 			return err
 		}
 		if err := writeCSVAtomic(filepath.Join(runDir, "paths_extended.csv"), extendedPathHeader(), func(writer *csv.Writer) error {
-			for _, item := range completed {
+			return repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 				if item.Decision.Decision == ReplayDecisionTrustMap {
 					if err := writer.Write(extendedPathRow(item.Event, item.Decision, config.CostProfile)); err != nil {
 						return err
 					}
 				}
-			}
-			return nil
+				return nil
+			})
 		}); err != nil {
 			return err
 		}
 		if config.RecordEvery > 0 {
 			if err := writeCSVAtomic(filepath.Join(runDir, "map_snapshots.csv"), []string{"nodes", "edges_total", "edges_cross_added", "idx", "time"}, func(writer *csv.Writer) error {
-				for _, item := range completed {
+				return repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 					if item.Snapshot != nil {
 						record := []string{uintText(item.Snapshot.GraphNodes), uintText(item.Snapshot.GraphEdges), uintText(item.Snapshot.CrossEdgesAdded), uintText(item.Snapshot.Sequence), legacyTime(item.Snapshot.Time)}
 						if err := writer.Write(record); err != nil {
 							return err
 						}
 					}
-				}
-				return nil
+					return nil
+				})
 			}); err != nil {
 				return err
 			}
 		}
 	}
 	if err := writeCSVAtomic(filepath.Join(runDir, "decisions_extended.csv"), extendedDecisionHeader(), func(writer *csv.Writer) error {
-		for _, item := range completed {
+		return repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 			if err := writer.Write(extendedDecisionRow(item.Event, item.Decision, config.CostProfile)); err != nil {
 				return err
 			}
-		}
-		return nil
+			return nil
+		})
 	}); err != nil {
 		return err
 	}
@@ -117,7 +113,11 @@ func ExportReplayRun(ctx context.Context, repository *ReplayRepository, trace Pr
 	if err := writeJSONAtomic(filepath.Join(runDir, "progress.json"), progress); err != nil {
 		return err
 	}
-	if err := writeJSONAtomic(filepath.Join(runDir, "summary.json"), replaySummary(setting, completed, config, policy, trace.Chains)); err != nil {
+	summary, err := replaySummary(ctx, repository, setting, config, policy)
+	if err != nil {
+		return err
+	}
+	if err := writeJSONAtomic(filepath.Join(runDir, "summary.json"), summary); err != nil {
 		return err
 	}
 	manifest := map[string]any{
@@ -288,12 +288,14 @@ func pathSegmentsLegacyJSON(path ReplayPath) string {
 	return compact
 }
 
-func replaySummary(setting Setting, completed []ReplayCommittedEvent, config Config, policy CheckpointPolicy, chains []string) any {
+func replaySummary(ctx context.Context, repository *ReplayRepository, setting Setting, config Config, policy CheckpointPolicy) (any, error) {
 	var directTotal, chosenTotal, savingTotal float64
 	var trustMapRows uint64
 	var snapshots uint64
 	var trustMapRowsWithJumps, trustMapJumpSegments uint64
-	for _, item := range completed {
+	var rows uint64
+	var lastGraphNodes, lastGraphEdges, lastCrossEdges uint64
+	if err := repository.ForEachCompleted(ctx, func(item ReplayCommittedEvent) error {
 		directTotal += float64(item.Decision.DirectCost)
 		chosenTotal += float64(item.Decision.ChosenCost)
 		savingTotal += float64(item.Decision.DirectCost - item.Decision.ChosenCost)
@@ -308,8 +310,12 @@ func replaySummary(setting Setting, completed []ReplayCommittedEvent, config Con
 		if item.Snapshot != nil {
 			snapshots++
 		}
+		lastGraphNodes, lastGraphEdges, lastCrossEdges = item.Decision.GraphNodes, item.Decision.GraphEdges, item.Decision.CrossEdgesAdded
+		rows++
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	rows := len(completed)
 	averageDirect, averageChosen, ratio := 0.0, 0.0, 0.0
 	if rows > 0 {
 		averageDirect, averageChosen, ratio = directTotal/float64(rows), chosenTotal/float64(rows), float64(trustMapRows)/float64(rows)
@@ -322,12 +328,11 @@ func replaySummary(setting Setting, completed []ReplayCommittedEvent, config Con
 		} else {
 			result["checkpoint_chains_enabled"] = 0
 		}
-		return result
+		return result, nil
 	}
 	result["trustmap_update_cost"] = float64(config.CostProfile.TrustRootUpdateCost)
 	if rows > 0 {
-		last := completed[rows-1].Decision
-		result["graph"] = map[string]any{"nodes": last.GraphNodes, "edges_total": last.GraphEdges, "edges_cross_added": last.CrossEdgesAdded}
+		result["graph"] = map[string]any{"nodes": lastGraphNodes, "edges_total": lastGraphEdges, "edges_cross_added": lastCrossEdges}
 	}
 	result["record_every"] = config.RecordEvery
 	result["graph_snapshots_rows"] = snapshots
@@ -338,7 +343,7 @@ func replaySummary(setting Setting, completed []ReplayCommittedEvent, config Con
 	if setting == SettingB3 {
 		result["checkpoint_chains_enabled"] = policy.ConfiguredChainCount()
 	}
-	return result
+	return result, nil
 }
 
 func writeCSVAtomic(path string, header []string, rows func(*csv.Writer) error) error {

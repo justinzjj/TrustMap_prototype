@@ -1,0 +1,5 @@
+# Sensitivity profile calibrated from this prototype; not an exact legacy run.
+id: prototype-calibrated
+direct_step_cost: 3000096
+path_step_cost: 30713
+trust_root_update_cost: 108582

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "trace_digest": "6047e1f6acd8820aa30f3e2181a1230802d6af73da6b03570a6aecb782a9a840",
+  "prepared_rows": 6,
+  "chain_count": 3,
+  "cost_profile_id": "legacy-v4.1",
+  "settings": {
+    "B0": {
+      "trustmap_rows": 0,
+      "decision_digest": "2596141d04de438a528502c576b08cab98f70f4dfec8ada47601c0bf4e9a6bc1"
+    },
+    "B1": {
+      "trustmap_rows": 0,
+      "decision_digest": "2596141d04de438a528502c576b08cab98f70f4dfec8ada47601c0bf4e9a6bc1"
+    },
+    "B2": {
+      "trustmap_rows": 1,
+      "decision_digest": "d6ed6ecc02b3b366367050b7246bf4d52e8d3c01150671cbf980758ead72e02e",
+      "path_digest": "194e9bd16a48e40de93574d9503d0c339dc78fc2d3bd95529b5d219c9dec416b",
+      "graph": { "nodes": 11, "edges_total": 22, "edges_cross_added": 6 }
+    },
+    "B3": {
+      "trustmap_rows": 1,
+      "decision_digest": "d6ed6ecc02b3b366367050b7246bf4d52e8d3c01150671cbf980758ead72e02e",
+      "path_digest": "194e9bd16a48e40de93574d9503d0c339dc78fc2d3bd95529b5d219c9dec416b",
+      "graph": { "nodes": 11, "edges_total": 22, "edges_cross_added": 6 }
+    }
+  }
+}
