@@ -132,28 +132,25 @@ precision_output=$fixture_root/precision-msg.csv
 mkdir -p "$precision_raw"
 cat >"$precision_raw/44_0000.csv" <<'CSV'
 src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
-ethereum,base,max,18446744073709551615,0,1,1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:01.000 UTC
-ethereum,base,beyond-float,9.007199254740993e15,2.5000000000000001,1,1,2025-12-01 00:00:01.000 UTC,2025-12-01 00:00:02.000 UTC
-ethereum,base,above-half,2.5000000000000001,9007199254740993,1,1,2025-12-01 00:00:02.000 UTC,2025-12-01 00:00:03.000 UTC
-ethereum,base,half-even,2.5,18446744073709551615,1,1,2025-12-01 00:00:03.000 UTC,2025-12-01 00:00:04.000 UTC
+ethereum,base,half-even,2.5,1.25e2,1,1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:01.000 UTC
 CSV
 python3 "$preparer" --raw-dir "$precision_raw" --query-id 44 \
-  --output "$precision_output" --expected-rows 4
+  --output "$precision_output" --expected-rows 1
 cat >"$fixture_root/expected-precision.csv" <<'CSV'
 src_chain,dst_chain,bridge_name,src_block_number,dst_block_number,tx_count,volume_usd,src_block_time,dst_block_time
-ethereum,base,max,18446744073709551615,0,1,1,2025-12-01 00:00:00+00:00,2025-12-01 00:00:01.000 UTC
-ethereum,base,beyond-float,9007199254740993,3,1,1,2025-12-01 00:00:01+00:00,2025-12-01 00:00:02.000 UTC
-ethereum,base,above-half,3,9007199254740993,1,1,2025-12-01 00:00:02+00:00,2025-12-01 00:00:03.000 UTC
-ethereum,base,half-even,2,18446744073709551615,1,1,2025-12-01 00:00:03+00:00,2025-12-01 00:00:04.000 UTC
+ethereum,base,half-even,2,125,1,1,2025-12-01 00:00:00+00:00,2025-12-01 00:00:01.000 UTC
 CSV
 cmp "$fixture_root/expected-precision.csv" "$precision_output"
 
-sed '2s/18446744073709551615/18446744073709551616/' \
-  "$precision_raw/44_0000.csv" >"$fixture_root/overflow-page"
-mv "$fixture_root/overflow-page" "$precision_raw/44_0000.csv"
 prepare_output=$precision_output
-expect_prepare_failure "uint64 height overflow" python3 "$preparer" \
-  --raw-dir "$precision_raw" --query-id 44 --output "$precision_output"
+for unsafe_height in 2.5000000000000001 9.007199254740993e15 18446744073709551615; do
+  cat >"$precision_raw/44_0000.csv" <<CSV
+$prepare_header
+ethereum,base,unsafe,$unsafe_height,1,1,1,2025-12-01 00:00:00.000 UTC,2025-12-01 00:00:01.000 UTC
+CSV
+  expect_prepare_failure "pandas-incompatible height $unsafe_height" python3 "$preparer" \
+    --raw-dir "$precision_raw" --query-id 44 --output "$precision_output"
+done
 for invalid_height in NaN Inf 1_0 1e99999; do
   cat >"$precision_raw/44_0000.csv" <<CSV
 $prepare_header

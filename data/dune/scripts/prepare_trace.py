@@ -41,7 +41,7 @@ DECIMAL_HEIGHT = re.compile(
     r"(?P<sign>[+-]?)(?P<coefficient>(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))"
     r"(?:[eE](?P<exponent>[+-]?[0-9]+))?"
 )
-MAX_UINT64 = (1 << 64) - 1
+MAX_INT64 = (1 << 63) - 1
 NONFINITE_NUMBER = re.compile(r"[+-]?(?:nan|inf(?:inity)?)", re.IGNORECASE)
 
 
@@ -227,8 +227,8 @@ def parse_height(value: object, label: str) -> int:
         if len(unsigned_exponent) > 4 or abs(int(exponent_text)) > 1024:
             raise PreparationError(f"{label} contains an out-of-range exponent")
     rounded = Decimal(value).to_integral_value(rounding=ROUND_HALF_EVEN)
-    if rounded < 0 or rounded > MAX_UINT64:
-        raise PreparationError(f"{label} is outside the uint64 range")
+    if rounded < 0 or rounded > MAX_INT64:
+        raise PreparationError(f"{label} is outside the non-negative int64 range")
     return int(rounded)
 
 
@@ -285,8 +285,22 @@ def normalize_trace(frame: pd.DataFrame) -> pd.DataFrame:
     frame["bridge_name"] = frame["bridge_name"].astype("string").str.strip()
 
     for column in ("src_block_number", "dst_block_number"):
-        converted = [parse_height(value, column) for value in frame[column].array]
-        frame[column] = pd.array(converted, dtype="UInt64")
+        exact = [parse_height(value, column) for value in frame[column].array]
+        try:
+            converted = (
+                pd.to_numeric(frame[column], errors="coerce")
+                .round()
+                .astype("Int64")
+            )
+        except (OverflowError, TypeError, ValueError) as error:
+            raise PreparationError(f"{column} cannot use pandas Int64 semantics") from error
+        if converted.isna().any():
+            raise PreparationError(f"{column} cannot use pandas Int64 semantics")
+        if [int(value) for value in converted.array] != exact:
+            raise PreparationError(
+                f"{column} loses precision under pandas Int64 semantics"
+            )
+        frame[column] = converted
 
     source_time_text = frame["src_block_time"].astype("string").str.removesuffix(" UTC")
     frame["src_block_time"] = pd.to_datetime(
