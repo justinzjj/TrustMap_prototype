@@ -192,7 +192,50 @@ def blank(row):
     return not row or all(not field.strip() for field in row)
 
 
+def validate_quote_structure(path):
+    field_start = "field_start"
+    unquoted = "unquoted"
+    quoted = "quoted"
+    after_quote = "after_quote"
+    after_quoted_cr = "after_quoted_cr"
+    state = field_start
+    with open(path, encoding="utf-8", newline="") as source:
+        while chunk := source.read(1024 * 1024):
+            for character in chunk:
+                if state == quoted:
+                    if character == '"':
+                        state = after_quote
+                elif state == after_quote:
+                    if character == '"':
+                        state = quoted
+                    elif character == "," or character == "\n":
+                        state = field_start
+                    elif character == "\r":
+                        state = after_quoted_cr
+                    else:
+                        raise ValueError("invalid CSV quote structure")
+                elif state == after_quoted_cr:
+                    if character != "\n":
+                        raise ValueError("invalid CSV quote structure")
+                    state = field_start
+                elif state == field_start:
+                    if character == '"':
+                        state = quoted
+                    elif character == "," or character == "\n":
+                        state = field_start
+                    else:
+                        state = unquoted
+                else:
+                    if character == '"':
+                        raise ValueError("invalid CSV quote structure")
+                    if character == "," or character == "\n":
+                        state = field_start
+    if state == quoted or state == after_quoted_cr:
+        raise ValueError("invalid CSV quote structure at end of file")
+
+
 try:
+    validate_quote_structure(sys.argv[1])
     with open(sys.argv[1], encoding="utf-8-sig", newline="") as response:
         reader = csv.reader(response, strict=True)
         header = None

@@ -523,10 +523,13 @@ case ${FAKE_CURL_SCENARIO:-} in
     esac
     ;;
   quoted_record)
-    printf 'column_a,column_b\n"line one\nline two, comma",ok\n' >"$output"
+    printf 'column_a,column_b\n"line one\nline two, ""quoted"" comma",ok\n' >"$output"
     ;;
   malformed_csv)
     printf 'column_a,column_b\n"unterminated,value\n' >"$output"
+    ;;
+  bare_quote_csv)
+    printf 'a,b\n1,bad"quote\n' >"$output"
     ;;
   always_data)
     offset=${url##*offset=}
@@ -710,7 +713,7 @@ run_downloader quoted_record --query-id 68 --max-pages 1 --output-dir "$quoted_d
 cat >"$fixture_root/expected-quoted.csv" <<'CSV'
 column_a,column_b
 "line one
-line two, comma",ok
+line two, ""quoted"" comma",ok
 CSV
 cmp "$fixture_root/expected-quoted.csv" "$quoted_dir/68_0000.csv"
 
@@ -719,6 +722,12 @@ expect_downloader_failure "malformed CSV response" run_downloader malformed_csv 
   --query-id 69 --max-pages 1 --output-dir "$malformed_dir"
 [ ! -e "$malformed_dir/69_0000.csv" ]
 [ ! -e "$malformed_dir.sha256" ]
+
+bare_quote_dir=$fixture_root/bare-quote-response
+expect_downloader_failure "bare quote in CSV response" run_downloader bare_quote_csv \
+  --query-id 76 --max-pages 1 --output-dir "$bare_quote_dir"
+[ ! -e "$bare_quote_dir/76_0000.csv" ]
+[ ! -e "$bare_quote_dir.sha256" ]
 
 race_dir=$fixture_root/race
 mkdir -p "$race_dir"
