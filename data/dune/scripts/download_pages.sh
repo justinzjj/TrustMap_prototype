@@ -1,4 +1,5 @@
 #!/bin/sh
+# Requires GNU/Linux with curl, mktemp, sha256sum, and Python 3.
 set -eu
 
 query_id=6515125
@@ -9,9 +10,12 @@ resume=0
 output_dir=
 temp_file=
 inventory_temp=
+header_file=
+status_temp=
 
 usage() {
   echo "usage: download_pages.sh --query-id ID --output-dir DIR [--limit N] [--start-page N] [--max-pages N] [--resume]" >&2
+  echo "requires GNU/Linux with curl, mktemp, sha256sum, and python3" >&2
 }
 
 die() {
@@ -53,10 +57,21 @@ cleanup() {
   if [ -n "$inventory_temp" ]; then
     rm -f -- "$inventory_temp"
   fi
+  if [ -n "$header_file" ]; then
+    rm -f -- "$header_file"
+  fi
+  if [ -n "$status_temp" ]; then
+    rm -f -- "$status_temp"
+  fi
 }
 
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
+
+for required_command in curl mktemp sha256sum python3; do
+  command -v "$required_command" >/dev/null 2>&1 || \
+    die "required command not found: $required_command"
+done
 
 while [ "$#" -gt 0 ]; do
   case $1 in
@@ -100,38 +115,109 @@ is_positive_integer "$query_id" || die "query id must be a positive integer"
 is_positive_integer "$limit" || die "limit must be a positive integer"
 is_nonnegative_integer "$start_page" || die "start page must be a non-negative integer"
 is_nonnegative_integer "$max_pages" || die "max pages must be a non-negative integer"
+[ "$limit" -le 1000000 ] || die "limit must not exceed 1000000"
+[ "$start_page" -le 9999 ] || die "start page must not exceed 9999"
 [ -n "$output_dir" ] || die "--output-dir is required"
 [ -n "${DUNE_API_KEY:-}" ] || die "DUNE_API_KEY is required"
+api_key=$DUNE_API_KEY
+unset DUNE_API_KEY
+case $api_key in
+  *[!A-Za-z0-9._-]*)
+    api_key=
+    die "DUNE_API_KEY contains unsupported characters"
+    ;;
+esac
 
+path_status=0
+python3 - "$output_dir" <<'PY' || path_status=$?
+import sys
+
+path = sys.argv[1]
+raise SystemExit(1 if "\r" in path or "\n" in path else 0)
+PY
+[ "$path_status" -eq 0 ] || die "output directory must not contain CR or LF"
 mkdir -p -- "$output_dir"
 [ -d "$output_dir" ] || die "output path is not a directory"
+if ! output_dir=$(CDPATH= cd -- "$output_dir" && pwd -P); then
+  die "could not normalize output directory"
+fi
+[ "$output_dir" != / ] || die "output directory must not be filesystem root"
+header_file=$(mktemp "$output_dir/.dune-header.XXXXXX")
+chmod 600 "$header_file"
+printf 'x-dune-api-key: %s\n' "$api_key" >"$header_file"
+api_key=
 
 page=$start_page
 attempted=0
 while [ "$max_pages" -eq 0 ] || [ "$attempted" -lt "$max_pages" ]; do
+  [ "$page" -le 9999 ] || die "page must not exceed 9999"
   page_name=$(printf '%s_%04d.csv' "$query_id" "$page")
   page_path=$output_dir/$page_name
   existing=0
+  if [ -L "$page_path" ]; then
+    die "page path must not be a symlink: $page_name"
+  fi
   if [ -e "$page_path" ]; then
     existing=1
     [ "$resume" -eq 1 ] || die "page already exists: $page_name"
   fi
 
   temp_file=$(mktemp "$output_dir/.dune-page.XXXXXX")
+  status_temp=$(mktemp "$output_dir/.dune-status.XXXXXX")
   offset=$((page * limit))
   url="https://api.dune.com/api/v1/query/${query_id}/results/csv?limit=${limit}&offset=${offset}"
-  if ! curl --fail --silent --show-error --location --retry 5 \
-    --header "x-dune-api-key: $DUNE_API_KEY" \
+  if ! curl --fail --silent --show-error --retry 5 \
+    --header "@$header_file" \
+    --write-out '%{http_code}' \
     --output "$temp_file" \
-    "$url"; then
+    "$url" >"$status_temp"; then
     die "Dune page request failed"
   fi
+  http_status=$(cat "$status_temp")
+  rm -f -- "$status_temp"
+  status_temp=
+  case $http_status in
+    2[0-9][0-9]) ;;
+    *) die "Dune page request returned non-2xx status" ;;
+  esac
   attempted=$((attempted + 1))
 
-  has_data=1
-  if [ ! -s "$temp_file" ] || ! awk 'NR > 1 { exit 0 } END { if (NR <= 1) exit 1 }' "$temp_file"; then
-    has_data=0
-  fi
+  csv_status=0
+  python3 - "$temp_file" <<'PY' || csv_status=$?
+import csv
+import sys
+
+
+def blank(row):
+    return not row or all(not field.strip() for field in row)
+
+
+try:
+    with open(sys.argv[1], encoding="utf-8-sig", newline="") as response:
+        reader = csv.reader(response, strict=True)
+        header = None
+        found_data = False
+        for row in reader:
+            if header is None:
+                if blank(row):
+                    continue
+                header = row
+                continue
+            if blank(row):
+                continue
+            if len(row) != len(header):
+                raise ValueError("CSV row width differs from header")
+            found_data = True
+except (OSError, UnicodeError, csv.Error, ValueError):
+    raise SystemExit(2)
+
+raise SystemExit(0 if found_data else 3)
+PY
+  case $csv_status in
+    0) has_data=1 ;;
+    3) has_data=0 ;;
+    *) die "Dune page response is malformed CSV" ;;
+  esac
 
   if [ "$existing" -eq 1 ]; then
     if ! cmp -s -- "$page_path" "$temp_file"; then
@@ -148,7 +234,10 @@ while [ "$max_pages" -eq 0 ] || [ "$attempted" -lt "$max_pages" ]; do
     temp_file=
     break
   else
-    mv -- "$temp_file" "$page_path"
+    if ! ln -- "$temp_file" "$page_path"; then
+      die "page appeared while download was in progress: $page_name"
+    fi
+    rm -f -- "$temp_file"
     temp_file=
   fi
 
@@ -159,8 +248,8 @@ inventory_path=${output_dir}.sha256
 inventory_temp=$(mktemp "${inventory_path}.tmp.XXXXXX")
 LC_ALL=C
 export LC_ALL
-for page_path in "$output_dir"/*.csv; do
-  [ -f "$page_path" ] || continue
+for page_path in "$output_dir"/"${query_id}_"[0-9][0-9][0-9][0-9].csv; do
+  [ -f "$page_path" ] && [ ! -L "$page_path" ] || continue
   page_name=${page_path##*/}
   digest=$(sha256sum "$page_path" | awk '{print $1}')
   printf '%s  %s\n' "$digest" "$page_name" >>"$inventory_temp"

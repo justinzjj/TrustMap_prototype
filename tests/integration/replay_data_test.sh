@@ -448,14 +448,19 @@ url=
 saw_fail=0
 saw_silent=0
 saw_show_error=0
-saw_location=0
 retry=
+write_out=
+expected_key=$(cat "$FAKE_EXPECTED_KEY_FILE")
+[ -z "${DUNE_API_KEY+x}" ] || exit 100
 while [ "$#" -gt 0 ]; do
+  case $1 in
+    *"$expected_key"*) exit 101 ;;
+  esac
   case $1 in
     --fail) saw_fail=1 ;;
     --silent) saw_silent=1 ;;
     --show-error) saw_show_error=1 ;;
-    --location) saw_location=1 ;;
+    --location) exit 102 ;;
     --retry)
       [ "$#" -ge 2 ] || exit 91
       retry=$2
@@ -464,6 +469,11 @@ while [ "$#" -gt 0 ]; do
     --header)
       [ "$#" -ge 2 ] || exit 92
       header=$2
+      shift
+      ;;
+    --write-out)
+      [ "$#" -ge 2 ] || exit 103
+      write_out=$2
       shift
       ;;
     --output|-o)
@@ -477,11 +487,19 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
-[ "$saw_fail:$saw_silent:$saw_show_error:$saw_location:$retry" = "1:1:1:1:5" ] || exit 95
-[ "$header" = "x-dune-api-key: $DUNE_API_KEY" ] || exit 96
+[ "$saw_fail:$saw_silent:$saw_show_error:$retry" = "1:1:1:5" ] || exit 95
+[ "$write_out" = '%{http_code}' ] || exit 96
+case $header in
+  @*) header_file=${header#@} ;;
+  *) exit 104 ;;
+esac
+[ -f "$header_file" ] && [ ! -L "$header_file" ] || exit 105
+[ "$(stat -c '%a' "$header_file")" = 600 ] || exit 106
+[ "$(cat "$header_file")" = "x-dune-api-key: $expected_key" ] || exit 107
 [ -n "$output" ] && [ -n "$url" ] || exit 97
 printf '%s\n' "$url" >>"$FAKE_CURL_LOG"
 
+http_code=200
 case ${FAKE_CURL_SCENARIO:-} in
   data_then_header)
     case $url in
@@ -496,6 +514,19 @@ case ${FAKE_CURL_SCENARIO:-} in
       *offset=5000) : >"$output" ;;
       *) exit 98 ;;
     esac
+    ;;
+  data_then_blank)
+    case $url in
+      *offset=0) printf 'column_a,column_b\nvalue-0,ok\n' >"$output" ;;
+      *offset=5000) printf 'column_a,column_b\n\n' >"$output" ;;
+      *) exit 98 ;;
+    esac
+    ;;
+  quoted_record)
+    printf 'column_a,column_b\n"line one\nline two, comma",ok\n' >"$output"
+    ;;
+  malformed_csv)
+    printf 'column_a,column_b\n"unterminated,value\n' >"$output"
     ;;
   always_data)
     offset=${url##*offset=}
@@ -516,16 +547,28 @@ case ${FAKE_CURL_SCENARIO:-} in
     printf 'partial download' >"$output"
     exit 22
     ;;
+  redirect)
+    printf 'column_a,column_b\nredirected,no\n' >"$output"
+    http_code=302
+    ;;
+  race_target)
+    printf 'raced target\n' >"$FAKE_RACE_TARGET"
+    printf 'column_a,column_b\ndownloaded,no\n' >"$output"
+    ;;
   *) exit 99 ;;
 esac
+printf '%s' "$http_code"
 SH
 chmod +x "$fake_bin/curl"
 
 test_key='integration-key-not-for-output'
+expected_key_file=$fixture_root/expected-key
+printf '%s' "$test_key" >"$expected_key_file"
 run_downloader() {
   scenario=$1
   shift
-  FAKE_CURL_LOG=$fake_log FAKE_CURL_SCENARIO=$scenario DUNE_API_KEY=$test_key \
+  FAKE_CURL_LOG=$fake_log FAKE_CURL_SCENARIO=$scenario \
+    FAKE_EXPECTED_KEY_FILE=$expected_key_file DUNE_API_KEY=$test_key \
     PATH=$fake_bin:$PATH sh "$downloader" "$@"
 }
 
@@ -566,6 +609,58 @@ expect_downloader_failure "option used as missing output value" \
   expect_missing_output_value_failure
 [ ! -e "$fixture_root/--resume" ]
 
+if DUNE_API_KEY=$test_key sh "$downloader" --unknown \
+  >"$fixture_root/usage.out" 2>&1; then
+  echo "expected usage failure" >&2
+  exit 1
+fi
+grep -Fq -- "GNU/Linux" "$fixture_root/usage.out"
+
+empty_path=$fixture_root/empty-path
+mkdir -p "$empty_path"
+if DUNE_API_KEY=$test_key PATH=$empty_path /bin/sh "$downloader" \
+  --max-pages 1 --output-dir "$fixture_root/missing-curl" \
+  >"$fixture_root/missing-command.out" 2>&1; then
+  echo "expected missing dependency failure" >&2
+  exit 1
+fi
+grep -Fq -- "required command not found: curl" "$fixture_root/missing-command.out"
+
+: >"$fake_log"
+bad_key=$(printf 'bad\rkey')
+expect_downloader_failure "credential containing CR" env \
+  FAKE_CURL_LOG=$fake_log FAKE_CURL_SCENARIO=always_data \
+  FAKE_EXPECTED_KEY_FILE=$expected_key_file DUNE_API_KEY="$bad_key" \
+  PATH=$fake_bin:$PATH sh "$downloader" --max-pages 1 --output-dir "$fixture_root/bad-key"
+[ ! -s "$fake_log" ]
+
+: >"$fake_log"
+expect_downloader_failure "start page above four-digit boundary" run_downloader always_data \
+  --start-page 10000 --max-pages 1 --output-dir "$fixture_root/start-overflow"
+expect_downloader_failure "limit above safe bound" run_downloader always_data \
+  --limit 1000001 --max-pages 1 --output-dir "$fixture_root/limit-overflow"
+[ ! -s "$fake_log" ]
+expect_downloader_failure "max pages crossing page boundary" run_downloader always_data \
+  --start-page 9999 --max-pages 2 --output-dir "$fixture_root/page-overflow"
+[ "$(wc -l <"$fake_log")" -eq 1 ]
+
+trailing_dir=$fixture_root/trailing
+run_downloader always_data --query-id 72 --max-pages 1 \
+  --output-dir "$trailing_dir///"
+[ -f "$trailing_dir/72_0000.csv" ]
+[ -f "$trailing_dir.sha256" ]
+[ ! -e "$trailing_dir/.sha256" ]
+
+crlf_dir=$(printf '%s/bad\rpath' "$fixture_root")
+expect_downloader_failure "output path containing CR" run_downloader always_data \
+  --query-id 73 --max-pages 1 --output-dir "$crlf_dir"
+[ ! -e "$crlf_dir" ]
+
+: >"$fake_log"
+expect_downloader_failure "filesystem root output" run_downloader always_data \
+  --query-id 75 --max-pages 1 --output-dir /
+[ ! -s "$fake_log" ]
+
 : >"$fake_log"
 download_dir=$fixture_root/download
 run_downloader data_then_header --output-dir "$download_dir"
@@ -586,6 +681,14 @@ printf '%s  %s\n' "$page_digest" 6515125_0000.csv >"$fixture_root/expected-inven
 cmp "$fixture_root/expected-inventory" "$download_dir.sha256"
 
 : >"$fake_log"
+redirect_dir=$fixture_root/redirect
+expect_downloader_failure "redirect response" run_downloader redirect \
+  --query-id 65 --max-pages 1 --output-dir "$redirect_dir"
+[ ! -e "$redirect_dir/65_0000.csv" ]
+[ ! -e "$redirect_dir.sha256" ]
+[ "$(wc -l <"$fake_log")" -eq 1 ]
+
+: >"$fake_log"
 empty_dir=$fixture_root/empty-response
 run_downloader data_then_empty --query-id 66 --output-dir "$empty_dir"
 [ -f "$empty_dir/66_0000.csv" ]
@@ -597,13 +700,65 @@ https://api.dune.com/api/v1/query/66/results/csv?limit=5000&offset=5000
 EOF
 cmp "$fixture_root/expected-empty-urls" "$fake_log"
 
+blank_dir=$fixture_root/blank-response
+run_downloader data_then_blank --query-id 67 --output-dir "$blank_dir"
+[ -f "$blank_dir/67_0000.csv" ]
+[ ! -e "$blank_dir/67_0001.csv" ]
+
+quoted_dir=$fixture_root/quoted-response
+run_downloader quoted_record --query-id 68 --max-pages 1 --output-dir "$quoted_dir"
+cat >"$fixture_root/expected-quoted.csv" <<'CSV'
+column_a,column_b
+"line one
+line two, comma",ok
+CSV
+cmp "$fixture_root/expected-quoted.csv" "$quoted_dir/68_0000.csv"
+
+malformed_dir=$fixture_root/malformed-response
+expect_downloader_failure "malformed CSV response" run_downloader malformed_csv \
+  --query-id 69 --max-pages 1 --output-dir "$malformed_dir"
+[ ! -e "$malformed_dir/69_0000.csv" ]
+[ ! -e "$malformed_dir.sha256" ]
+
+race_dir=$fixture_root/race
+mkdir -p "$race_dir"
+race_target=$race_dir/70_0000.csv
+expect_race_failure() {
+  FAKE_CURL_LOG=$fake_log FAKE_CURL_SCENARIO=race_target \
+    FAKE_EXPECTED_KEY_FILE=$expected_key_file FAKE_RACE_TARGET=$race_target \
+    DUNE_API_KEY=$test_key PATH=$fake_bin:$PATH \
+    sh "$downloader" --query-id 70 --max-pages 1 --output-dir "$race_dir"
+}
+expect_downloader_failure "target created during download" expect_race_failure
+[ "$(cat "$race_target")" = "raced target" ]
+[ ! -e "$race_dir.sha256" ]
+
+symlink_dir=$fixture_root/symlink-existing
+mkdir -p "$symlink_dir"
+ln -s missing-target "$symlink_dir/71_0000.csv"
+expect_downloader_failure "dangling symlink existing page" run_downloader always_data \
+  --query-id 71 --max-pages 1 --output-dir "$symlink_dir"
+[ -L "$symlink_dir/71_0000.csv" ]
+
+printf 'column_a,column_b\nvalue-0,ok\n' >"$symlink_dir/protected.csv"
+ln -s protected.csv "$symlink_dir/74_0000.csv"
+: >"$fake_log"
+expect_downloader_failure "symlink page with resume" run_downloader always_data \
+  --query-id 74 --max-pages 1 --output-dir "$symlink_dir" --resume
+[ -L "$symlink_dir/74_0000.csv" ]
+[ ! -s "$fake_log" ]
+
 : >"$fake_log"
 max_dir=$fixture_root/max-pages
+mkdir -p "$max_dir"
+printf 'foreign\n' >"$max_dir/foreign.csv"
+printf 'other query\n' >"$max_dir/78_0000.csv"
+ln -s foreign.csv "$max_dir/77_0002.csv"
 run_downloader always_data --query-id 77 --output-dir "$max_dir" \
   --limit 7 --start-page 3 --max-pages 2
 [ -f "$max_dir/77_0003.csv" ]
 [ -f "$max_dir/77_0004.csv" ]
-[ "$(find "$max_dir" -type f | wc -l)" -eq 2 ]
+[ -L "$max_dir/77_0002.csv" ]
 cat >"$fixture_root/expected-max-urls" <<'EOF'
 https://api.dune.com/api/v1/query/77/results/csv?limit=7&offset=21
 https://api.dune.com/api/v1/query/77/results/csv?limit=7&offset=28
