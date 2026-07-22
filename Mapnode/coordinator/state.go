@@ -84,7 +84,9 @@ func ValidateTransition(from, to RequestState) (bool, error) {
 	}
 	legal := (from == Observed && (to == EvidenceReady || to == Rejected)) ||
 		(from == EvidenceReady && to == Planned) ||
-		(from == Planned && to == ProofReady) ||
+		(from == Planned && (to == ProofReady || to == Retryable)) ||
+		(from == ProofReady && to == Retryable) ||
+		(from == DirectFallback && to == Retryable) ||
 		(from == Retryable && (to == Replanned || to == DirectFallback)) ||
 		(from == Replanned && to == ProofReady)
 	if !legal {

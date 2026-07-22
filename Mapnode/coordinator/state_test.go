@@ -6,6 +6,7 @@ func TestRequestStateTransitionGraph(t *testing.T) {
 	legal := [][2]RequestState{
 		{Observed, EvidenceReady}, {EvidenceReady, Planned}, {Planned, ProofReady},
 		{Observed, Rejected}, {Retryable, Replanned}, {Retryable, DirectFallback}, {Replanned, ProofReady},
+		{Planned, Retryable}, {ProofReady, Retryable}, {DirectFallback, Retryable},
 	}
 	for _, edge := range legal {
 		changed, err := ValidateTransition(edge[0], edge[1])

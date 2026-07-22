@@ -63,10 +63,19 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 	if coordinator == nil || coordinator.requests == nil || coordinator.evidence == nil || coordinator.planner == nil || coordinator.plans == nil || coordinator.builder == nil {
 		return Result{}, errors.New("coordinator dependencies are required")
 	}
-	if work.Request.ID == (domain.RequestID{}) || work.Request.State != Observed || work.SnapshotID == (trustview.SnapshotID{}) || work.ExpectedHomeTrustRoot.Hash == ([32]byte{}) || work.Request.SourceBlockHash == ([32]byte{}) {
+	if work.Request.ID == (domain.RequestID{}) || work.Request.State.Validate() != nil || work.SnapshotID == (trustview.SnapshotID{}) || work.Request.SourceBlockHash == ([32]byte{}) {
 		return Result{}, ErrInvalidObservation
 	}
-	request, _, err := coordinator.requests.Observe(ctx, work.Request)
+	var request Request
+	var err error
+	if work.Request.State == Observed {
+		request, _, err = coordinator.requests.Observe(ctx, work.Request)
+	} else {
+		request, err = coordinator.requests.Load(ctx, work.Request.ID)
+		if err == nil && !sameRequestIdentityForResume(request, work.Request) {
+			err = ErrInvalidObservation
+		}
+	}
 	if err != nil {
 		return Result{}, err
 	}
@@ -209,6 +218,10 @@ func (coordinator *Coordinator) Process(ctx context.Context, work Work) (Result,
 			return Result{}, fmt.Errorf("%w: %s", ErrInvalidRequestState, result.Request.State)
 		}
 	}
+}
+
+func sameRequestIdentityForResume(left, right Request) bool {
+	return left.ID == right.ID && left.HomeChainID == right.HomeChainID && left.Gateway == right.Gateway && left.Requester == right.Requester && left.Nonce == right.Nonce && left.SourceChainID == right.SourceChainID && left.SourceHeight == right.SourceHeight && left.SourceBlockHash == right.SourceBlockHash
 }
 
 func validateWorkPlan(work Work, plan planner.Plan) error {

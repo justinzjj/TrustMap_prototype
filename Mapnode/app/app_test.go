@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -644,6 +645,35 @@ func appFixture(t *testing.T, runtimeChainID string) (bootstrap.Config, bootstra
 	gatewayCode, verifierCode := []byte{0x60, 0x01}, []byte{0x60, 0x02}
 	gateway := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	verifier := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	runtimeDir := filepath.Join(t.TempDir(), "runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeKey := func(name string) (string, string, common.Address) {
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		address := crypto.PubkeyToAddress(key.PublicKey)
+		encoded, err := keystore.EncryptKey(&keystore.Key{Address: address, PrivateKey: key}, "test", keystore.LightScryptN, keystore.LightScryptP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyPath, passwordPath := filepath.Join(runtimeDir, name+".json"), filepath.Join(runtimeDir, name+".password")
+		if err := os.WriteFile(keyPath, encoded, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(passwordPath, []byte("test\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return keyPath, passwordPath, address
+	}
+	signers := make([]bootstrap.AuthorizedSigner, 3)
+	for index := range signers {
+		keyPath, passwordPath, address := writeKey(fmt.Sprintf("direct-%d", index))
+		signers[index] = bootstrap.AuthorizedSigner{Address: address.Hex(), KeystoreFile: keyPath, PasswordFile: passwordPath}
+	}
+	txKey, txPassword, _ := writeKey("transaction")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var call struct {
 			Method string            `json:"method"`
@@ -660,17 +690,49 @@ func appFixture(t *testing.T, runtimeChainID string) (bootstrap.Config, bootstra
 			} else {
 				result = "0x6002"
 			}
+		} else if call.Method == "eth_call" {
+			var message struct {
+				To    string `json:"to"`
+				Data  string `json:"data"`
+				Input string `json:"input"`
+			}
+			_ = json.Unmarshal(call.Params[0], &message)
+			data := message.Data
+			if data == "" {
+				data = message.Input
+			}
+			wordAddress := func(address common.Address) string {
+				return "0x" + common.Bytes2Hex(common.LeftPadBytes(address[:], 32))
+			}
+			wordUint := func(value uint64) string {
+				return "0x" + common.Bytes2Hex(common.LeftPadBytes(new(big.Int).SetUint64(value).Bytes(), 32))
+			}
+			switch data {
+			case "0xd85ac10a":
+				result = wordAddress(verifier)
+			case "0x116191b6":
+				result = wordAddress(gateway)
+			case "0xe3a05324":
+				result = wordUint(uint64(len(signers)))
+			case "0xf49675b7":
+				result = wordUint(3)
+			case "0x1b3ee237":
+				result = wordUint(4497)
+			default:
+				if len(data) >= 10 && data[:10] == "0xa2b84460" {
+					index := new(big.Int)
+					index.SetString(data[10:], 16)
+					result = wordAddress(common.HexToAddress(signers[index.Uint64()].Address))
+				} else {
+					result = "0x"
+				}
+			}
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": call.ID, "result": result})
 	}))
-	signers := []bootstrap.AuthorizedSigner{
-		{Address: "0x1000000000000000000000000000000000000001"},
-		{Address: "0x2000000000000000000000000000000000000002"},
-		{Address: "0x3000000000000000000000000000000000000003"},
-	}
 	cost := uint64(3_000_096)
 	profile := &bootstrap.DirectVerifierProfile{Version: 1, ProfileID: "pow-spv-3m", ContractName: "ExperimentalCostedDirectVerifier", AuthorizedSigners: signers, SignatureChecks: 3, HashRounds: 4497, MeasuredDirectCostGas: &cost}
-	config := bootstrap.Config{Version: 1, Name: "mapnode-c", HomeChain: bootstrap.HomeChain{Name: "chain-c", ChainID: "10001", HTTPRPC: server.URL, Confirmations: 2, GatewayManifest: "/runtime/deployment/gateway-manifest.json"}, Database: bootstrap.Database{Driver: "sqlite", Path: filepath.Join(t.TempDir(), "runtime", "mapnode.sqlite")}, DirectVerifier: bootstrap.DirectVerifier{Profile: profile}}
+	config := bootstrap.Config{Version: 1, Name: "mapnode-c", HomeChain: bootstrap.HomeChain{Name: "chain-c", ChainID: "10001", HTTPRPC: server.URL, Confirmations: 2, GatewayManifest: "/runtime/deployment/gateway-manifest.json"}, Database: bootstrap.Database{Driver: "sqlite", Path: filepath.Join(runtimeDir, "mapnode.sqlite")}, Signer: bootstrap.Signer{KeystoreFile: txKey, PasswordFile: txPassword}, DirectVerifier: bootstrap.DirectVerifier{Profile: profile}}
 	config.Chains = []bootstrap.ChainCatalog{
 		{Name: "chain-c", ChainID: "10001", HTTPRPC: server.URL, Confirmations: 2, DeploymentManifest: "/runtime/chains/chain-c/deployment/gateway-manifest.json", Home: true},
 		{Name: "chain-d", ChainID: "10002", HTTPRPC: "http://remote-not-dialed.invalid:8545", Confirmations: 3, DeploymentManifest: "/runtime/chains/chain-d/deployment/gateway-manifest.json"},

@@ -118,6 +118,26 @@ func TestCoordinatorPersistsInitialDirectPlanAtPlanned(t *testing.T) {
 	}
 }
 
+func TestCoordinatorAcceptsZeroInitialHomeTrustRootAndRealPersistedResumeState(t *testing.T) {
+	fixture := newCoordinatorFixture()
+	fixture.planning.plan.Type = planner.DirectPlan
+	fixture.planning.plan.FallbackReason = planner.NoPath
+	fixture.planning.plan.Hops = nil
+	fixture.planning.plan.PathStepCost, fixture.planning.plan.PathCost = 0, nil
+	fixture.planning.plan.ID = planner.ComputePlanID(fixture.planning.plan)
+	fixture.work.ExpectedHomeTrustRoot = trustview.TrustRoot{}
+	result, err := fixture.coordinator.Process(context.Background(), fixture.work)
+	if err != nil || result.Request.State != Planned {
+		t.Fatalf("zero initial root result=%+v err=%v", result, err)
+	}
+
+	fixture.work.Request = result.Request // caller passes the real durable state
+	second, err := fixture.coordinator.Process(context.Background(), fixture.work)
+	if err != nil || second.Request.State != Planned || fixture.planning.calls != 1 {
+		t.Fatalf("durable resume result=%+v calls=%d err=%v", second, fixture.planning.calls, err)
+	}
+}
+
 func TestCoordinatorUsesOnlyApprovedRetryableTransitions(t *testing.T) {
 	fixture := newCoordinatorFixture()
 	fixture.requests.record = fixture.work.Request

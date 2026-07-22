@@ -22,6 +22,7 @@ var migrations = []migration{
 	{version: 5, name: "confirmed_gateway_indexer", sql: confirmedGatewayIndexerV5},
 	{version: 6, name: "dependency_evidence_mailboxes", sql: dependencyEvidenceMailboxesV6},
 	{version: 7, name: "evidence_ingress_rejections", sql: evidenceIngressRejectionsV7},
+	{version: 8, name: "live_transaction_execution", sql: liveTransactionExecutionV8},
 }
 
 const migrationTable = `
@@ -786,4 +787,81 @@ CREATE TABLE evidence_ingress_rejections (
 CREATE UNIQUE INDEX evidence_ingress_rejection_provenance ON evidence_ingress_rejections(actual_origin_peer,payload_fingerprint);
 CREATE TRIGGER prevent_evidence_ingress_rejection_update BEFORE UPDATE ON evidence_ingress_rejections BEGIN SELECT RAISE(ABORT,'evidence ingress rejection is immutable'); END;
 CREATE TRIGGER prevent_evidence_ingress_rejection_delete BEFORE DELETE ON evidence_ingress_rejections BEGIN SELECT RAISE(ABORT,'evidence ingress rejection is append-only'); END;
+`
+
+const liveTransactionExecutionV8 = `
+CREATE TABLE transaction_submissions (
+    submission_id BLOB PRIMARY KEY CHECK(typeof(submission_id)='blob' AND length(submission_id)=32),
+    request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32),
+    attempt INTEGER NOT NULL CHECK(attempt>=0),
+    plan_id BLOB NOT NULL CHECK(typeof(plan_id)='blob' AND length(plan_id)=32),
+    plan_type TEXT NOT NULL CHECK(plan_type IN ('direct','path')),
+    snapshot_id BLOB NOT NULL CHECK(typeof(snapshot_id)='blob' AND length(snapshot_id)=32),
+    proof_id BLOB CHECK(proof_id IS NULL OR (typeof(proof_id)='blob' AND length(proof_id)=32)),
+    home_chain_id BLOB NOT NULL CHECK(typeof(home_chain_id)='blob' AND length(home_chain_id)=32),
+    gateway BLOB NOT NULL CHECK(typeof(gateway)='blob' AND length(gateway)=20),
+    sender BLOB NOT NULL CHECK(typeof(sender)='blob' AND length(sender)=20),
+    nonce INTEGER NOT NULL CHECK(nonce>=0),
+    calldata_hash BLOB NOT NULL CHECK(typeof(calldata_hash)='blob' AND length(calldata_hash)=32),
+    raw_signed_tx BLOB NOT NULL CHECK(typeof(raw_signed_tx)='blob' AND length(raw_signed_tx) BETWEEN 1 AND 1048576),
+    tx_hash BLOB NOT NULL UNIQUE CHECK(typeof(tx_hash)='blob' AND length(tx_hash)=32),
+    max_fee_per_gas BLOB NOT NULL CHECK(typeof(max_fee_per_gas)='blob' AND length(max_fee_per_gas)=32),
+    max_priority_fee_per_gas BLOB NOT NULL CHECK(typeof(max_priority_fee_per_gas)='blob' AND length(max_priority_fee_per_gas)=32),
+    gas_limit INTEGER NOT NULL CHECK(gas_limit>0),
+    state TEXT NOT NULL CHECK(state IN ('prepared','submitted','confirmed','retryable','reverted','superseded')),
+    reason TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL CHECK(created_at>0),
+    updated_at INTEGER NOT NULL CHECK(updated_at>0),
+    submitted_at INTEGER CHECK(submitted_at IS NULL OR submitted_at>0),
+    CHECK((plan_type='direct' AND proof_id IS NULL) OR (plan_type='path' AND proof_id IS NOT NULL)),
+    CHECK((state IN ('prepared','submitted','confirmed') AND reason='') OR (state IN ('retryable','reverted','superseded') AND length(reason)>0)),
+    FOREIGN KEY(request_id) REFERENCES requests(id),
+    FOREIGN KEY(request_id,plan_id,snapshot_id) REFERENCES plans(request_id,plan_id,snapshot_id),
+    FOREIGN KEY(proof_id,plan_id,snapshot_id) REFERENCES proofs(proof_id,plan_id,snapshot_id),
+    UNIQUE(request_id,attempt),
+    UNIQUE(submission_id,request_id,tx_hash,home_chain_id)
+) STRICT;
+
+CREATE UNIQUE INDEX active_home_sender_nonce ON transaction_submissions(home_chain_id,sender,nonce)
+WHERE state IN ('prepared','submitted','retryable');
+CREATE INDEX recoverable_transaction_submissions ON transaction_submissions(state,created_at)
+WHERE state IN ('prepared','submitted','retryable');
+
+CREATE TABLE confirmed_transaction_receipts (
+    submission_id BLOB PRIMARY KEY CHECK(typeof(submission_id)='blob' AND length(submission_id)=32),
+    request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32),
+    tx_hash BLOB NOT NULL CHECK(typeof(tx_hash)='blob' AND length(tx_hash)=32),
+    home_chain_id BLOB NOT NULL CHECK(typeof(home_chain_id)='blob' AND length(home_chain_id)=32),
+    block_number BLOB NOT NULL CHECK(typeof(block_number)='blob' AND length(block_number)=32),
+    block_hash BLOB NOT NULL CHECK(typeof(block_hash)='blob' AND length(block_hash)=32),
+    status INTEGER NOT NULL CHECK(status=1),
+    confirmations INTEGER NOT NULL CHECK(confirmations>0),
+    confirmed_at INTEGER NOT NULL CHECK(confirmed_at>0),
+    FOREIGN KEY(submission_id,request_id,tx_hash,home_chain_id) REFERENCES transaction_submissions(submission_id,request_id,tx_hash,home_chain_id),
+    FOREIGN KEY(home_chain_id,tx_hash) REFERENCES verification_receipts(chain_id,tx_hash),
+    FOREIGN KEY(request_id) REFERENCES request_resolutions(request_id),
+    UNIQUE(home_chain_id,block_hash,tx_hash)
+) STRICT;
+
+CREATE TABLE request_execution_transitions (
+    sequence INTEGER PRIMARY KEY,
+    request_id BLOB NOT NULL CHECK(typeof(request_id)='blob' AND length(request_id)=32),
+    submission_id BLOB NOT NULL CHECK(typeof(submission_id)='blob' AND length(submission_id)=32),
+    from_state TEXT NOT NULL CHECK(from_state IN ('prepared','submitted','confirmed','retryable','reverted','superseded')),
+    to_state TEXT NOT NULL CHECK(to_state IN ('prepared','submitted','confirmed','retryable','reverted','superseded')),
+    reason TEXT NOT NULL DEFAULT '',
+    changed_at INTEGER NOT NULL CHECK(changed_at>0),
+    FOREIGN KEY(request_id) REFERENCES requests(id),
+    FOREIGN KEY(submission_id) REFERENCES transaction_submissions(submission_id),
+    UNIQUE(submission_id,from_state,to_state)
+) STRICT;
+
+CREATE TRIGGER prevent_transaction_submission_identity_update
+BEFORE UPDATE OF submission_id,request_id,attempt,plan_id,plan_type,snapshot_id,proof_id,home_chain_id,gateway,sender,nonce,calldata_hash,raw_signed_tx,tx_hash,max_fee_per_gas,max_priority_fee_per_gas,gas_limit,created_at
+ON transaction_submissions BEGIN SELECT RAISE(ABORT,'TransactionSubmission identity is immutable'); END;
+CREATE TRIGGER prevent_transaction_submission_delete BEFORE DELETE ON transaction_submissions BEGIN SELECT RAISE(ABORT,'TransactionSubmission is append-only'); END;
+CREATE TRIGGER prevent_confirmed_transaction_receipt_update BEFORE UPDATE ON confirmed_transaction_receipts BEGIN SELECT RAISE(ABORT,'confirmed transaction receipt is append-only'); END;
+CREATE TRIGGER prevent_confirmed_transaction_receipt_delete BEFORE DELETE ON confirmed_transaction_receipts BEGIN SELECT RAISE(ABORT,'confirmed transaction receipt is append-only'); END;
+CREATE TRIGGER prevent_request_execution_transition_update BEFORE UPDATE ON request_execution_transitions BEGIN SELECT RAISE(ABORT,'request execution transition is append-only'); END;
+CREATE TRIGGER prevent_request_execution_transition_delete BEFORE DELETE ON request_execution_transitions BEGIN SELECT RAISE(ABORT,'request execution transition is append-only'); END;
 `

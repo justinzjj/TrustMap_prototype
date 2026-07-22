@@ -8,16 +8,21 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/bootstrap"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/chain"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/coordinator"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/evidence"
+	"github.com/justinzjj/TrustMap_prototype/Mapnode/executor"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/indexer"
 	tmp2p "github.com/justinzjj/TrustMap_prototype/Mapnode/p2p"
 	"github.com/justinzjj/TrustMap_prototype/Mapnode/planner"
@@ -51,6 +56,9 @@ type App struct {
 	EvidenceInbox            *store.EvidenceInboxRepository
 	RemoteDependencies       *store.RemoteDependencyRepository
 	DependencyEvidenceGossip *tmp2p.DependencyEvidenceGossip
+	TransactionSubmissions   *store.TransactionRepository
+	ExecutionWork            *store.ExecutionWorkRepository
+	RequestWorker            *executor.RequestWorker
 
 	database          *store.DB
 	pathTreeDepth     uint8
@@ -59,6 +67,7 @@ type App struct {
 	indexerValidated  bool
 	indexerFailed     bool
 	p2pFailed         bool
+	executorFailed    bool
 	p2pHost           host.Host
 	p2pCancel         context.CancelFunc
 	p2pRequired       bool
@@ -153,6 +162,54 @@ func Open(ctx context.Context, config bootstrap.Config, manifest bootstrap.Deplo
 	if err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("dial home HTTP RPC for confirmed indexer: %w", err)
+	}
+	liveRPC := executor.EthRPC{Client: homeRPC}
+	profileAddresses := make([]common.Address, len(config.DirectVerifier.Profile.AuthorizedSigners))
+	for index, signer := range config.DirectVerifier.Profile.AuthorizedSigners {
+		profileAddresses[index] = common.HexToAddress(signer.Address)
+	}
+	if err := executor.ValidateVerifierBinding(ctx, liveRPC, common.HexToAddress(manifest.Gateway), common.HexToAddress(manifest.DirectVerifier), profileAddresses, manifest.SignatureChecks, manifest.HashRounds); err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, fmt.Errorf("validate deployed DirectVerifier binding: %w", err)
+	}
+	directSigners, err := loadDirectSigners(*config.DirectVerifier.Profile)
+	if err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	transactionKey, err := loadKeystoreKey(config.Signer.KeystoreFile, config.Signer.PasswordFile)
+	if err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, fmt.Errorf("load home transaction signer: %w", err)
+	}
+	directExecutor, err := executor.NewDirectPlanExecutor(liveRPC, common.HexToAddress(manifest.DirectVerifier), directSigners, manifest.SignatureChecks)
+	if err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	rootGuard, err := executor.NewHomeRootGuard(liveRPC, common.HexToAddress(manifest.Gateway))
+	if err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	application.TransactionSubmissions = store.NewTransactionRepository(database)
+	application.ExecutionWork = store.NewExecutionWorkRepository(database)
+	transactionSubmitter, err := executor.NewTransactionSubmitter(liveRPC, application.TransactionSubmissions, homeChainID, transactionKey.PrivateKey, config.HomeChain.Confirmations, rootGuard)
+	if err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, err
+	}
+	application.RequestWorker, err = executor.NewRequestWorker(application.ExecutionWork, application, application.coordinator, directExecutor, transactionSubmitter, transactionKey.Address)
+	if err != nil {
+		homeRPC.Close()
+		_ = database.Close()
+		return nil, err
 	}
 	application.observers = make(map[domain.ChainID]observerBinding)
 	confirmedIndexer, err := indexer.NewConfirmedEventIndexer(indexer.ConfirmedEventIndexerConfig{ChainID: homeChainID, Gateway: common.HexToAddress(manifest.Gateway), GatewayCodeHash: common.HexToHash(manifest.CodeHashes.Gateway), DeploymentBlock: deploymentHeight, Confirmations: config.HomeChain.Confirmations, MaxBlockRange: 256, MerkleDepth: manifest.MerkleDepth, PathStepCostGas: pathStepCost}, homeRPC, application, application)
@@ -295,6 +352,9 @@ func (application *App) indexerWorkerGate(ctx context.Context) error {
 		return ErrOperationalDegraded
 	}
 	if application.p2pFailed {
+		return ErrOperationalDegraded
+	}
+	if application.executorFailed {
 		return ErrOperationalDegraded
 	}
 	if application.p2pRequired && !application.p2pBootstrapReady.Load() {
@@ -666,6 +726,93 @@ func (application *App) RunDependencyEvidenceWorkers(ctx context.Context) error 
 	return application.runDependencyEvidenceSupervisor(ctx, workers...)
 }
 
+func (application *App) ObserveRequestEndpoints(ctx context.Context, request coordinator.Request) (trustview.TrustNode, trustview.TrustNode, error) {
+	sourceEntry, ok := application.ChainCatalog.Chain(request.SourceChainID)
+	if !ok {
+		return trustview.TrustNode{}, trustview.TrustNode{}, chain.ErrChainNotFound
+	}
+	source, err := application.observeAndPersist(ctx, sourceEntry, request.SourceHeight, request.SourceBlockHash)
+	if err != nil {
+		return trustview.TrustNode{}, trustview.TrustNode{}, err
+	}
+	homeEntry, err := application.ChainCatalog.HomeChain()
+	if err != nil {
+		return trustview.TrustNode{}, trustview.TrustNode{}, err
+	}
+	binding, err := application.observer(homeEntry)
+	if err != nil {
+		return trustview.TrustNode{}, trustview.TrustNode{}, err
+	}
+	head, err := binding.client.HeaderByNumber(ctx, nil)
+	if err != nil || head == nil || head.Number == nil || !head.Number.IsUint64() || head.Number.Uint64() < homeEntry.Confirmations {
+		return trustview.TrustNode{}, trustview.TrustNode{}, errors.New("home chain lacks a confirmed TrustRoot block")
+	}
+	safeHeight := head.Number.Uint64() - homeEntry.Confirmations
+	header, err := binding.client.HeaderByNumber(ctx, new(big.Int).SetUint64(safeHeight))
+	if err != nil || header == nil {
+		return trustview.TrustNode{}, trustview.TrustNode{}, errors.New("read confirmed home TrustRoot block")
+	}
+	height, _ := domain.NewBlockHeight(safeHeight)
+	home, err := application.observeAndPersist(ctx, homeEntry, height, header.Hash())
+	if err != nil {
+		return trustview.TrustNode{}, trustview.TrustNode{}, err
+	}
+	return home, source, nil
+}
+
+func (application *App) observeAndPersist(ctx context.Context, entry chain.Chain, height domain.BlockHeight, hash common.Hash) (trustview.TrustNode, error) {
+	binding, err := application.observer(entry)
+	if err != nil {
+		return trustview.TrustNode{}, err
+	}
+	observation, err := binding.reader.Observe(ctx, height, hash, entry.Confirmations)
+	if err != nil {
+		return trustview.TrustNode{}, err
+	}
+	application.operationalMu.Lock()
+	defer application.operationalMu.Unlock()
+	if err := application.indexerWorkerGate(ctx); err != nil {
+		return trustview.TrustNode{}, err
+	}
+	if err := application.LiveChains.BindDeployment(ctx, binding.deployment, binding.block); err != nil {
+		return trustview.TrustNode{}, err
+	}
+	_, node, _, err := application.TrustRootObservations.Save(ctx, observation)
+	return node, err
+}
+
+func (application *App) RunRequestWorker(ctx context.Context) error {
+	if application == nil || application.RequestWorker == nil {
+		return ErrOperationalUnavailable
+	}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		application.operationalMu.RLock()
+		gateErr := application.operationalGate(ctx)
+		application.operationalMu.RUnlock()
+		if errors.Is(gateErr, ErrOperationalDegraded) {
+			application.operationalMu.Lock()
+			application.executorFailed = true
+			application.operationalMu.Unlock()
+			return gateErr
+		}
+		if gateErr == nil {
+			if _, err := application.RequestWorker.Step(ctx); err != nil {
+				application.operationalMu.Lock()
+				application.executorFailed = true
+				application.operationalMu.Unlock()
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (application *App) runDependencyEvidenceSupervisor(ctx context.Context, workers ...func(context.Context) error) error {
 	if application == nil || len(workers) == 0 {
 		return ErrOperationalUnavailable
@@ -727,6 +874,37 @@ func (application *App) Close() error {
 		return nil
 	}
 	return application.database.Close()
+}
+
+func loadKeystoreKey(keystoreFile, passwordFile string) (*keystore.Key, error) {
+	encoded, err := os.ReadFile(keystoreFile)
+	if err != nil {
+		return nil, err
+	}
+	password, err := os.ReadFile(passwordFile)
+	if err != nil {
+		return nil, err
+	}
+	return keystore.DecryptKey(encoded, strings.TrimSpace(string(password)))
+}
+
+func loadDirectSigners(profile bootstrap.DirectVerifierProfile) ([]executor.AuthorizedSigner, error) {
+	if profile.SignatureChecks == 0 || int(profile.SignatureChecks) > len(profile.AuthorizedSigners) {
+		return nil, errors.New("invalid direct signature checks")
+	}
+	signers := make([]executor.AuthorizedSigner, profile.SignatureChecks)
+	for index := range signers {
+		key, err := loadKeystoreKey(profile.AuthorizedSigners[index].KeystoreFile, profile.AuthorizedSigners[index].PasswordFile)
+		if err != nil {
+			return nil, fmt.Errorf("load authorized signer %d: %w", index, err)
+		}
+		want := common.HexToAddress(profile.AuthorizedSigners[index].Address)
+		if key.Address != want || crypto.PubkeyToAddress(key.PrivateKey.PublicKey) != want {
+			return nil, fmt.Errorf("authorized signer %d key/address mismatch", index)
+		}
+		signers[index] = executor.AuthorizedSigner{Address: want, PrivateKey: key.PrivateKey}
+	}
+	return signers, nil
 }
 
 func registryFromDeployment(config bootstrap.Config, manifest bootstrap.DeploymentManifest) (*registry.Registry, error) {
