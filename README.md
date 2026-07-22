@@ -249,7 +249,7 @@ Equivalent flags are available:
   --profile legacy-v4.1
 ```
 
-The Dune query, download, and preprocessing pipeline also remains in the legacy research repository and has not yet been migrated into `TrustMap_prototype`. Therefore the current prototype release does not claim a self-contained raw-data acquisition pipeline. Any future downloader must read credentials such as `DUNE_API_KEY` from the environment; credentials must never be committed.
+The project provides the Dune query used to obtain the experimental data. Because of repository size constraints, the complete raw dataset and the prepared full trace are not included; users can run the query to obtain the data or supply an existing prepared trace through `TRACE_PATH`.
 
 For the canonical prepared trace, the checker expects:
 
