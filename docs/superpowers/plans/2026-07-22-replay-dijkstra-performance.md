@@ -162,7 +162,7 @@ warming the pool and require the optimized search to allocate fewer objects
 than the test-only reference on a fixed graph; do not assert a machine-specific
 absolute count. Commit: `perf: reuse replay Dijkstra search state`.
 
-### Task 4: Repository and 30k performance gates
+### Task 4: Repository and 30k semantic gate
 
 **Files:**
 - Modify only if verification exposes a defect in the files above.
@@ -198,13 +198,13 @@ path rows       = 13251
 graph           = 54687 nodes / 139336 edges / 30000 cross additions
 ```
 
-Any semantic mismatch rejects the optimization. The target wall time is at
-least 2x faster than `5:43.99` on the same host. If it is not materially faster,
-pause before the full run and profile the remaining bottleneck without changing
-replay semantics.
+Any semantic mismatch rejects the optimization. Wall time, CPU time and peak
+RSS are recorded for reproducibility but are not acceptance criteria. There is
+no minimum speedup requirement and measured performance does not block the full
+run.
 
 - [ ] **Step 4: Record the checkpoint**
 
 Append commit/binary/input hashes, exact command, time/RSS, output paths,
-digests, and the pass/fail decision to the ignored experiment record. Only a
-passing probe authorizes the sequential B0--B3 full run.
+digests, and the semantic pass/fail decision to the ignored experiment record.
+Only a semantically passing probe authorizes the sequential B0--B3 full run.

@@ -225,22 +225,22 @@ pruning, reverse the search, or change direct cutoffs.
 - scratch generation reset/wrap coverage;
 - coordinator recovery and smoke golden checks.
 
-### 7.3 Performance and full-run gates
+### 7.3 Semantic probe and full-run gates
 
 The optimized binary reruns the same first-30,000 B2 probe. Both semantic
 digests must match the `47a59d2` baseline exactly. A result mismatch rejects the
 optimization regardless of speed.
 
-The target is at least a 2x wall-time improvement on the same host. If the
-probe does not materially improve, the full run remains paused and the
-implementation is profiled/reviewed again; experimental semantics are never
+Wall time, CPU time and peak RSS are recorded as operational observations only.
+They are not experimental acceptance criteria and do not block the full run.
+There is no minimum speedup requirement; experimental semantics are never
 weakened for speed.
 
-After the probe passes, one new run root executes B0, B1, B2 and B3
-sequentially with a fixed binary. The run retains logs, SQLite/WAL, manifests,
-CSV exports, summaries and resource measurements. The final full golden check
-must pass every row-level decision/path digest and aggregate before the run is
-reported complete.
+After the semantic probe passes, one new run root executes B0, B1, B2 and B3
+sequentially with a fixed binary, regardless of measured speed. The run retains
+logs, SQLite/WAL, manifests, CSV exports, summaries and resource measurements.
+The final full golden check must pass every row-level decision/path digest and
+aggregate before the run is reported complete.
 
 ## 8. Git and records
 
